@@ -18,6 +18,11 @@ Type=simple
 User=rustydns
 Group=rustydns
 
+# Refuse to start with an invalid config rather than crash-looping after
+# bind. `--validate-config` parses + validates and exits 0/1 without
+# touching sockets. systemd marks the unit failed on exit 1, so this
+# never reaches ExecStart with a bad config.
+ExecStartPre=/usr/local/bin/rustydnsd --config /etc/rustydns/rustydns.toml --validate-config
 ExecStart=/usr/local/bin/rustydnsd --config /etc/rustydns/rustydns.toml
 ExecReload=/bin/kill -HUP $MAINPID
 

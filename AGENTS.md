@@ -10,7 +10,7 @@ This file is the entry point for any AI agent or automated tool working in this 
 
 ## Repository status
 
-**Early scaffolding.** Milestone 1 (workspace + core + blocklist) is complete. The current content is:
+**Milestones 1–3 complete, M4 in progress.** Workspace, core, blocklist, authority (with signed Rustynet mesh bundle integration), and the DoH/plain resolver are implemented and tested. `rustydnsd` runs end-to-end on UDP/TCP/DoH with metrics, signal handling, and atomic mesh-zone reload via `ArcSwap`. Remaining M4 work: in-process capability dropping and DoT listener (blocked on hickory-server upgrading from rustls 0.21 to 0.23). The current content is:
 
 - `README.md` — project overview and quick-start sketch
 - `docs/architecture.md` — intended design (authoritative, canonical)
@@ -21,9 +21,9 @@ This file is the entry point for any AI agent or automated tool working in this 
 - `CLAUDE.md` — Claude-specific guidance
 - `crates/rustydns-core` — ✅ config, error, record, client types
 - `crates/rustydns-blocklist` — ✅ engine, parser, allowlist
-- `crates/rustydns-authority` — stub (Milestone 2)
-- `crates/rustydns-resolver` — stub (Milestone 3)
-- `crates/rustydnsd` — stub (Milestone 4)
+- `crates/rustydns-authority` — ✅ static zones + signed Rustynet mesh bundle (M2)
+- `crates/rustydns-resolver` — ✅ DoH/plain upstream with fail-closed (M3)
+- `crates/rustydnsd` — daemon binary, UDP/TCP/DoH listeners + e2e tests (M4, partial)
 
 The next milestone is a working `rustydnsd` binary that can:
 1. Serve a static mesh zone from a TOML file (no Rustynet DB yet)
