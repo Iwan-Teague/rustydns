@@ -200,3 +200,243 @@ impl ResponseHandler for DohResponseHandler {
         Ok(info)
     }
 }
+
+// ===========================================================================
+// Integration tests
+//
+// Boot the DoH listener on a random loopback port, send GET (?dns=base64url)
+// and POST (application/dns-message) requests through reqwest, assert that
+// the responses are well-formed DNS messages with the expected response
+// codes.
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name as ProtoName, RData, RecordType as ProtoRecordType};
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+
+    use rustydns_authority::Authority;
+    use rustydns_blocklist::BlocklistEngine;
+    use rustydns_core::config::{
+        AuthorityConfig, BlockResponse, BlocklistConfig, DnsConfig, StaticRecord, UpstreamConfig,
+    };
+    use rustydns_resolver::Resolver;
+
+    use crate::handler::DnsHandler;
+    use crate::metrics::Metrics;
+
+    fn static_a(name: &str, addr: &str) -> StaticRecord {
+        StaticRecord {
+            name: name.to_string(),
+            record_type: "A".to_string(),
+            address: Some(addr.to_string()),
+            target: None,
+            ttl: 300,
+            client_filter: None,
+        }
+    }
+
+    async fn build_handler(
+        static_records: Vec<StaticRecord>,
+        blocklist_lines: &str,
+        upstream_resolvers: Vec<String>,
+        block_response: BlockResponse,
+    ) -> Arc<DnsHandler> {
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let authority_cfg = AuthorityConfig {
+            mesh_zone_bundle_path: None,
+            mesh_zone_verifier_key_path: None,
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records,
+            poll_interval_secs: 30,
+        };
+        let authority = Arc::new(Authority::new(authority_cfg).unwrap());
+
+        let mut bl_cfg = BlocklistConfig::default();
+        bl_cfg.sources = Vec::new();
+        bl_cfg.reload_interval_secs = 0;
+        bl_cfg.block_response = block_response;
+        let blocklist = Arc::new(BlocklistEngine::new(bl_cfg));
+        if !blocklist_lines.is_empty() {
+            blocklist.load_trusted(blocklist_lines);
+        }
+
+        let mut upstream = UpstreamConfig::default();
+        upstream.resolvers = upstream_resolvers;
+        upstream.timeout_ms = 500;
+        let mut dns_config = DnsConfig {
+            server: Default::default(),
+            upstream,
+            authority: Default::default(),
+            blocklist: Default::default(),
+            privacy: Default::default(),
+            metrics: Default::default(),
+            policy: Vec::new(),
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+
+        let resolver = Arc::new(Resolver::new(dns_config).await.unwrap());
+        Arc::new(DnsHandler::new(authority, blocklist, resolver, metrics).unwrap())
+    }
+
+    /// Boot a DoH listener on a random port. Returns `(base_url, shutdown_token)`.
+    /// Drop the token (or call .cancel()) to stop the listener.
+    async fn spawn_doh(handler: Arc<DnsHandler>) -> (String, CancellationToken) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // free the port — serve() will rebind it
+
+        let shutdown = CancellationToken::new();
+        let shutdown_for_task = shutdown.clone();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(handler, addr, shutdown_for_task).await;
+        });
+
+        // Wait for the listener to come up. axum binds inside serve()
+        // after spawn returns control to us, so poll briefly.
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        (format!("http://127.0.0.1:{port}"), shutdown)
+    }
+
+    fn build_query(name: &str, qtype: ProtoRecordType) -> Vec<u8> {
+        let mut msg = Message::new();
+        msg.set_id(0x4242)
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Query)
+            .set_recursion_desired(true);
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(ProtoName::from_ascii(name).unwrap())
+                .set_query_type(qtype);
+            q
+        });
+        msg.to_bytes().unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doh_post_authority_hit() {
+        let handler = build_handler(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let body = build_query("router.mesh.", ProtoRecordType::A);
+        let resp = client
+            .post(format!("{base}/dns-query"))
+            .header("content-type", "application/dns-message")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/dns-message"),
+        );
+        let body = resp.bytes().await.unwrap();
+        let dns = Message::from_bytes(&body).unwrap();
+        assert_eq!(dns.response_code(), ResponseCode::NoError);
+        assert!(dns.authoritative());
+        let answers = dns.answers();
+        assert_eq!(answers.len(), 1);
+        match answers[0].data().unwrap() {
+            RData::A(a) => assert_eq!(a.0.to_string(), "100.64.0.5"),
+            other => panic!("expected A, got {other:?}"),
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doh_get_blocked_returns_nxdomain() {
+        let handler = build_handler(
+            vec![],
+            "0.0.0.0 ads.example.com\n",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        let wire = build_query("ads.example.com.", ProtoRecordType::A);
+        let dns_param = URL_SAFE_NO_PAD.encode(&wire);
+        let url = format!("{base}/dns-query?dns={dns_param}");
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.bytes().await.unwrap();
+        let dns = Message::from_bytes(&body).unwrap();
+        assert_eq!(dns.response_code(), ResponseCode::NXDomain);
+        assert!(dns.answers().is_empty());
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doh_rejects_malformed_dns_message() {
+        let handler = build_handler(
+            vec![],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .post(format!("{base}/dns-query"))
+            .header("content-type", "application/dns-message")
+            .body(b"not a DNS message".to_vec())
+            .send()
+            .await
+            .unwrap();
+        // RFC 8484 says implementations may return either a DNS-format
+        // FormErr or HTTP 4xx; we return HTTP 400 per a comment in
+        // handle_dns_message about not synthesising a FormErr without
+        // a parsed header.
+        assert_eq!(resp.status(), 400);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doh_rejects_invalid_base64url_get() {
+        let handler = build_handler(
+            vec![],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .get(format!("{base}/dns-query?dns=*not-base64*"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        shutdown.cancel();
+    }
+}
