@@ -242,3 +242,291 @@ fn dns_record_to_rr(rec: &DnsRecord) -> Option<Record> {
 
     Some(Record::from_rdata(name, ttl, rdata))
 }
+
+// ===========================================================================
+// End-to-end integration tests
+//
+// Wires Authority + BlocklistEngine + Resolver + DnsHandler + ServerFuture
+// in-process on a loopback UDP port and sends real DNS queries via a raw
+// tokio UdpSocket. Covers the three invariants from AGENTS.md §Testing:
+//   - blocked domain → NXDOMAIN
+//   - authority hit bypasses the blocklist
+//   - upstream failure → SERVFAIL (fail_closed)
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name as ProtoName, RecordType as ProtoRecordType};
+    use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+    use hickory_server::server::ServerFuture;
+    use tokio::net::UdpSocket;
+    use tokio::time::timeout;
+
+    use rustydns_authority::Authority;
+    use rustydns_blocklist::BlocklistEngine;
+    use rustydns_core::config::{
+        AuthorityConfig, BlockResponse, BlocklistConfig, DnsConfig, StaticRecord, UpstreamConfig,
+    };
+    use rustydns_resolver::Resolver;
+
+    use crate::handler::DnsHandler;
+    use crate::metrics::Metrics;
+
+    /// Daemon test harness: pipeline wired, listening on a randomly
+    /// assigned loopback port. `port` is the bound UDP port.
+    struct Harness {
+        port: u16,
+        // Hold the server future so it isn't dropped (which would shut
+        // the listener down). The test drops it at the end of scope.
+        _server: ServerFuture<DnsHandler>,
+    }
+
+    async fn build_harness(
+        static_records: Vec<StaticRecord>,
+        blocklist_lines: &str,
+        upstream_resolvers: Vec<String>,
+        block_response: BlockResponse,
+    ) -> Harness {
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+
+        let authority_cfg = AuthorityConfig {
+            mesh_zone_bundle_path: None,
+            mesh_zone_verifier_key_path: None,
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records,
+            poll_interval_secs: 30,
+        };
+        let authority = Arc::new(Authority::new(authority_cfg).expect("authority"));
+
+        let mut blocklist_cfg = BlocklistConfig::default();
+        blocklist_cfg.sources = Vec::new();
+        blocklist_cfg.reload_interval_secs = 0;
+        blocklist_cfg.block_response = block_response;
+        let blocklist = Arc::new(BlocklistEngine::new(blocklist_cfg));
+        if !blocklist_lines.is_empty() {
+            blocklist.load_trusted(blocklist_lines);
+        }
+
+        // Build a DnsConfig for the resolver. We intentionally use
+        // unreachable upstreams in the SERVFAIL test so we never touch
+        // the network in CI.
+        let mut upstream = UpstreamConfig::default();
+        upstream.resolvers = upstream_resolvers;
+        // Short timeout so the SERVFAIL test doesn't take 5+ seconds.
+        upstream.timeout_ms = 500;
+        let mut dns_config = DnsConfig {
+            server: Default::default(),
+            upstream,
+            authority: Default::default(),
+            blocklist: Default::default(),
+            privacy: Default::default(),
+            metrics: Default::default(),
+            policy: Vec::new(),
+        };
+        // Disable randomisation for deterministic test ordering.
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+
+        let resolver = Arc::new(
+            Resolver::new(dns_config)
+                .await
+                .expect("resolver builds even with bogus upstreams (bootstrap is best-effort)"),
+        );
+
+        let handler =
+            DnsHandler::new(authority, blocklist, resolver, metrics).expect("handler");
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let port = socket.local_addr().unwrap().port();
+        let mut server = ServerFuture::new(handler);
+        server.register_socket(socket);
+
+        Harness {
+            port,
+            _server: server,
+        }
+    }
+
+    /// Send a question over UDP, return the parsed response.
+    async fn query(port: u16, name: &str, rtype: ProtoRecordType) -> Message {
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+        let mut msg = Message::new();
+        msg.set_id(0x1234)
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Query)
+            .set_recursion_desired(true);
+        let name = ProtoName::from_ascii(name).expect("name parse");
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(name).set_query_type(rtype);
+            q
+        });
+        let bytes = msg.to_bytes().expect("encode");
+        client
+            .send_to(&bytes, format!("127.0.0.1:{port}"))
+            .await
+            .expect("send");
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("response within 5s")
+            .expect("recv");
+        Message::from_bytes(&buf[..n]).expect("decode response")
+    }
+
+    fn static_a(name: &str, addr: &str) -> StaticRecord {
+        StaticRecord {
+            name: name.to_string(),
+            record_type: "A".to_string(),
+            address: Some(addr.to_string()),
+            target: None,
+            ttl: 300,
+            client_filter: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authority_hit_serves_static_record_with_aa_flag() {
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()], // unreachable, but unused
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.authoritative(), "authority hit must set the aa flag");
+        let answers = resp.answers();
+        assert_eq!(answers.len(), 1, "exactly one A record expected");
+        let rdata = answers[0].data().expect("rdata");
+        let ip = match rdata {
+            hickory_proto::rr::RData::A(a) => a.0.to_string(),
+            other => panic!("expected A, got {other:?}"),
+        };
+        assert_eq!(ip, "100.64.0.5");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authority_hit_bypasses_blocklist() {
+        // Static record for the same name that the blocklist would have blocked.
+        // The authority is FIRST in the pipeline (AGENTS.md invariant);
+        // the blocklist must not be consulted for mesh-authoritative names.
+        let harness = build_harness(
+            vec![static_a("ads.example.com", "10.0.0.99")],
+            "0.0.0.0 ads.example.com\n",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
+
+        assert_eq!(
+            resp.response_code(),
+            ResponseCode::NoError,
+            "authority record must NOT be blocked by the blocklist"
+        );
+        assert!(resp.authoritative());
+        let answers = resp.answers();
+        assert_eq!(answers.len(), 1);
+        match answers[0].data().unwrap() {
+            hickory_proto::rr::RData::A(a) => assert_eq!(a.0.to_string(), "10.0.0.99"),
+            other => panic!("expected A, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_domain_returns_nxdomain() {
+        let harness = build_harness(
+            vec![],
+            "0.0.0.0 ads.example.com\n",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
+
+        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
+        assert_eq!(resp.answers().len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_domain_refused_response_code() {
+        let harness = build_harness(
+            vec![],
+            "0.0.0.0 ads.example.com\n",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Refused,
+        )
+        .await;
+
+        let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.response_code(), ResponseCode::Refused);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upstream_failure_returns_servfail() {
+        // No authority hit, no blocklist match, unreachable upstream →
+        // fail-closed → SERVFAIL.
+        let harness = build_harness(
+            vec![],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        let resp = query(harness.port, "definitely-not-cached.example.test.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.response_code(),
+            ResponseCode::ServFail,
+            "fail-closed must return SERVFAIL when no upstream is reachable"
+        );
+        assert_eq!(resp.answers().len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_query_opcode_returns_notimp() {
+        // We're a recursive resolver, not a master server. UPDATE etc.
+        // must return NotImp without ever consulting the pipeline.
+        let harness = build_harness(
+            vec![],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut msg = Message::new();
+        msg.set_id(1)
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Update); // not Query
+        let n = ProtoName::from_ascii("ignored.example.").unwrap();
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(n).set_query_type(ProtoRecordType::A);
+            q
+        });
+        client
+            .send_to(&msg.to_bytes().unwrap(), format!("127.0.0.1:{}", harness.port))
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let resp = Message::from_bytes(&buf[..n]).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NotImp);
+    }
+}
