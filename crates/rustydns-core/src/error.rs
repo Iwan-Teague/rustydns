@@ -21,8 +21,10 @@ pub enum RustyDnsError {
     #[error("zone error: {0}")]
     Zone(String),
 
-    /// The SQLite database for the Rustynet zone could not be opened or read.
-    #[error("rustynet database error: {0}")]
+    /// The Rustynet signed dns-zone bundle could not be read, parsed,
+    /// or verified. Kept as the unified database-style variant for any
+    /// future persistent state read by the daemon.
+    #[error("rustynet zone source error: {0}")]
     Database(String),
 
     // --- Blocklist ----------------------------------------------------------

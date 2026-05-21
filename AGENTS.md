@@ -94,7 +94,7 @@ Implement in this order to avoid dependency inversions:
 ## Testing expectations
 
 - `rustydns-blocklist`: unit tests for hosts-format parsing, RPZ parsing, wildcard matching, AdGuard parsing, allowlist bypass, trusted/untrusted RPZ passthru distinction, domain label validation, and size limit enforcement. No network required.
-- `rustydns-authority`: unit tests with an in-memory zone source. Integration test against a real SQLite file with Rustynet schema.
+- `rustydns-authority`: unit tests with an in-memory zone source plus a synthetic signed bundle (build one in-test with `ed25519-dalek`). Mesh integration consumes a **signed bundle file** produced by `rustynetd` — see `docs/integration-rustynet.md`. There is no SQLite database (earlier drafts of this doc and `docs/architecture.md` referenced one — that was speculative).
 - `rustydns-resolver`: integration tests using a mock DoH server (use `wiremock` or `axum` test server). No real upstream calls in CI. Tests must cover: ECS stripping, query minimisation behaviour, padding, DNSSEC validation pass/fail, fail-closed, TLS 1.3 enforcement.
 - `rustydnsd`: end-to-end test that starts the full daemon on a random port and sends real DNS queries. Must cover: blocked domain returns NXDOMAIN, authority hit bypasses blocklist, upstream failure returns SERVFAIL.
 
@@ -102,7 +102,7 @@ Implement in this order to avoid dependency inversions:
 
 - **Do not add a web UI.** Rustyfin is the UI. Rustydns exposes `/metrics` and a minimal management API only.
 - **Do not implement DNSSEC signing.** Validation is in scope; signing is not (we don't own a public zone).
-- **Do not add a database.** Rustynet's SQLite is read-only from rustydns. Query logs stay in memory.
+- **Do not add a database.** rustydns has no persistent state of its own. Mesh data comes from a Rustynet-produced signed bundle file (read-only). Query logs stay in memory.
 - **Do not diverge from the hickory-dns crate family.** We use `hickory-server`, `hickory-proto`, and `hickory-resolver`. Do not introduce a competing DNS library.
 - **Do not add `allow_http_sources`, `verify_tls_certs = false`, `disable_dnssec`, or any similar "escape hatch" config field** that would silently degrade security. If an operator wants to do something insecure, they must do it at the infrastructure layer (firewall, proxy), not inside the daemon.
 - **Do not log full query names at `info` or above.** See log redaction invariant above.

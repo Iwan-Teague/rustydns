@@ -5,9 +5,11 @@
 //!
 //! Serves DNS answers for two zone types:
 //!
-//! 1. **Mesh zone** — live records read from the `rustynet-dns-zone` SQLite
-//!    database. Updated on a configurable poll interval (default 30 s) and
-//!    cached in memory between polls.
+//! 1. **Mesh zone** — records read from a signed bundle file written by
+//!    `rustynetd`. The bundle's ed25519 signature is verified at every
+//!    load against an operator-configured verifier key. Updated on a
+//!    configurable poll interval (default 30 s) and held behind
+//!    `arc_swap::ArcSwap` so reads never block during reload.
 //!
 //! 2. **Static zones** — records declared directly in `rustydns.toml` under
 //!    `[[authority.static_records]]`. Useful for local overrides and
@@ -30,66 +32,822 @@
 //!
 //! # Status
 //!
-//! Milestone 2 (in progress). Current implementation: static zone from TOML.
-//! Rustynet SQLite integration is the next step.
+//! Milestone 2 complete. Implementation: static zones from TOML, plus
+//! signed mesh-zone bundle read from disk with ed25519 verification and
+//! `ArcSwap` hot reload.
 
-use rustydns_core::config::AuthorityConfig;
-use rustydns_core::record::DnsRecord;
+mod mesh;
+
+pub use mesh::{LoadedBundle, MeshBundleError};
+
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+
+use rustydns_core::RustyDnsError;
+use rustydns_core::config::{AuthorityConfig, StaticRecord};
+use rustydns_core::record::{DnsRecord, RecordData, STATIC_RECORD_TTL};
 
 /// Result type for authority operations.
-pub type AuthorityResult<T> = Result<T, rustydns_core::RustyDnsError>;
+pub type AuthorityResult<T> = Result<T, RustyDnsError>;
+
+/// Immutable snapshot of the authority's zone state.
+///
+/// All reader-visible state lives in a snapshot held behind
+/// [`arc_swap::ArcSwap`] so the background reloader can swap it
+/// atomically without blocking readers.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    /// Lowercased, trailing-dot zone apexes (static + mesh).
+    zones: Vec<String>,
+    /// Per-name record store. Key is the lowercased FQDN with trailing dot.
+    records: HashMap<String, Vec<DnsRecord>>,
+}
 
 /// The authoritative zone server.
 ///
 /// Holds an in-memory view of all zones it is authoritative for. Answers
 /// queries for names within those zones; returns `None` for names outside
 /// them (which the daemon then forwards to the blocklist + resolver pipeline).
+///
+/// Lock-free hot reload: the mesh-zone bundle can be re-read via
+/// [`Authority::reload_mesh`] without blocking lookups.
+#[derive(Debug)]
 pub struct Authority {
     config: AuthorityConfig,
-    // TODO (Milestone 2): add static zone store and SQLite zone reader.
+    /// Lowercased mesh zone with trailing dot (e.g. `"mesh."`).
+    mesh_zone: String,
+    /// Static records — fixed at startup, used to rebuild snapshots on reload.
+    static_records: HashMap<String, Vec<DnsRecord>>,
+    /// Static zone apexes — fixed at startup.
+    static_zones: Vec<String>,
+    /// Atomically swappable snapshot of the merged static + mesh state.
+    snapshot: ArcSwap<Snapshot>,
 }
 
 impl Authority {
     /// Create a new authority from config.
     ///
     /// At startup, static records from `config.static_records` are loaded
-    /// into memory. The Rustynet SQLite database is opened read-only (if it
-    /// exists); missing database is non-fatal at startup (gracefully degrades
-    /// to static-only mode with a warning).
+    /// into memory. If `mesh_zone_bundle_path` and
+    /// `mesh_zone_verifier_key_path` are both set, the Rustynet
+    /// mesh-zone bundle is read and its ed25519 signature verified; on
+    /// any failure the daemon falls back to static-only mode with a
+    /// warning rather than refusing to start.
+    ///
+    /// Returns [`RustyDnsError::Zone`] if any static record is malformed
+    /// (unknown type, missing required field, unparseable address, etc.).
     pub fn new(config: AuthorityConfig) -> AuthorityResult<Self> {
+        let mesh_zone = normalise_name(&config.mesh_zone);
+
+        // Build the static-record half once — it never changes at runtime.
+        let mut static_records: HashMap<String, Vec<DnsRecord>> = HashMap::new();
+        let mut static_zones: Vec<String> = Vec::new();
+        for sr in &config.static_records {
+            let rec = static_record_to_dns_record(sr)?;
+            let name = rec.name.clone();
+            if !static_zones.iter().any(|z| z == &name) {
+                static_zones.push(name.clone());
+            }
+            static_records.entry(name).or_default().push(rec);
+        }
+
+        // Initial mesh-zone load. Failure is non-fatal.
+        let mesh = load_mesh_if_configured(&config, &mesh_zone);
+        let mesh_record_count = mesh.as_ref().map(|m| m.records.len()).unwrap_or(0);
+
+        let snapshot = build_snapshot(&static_records, &static_zones, mesh.as_ref());
+
         tracing::info!(
             static_records = config.static_records.len(),
-            db = %config.rustynet_db.display(),
+            static_zones = static_zones.len(),
+            mesh_records = mesh_record_count,
+            mesh_zone = %mesh_zone,
             poll_interval_secs = config.poll_interval_secs,
-            "authority initialised (static-only mode — Rustynet DB integration pending)"
+            "authority initialised"
         );
-        Ok(Self { config })
+
+        Ok(Self {
+            config,
+            mesh_zone,
+            static_records,
+            static_zones,
+            snapshot: ArcSwap::from(Arc::new(snapshot)),
+        })
+    }
+
+    /// Re-read the mesh-zone bundle (if configured) and atomically swap
+    /// in a new snapshot.
+    ///
+    /// Returns:
+    /// - `Ok(Some(count))` — bundle reloaded successfully, `count` mesh
+    ///   records are now live.
+    /// - `Ok(None)` — bundle is not configured; nothing to do.
+    /// - `Err(_)` — bundle read or signature verification failed. The
+    ///   previous snapshot is **kept** (caller decides whether to keep
+    ///   running or shut down).
+    ///
+    /// Lock-free: existing lookups in flight see the old snapshot until
+    /// they finish; new lookups after the swap see the new one.
+    pub fn reload_mesh(&self) -> Result<Option<usize>, MeshBundleError> {
+        let (bundle_path, key_path) = match (
+            self.config.mesh_zone_bundle_path.as_ref(),
+            self.config.mesh_zone_verifier_key_path.as_ref(),
+        ) {
+            (Some(b), Some(k)) => (b, k),
+            _ => return Ok(None),
+        };
+
+        let loaded = mesh::load_mesh_bundle(
+            bundle_path,
+            key_path,
+            &self.mesh_zone,
+            self.config.mesh_zone_max_age_secs,
+        )?;
+        let count = loaded.records.len();
+        let snapshot = build_snapshot(&self.static_records, &self.static_zones, Some(&loaded));
+        self.snapshot.store(Arc::new(snapshot));
+        tracing::info!(mesh_records = count, "mesh zone bundle reloaded");
+        Ok(Some(count))
     }
 
     /// Look up `name` in the authority's zones.
     ///
-    /// Returns `Some(records)` if the name is within an authoritative zone
-    /// and records exist. Returns `None` if the name is not within any
-    /// authoritative zone (caller should continue to blocklist + resolver).
+    /// Returns:
+    /// - `Some(records)` if the name is within an authoritative zone and one
+    ///   or more records of `record_type` exist at that exact name.
+    /// - `Some(vec![])` for authoritative NXDOMAIN — the name is within an
+    ///   authoritative zone but has no records of the requested type.
+    /// - `None` if the name is not within any authoritative zone. The caller
+    ///   should continue to the blocklist + resolver pipeline.
     ///
-    /// The returned slice is empty (but `Some`) for authoritative NXDOMAIN
-    /// (name is in the zone but has no records of the requested type).
+    /// `record_type` is matched case-insensitively (`"A"` / `"a"` / `"A "`-trimmed
+    /// all behave the same).
     ///
     /// # Privacy note
     ///
-    /// Authority hits are logged at `tracing::trace!` level only — they must
-    /// not appear at `info` or above in production (would log every mesh query).
+    /// Authority hits are logged at `tracing::trace!` only — they must not
+    /// appear at `info` or above in production (would log every mesh query
+    /// and defeat the privacy posture).
     pub fn lookup(&self, name: &str, record_type: &str) -> Option<Vec<DnsRecord>> {
-        // TODO (Milestone 2): check static zones and SQLite zone.
-        let _ = (name, record_type);
-        tracing::trace!(qname = name, qtype = record_type, "authority miss (stub)");
-        None
+        let key = normalise_name(name);
+        let rtype = record_type.trim().to_ascii_uppercase();
+        let snap = self.snapshot.load();
+
+        if !self.is_authoritative_for_normalised(&key, &snap) {
+            tracing::trace!(qtype = %rtype, "authority not authoritative for name");
+            return None;
+        }
+
+        let matching: Vec<DnsRecord> = snap
+            .records
+            .get(&key)
+            .map(|recs| {
+                if rtype == "ANY" {
+                    recs.clone()
+                } else {
+                    recs.iter()
+                        .filter(|r| r.type_name() == rtype)
+                        .cloned()
+                        .collect()
+                }
+            })
+            .unwrap_or_default();
+
+        tracing::trace!(qtype = %rtype, count = matching.len(), "authority lookup");
+        Some(matching)
     }
 
     /// Returns `true` if `name` is within one of the authority's zones.
+    ///
+    /// A name is "within a zone" if it equals the zone apex or is a
+    /// subdomain of it. Both the mesh zone and every zone apex derived
+    /// from static records are checked.
     pub fn is_authoritative_for(&self, name: &str) -> bool {
-        // TODO (Milestone 2): check zone apex list.
-        let mesh_zone = self.config.mesh_zone.trim_end_matches('.');
-        name.ends_with(mesh_zone)
+        let normalised = normalise_name(name);
+        let snap = self.snapshot.load();
+        self.is_authoritative_for_normalised(&normalised, &snap)
+    }
+
+    fn is_authoritative_for_normalised(&self, name: &str, snap: &Snapshot) -> bool {
+        if name_within_zone(name, &self.mesh_zone) {
+            return true;
+        }
+        snap.zones.iter().any(|zone| name_within_zone(name, zone))
+    }
+
+    /// Borrow the authority's config.
+    pub fn config(&self) -> &AuthorityConfig {
+        &self.config
+    }
+}
+
+/// Build a [`Snapshot`] from the immutable static state plus the optional
+/// loaded mesh bundle. Static records take precedence within a single
+/// name (we push them first, so authority lookups that don't care about
+/// order still see them).
+fn build_snapshot(
+    static_records: &HashMap<String, Vec<DnsRecord>>,
+    static_zones: &[String],
+    mesh: Option<&LoadedBundle>,
+) -> Snapshot {
+    let mut records: HashMap<String, Vec<DnsRecord>> = static_records.clone();
+    let mut zones: Vec<String> = static_zones.to_vec();
+
+    if let Some(loaded) = mesh {
+        for rec in &loaded.records {
+            records.entry(rec.name.clone()).or_default().push(rec.clone());
+            if !zones.iter().any(|z| z == &rec.name) {
+                zones.push(rec.name.clone());
+            }
+        }
+    }
+
+    Snapshot { zones, records }
+}
+
+/// Attempt the initial mesh-zone bundle load. Failures are logged and
+/// returned as `None` so the daemon can still start in static-only mode.
+fn load_mesh_if_configured(
+    config: &AuthorityConfig,
+    mesh_zone: &str,
+) -> Option<LoadedBundle> {
+    let (bundle, key) = match (
+        config.mesh_zone_bundle_path.as_ref(),
+        config.mesh_zone_verifier_key_path.as_ref(),
+    ) {
+        (Some(b), Some(k)) => (b, k),
+        (Some(_), None) | (None, Some(_)) => {
+            tracing::warn!(
+                "authority.mesh_zone_bundle_path and authority.mesh_zone_verifier_key_path must \
+                 both be set to enable mesh integration — running in static-only mode"
+            );
+            return None;
+        }
+        (None, None) => return None,
+    };
+
+    match mesh::load_mesh_bundle(bundle, key, mesh_zone, config.mesh_zone_max_age_secs) {
+        Ok(loaded) => Some(loaded),
+        Err(e) => {
+            tracing::warn!(
+                bundle = %bundle.display(),
+                error = %e,
+                "mesh zone bundle could not be loaded — running in static-only mode"
+            );
+            None
+        }
+    }
+}
+
+/// Returns `true` if `name` equals `zone` or is a subdomain of it.
+///
+/// Both arguments must already be normalised (lowercased, trailing dot).
+fn name_within_zone(name: &str, zone: &str) -> bool {
+    if name == zone {
+        return true;
+    }
+    // Subdomain: name must be longer and end with ".<zone>"
+    name.len() > zone.len()
+        && name.ends_with(zone)
+        && name.as_bytes()[name.len() - zone.len() - 1] == b'.'
+}
+
+/// Normalise a DNS name: lowercase, ensure trailing dot.
+fn normalise_name(name: &str) -> String {
+    let mut n = name.trim().to_ascii_lowercase();
+    if !n.ends_with('.') {
+        n.push('.');
+    }
+    n
+}
+
+/// Convert a TOML [`StaticRecord`] into the in-memory [`DnsRecord`] form.
+///
+/// Returns [`RustyDnsError::Zone`] for unknown record types or missing /
+/// unparseable required fields.
+fn static_record_to_dns_record(sr: &StaticRecord) -> AuthorityResult<DnsRecord> {
+    let ttl = if sr.ttl == 0 {
+        STATIC_RECORD_TTL
+    } else {
+        Duration::from_secs(u64::from(sr.ttl))
+    };
+
+    let rtype = sr.record_type.trim().to_ascii_uppercase();
+    let data = match rtype.as_str() {
+        "A" => {
+            let addr = require_address(sr, "A")?;
+            let ip: Ipv4Addr = addr.parse().map_err(|e| {
+                RustyDnsError::Zone(format!(
+                    "static record `{}` has invalid A address `{}`: {}",
+                    sr.name, addr, e
+                ))
+            })?;
+            RecordData::A(ip)
+        }
+        "AAAA" => {
+            let addr = require_address(sr, "AAAA")?;
+            let ip: Ipv6Addr = addr.parse().map_err(|e| {
+                RustyDnsError::Zone(format!(
+                    "static record `{}` has invalid AAAA address `{}`: {}",
+                    sr.name, addr, e
+                ))
+            })?;
+            RecordData::Aaaa(ip)
+        }
+        "CNAME" => RecordData::Cname(normalise_name(require_target(sr, "CNAME")?)),
+        "PTR" => RecordData::Ptr(normalise_name(require_target(sr, "PTR")?)),
+        "TXT" => {
+            let target = require_target(sr, "TXT")?;
+            RecordData::Txt(vec![target.as_bytes().to_vec()])
+        }
+        "NS" => RecordData::Ns(normalise_name(require_target(sr, "NS")?)),
+        "MX" => {
+            let target = require_target(sr, "MX")?;
+            let mut parts = target.split_whitespace();
+            let pref = parts
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+                .ok_or_else(|| {
+                    RustyDnsError::Zone(format!(
+                        "static record `{}` MX target `{}` must be \"<preference> <hostname>\"",
+                        sr.name, target
+                    ))
+                })?;
+            let exchange = parts.next().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+                RustyDnsError::Zone(format!(
+                    "static record `{}` MX target `{}` missing exchange hostname",
+                    sr.name, target
+                ))
+            })?;
+            if parts.next().is_some() {
+                return Err(RustyDnsError::Zone(format!(
+                    "static record `{}` MX target `{}` has trailing junk after \"<preference> <hostname>\"",
+                    sr.name, target
+                )));
+            }
+            RecordData::Mx {
+                preference: pref,
+                exchange: normalise_name(exchange),
+            }
+        }
+        "SRV" => {
+            let target = require_target(sr, "SRV")?;
+            let parts: Vec<&str> = target.split_whitespace().collect();
+            if parts.len() != 4 {
+                return Err(RustyDnsError::Zone(format!(
+                    "static record `{}` SRV target `{}` must be \"<priority> <weight> <port> <hostname>\"",
+                    sr.name, target
+                )));
+            }
+            let priority = parse_u16(sr, "SRV priority", parts[0])?;
+            let weight = parse_u16(sr, "SRV weight", parts[1])?;
+            let port = parse_u16(sr, "SRV port", parts[2])?;
+            RecordData::Srv {
+                priority,
+                weight,
+                port,
+                target: normalise_name(parts[3]),
+            }
+        }
+        other => {
+            return Err(RustyDnsError::Zone(format!(
+                "static record `{}` has unsupported type `{}` \
+                 (supported: A, AAAA, CNAME, PTR, TXT, MX, NS, SRV)",
+                sr.name, other
+            )));
+        }
+    };
+
+    Ok(DnsRecord::new(&sr.name, data, ttl))
+}
+
+fn require_address<'a>(sr: &'a StaticRecord, type_label: &str) -> AuthorityResult<&'a str> {
+    sr.address.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+        RustyDnsError::Zone(format!(
+            "static record `{}` of type {} is missing required `address` field",
+            sr.name, type_label
+        ))
+    })
+}
+
+fn require_target<'a>(sr: &'a StaticRecord, type_label: &str) -> AuthorityResult<&'a str> {
+    sr.target.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+        RustyDnsError::Zone(format!(
+            "static record `{}` of type {} is missing required `target` field",
+            sr.name, type_label
+        ))
+    })
+}
+
+fn parse_u16(sr: &StaticRecord, label: &str, value: &str) -> AuthorityResult<u16> {
+    value.parse::<u16>().map_err(|_| {
+        RustyDnsError::Zone(format!(
+            "static record `{}` {} `{}` is not a valid u16",
+            sr.name, label, value
+        ))
+    })
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(records: Vec<StaticRecord>) -> AuthorityConfig {
+        AuthorityConfig {
+            mesh_zone_bundle_path: None,
+            mesh_zone_verifier_key_path: None,
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records: records,
+            poll_interval_secs: 30,
+        }
+    }
+
+    fn a(name: &str, addr: &str) -> StaticRecord {
+        StaticRecord {
+            name: name.to_string(),
+            record_type: "A".to_string(),
+            address: Some(addr.to_string()),
+            target: None,
+            ttl: 300,
+            client_filter: None,
+        }
+    }
+
+    #[test]
+    fn static_a_record_exact_match_returns_record() {
+        let auth = Authority::new(cfg(vec![a("host.lab.example.com", "10.0.0.5")])).unwrap();
+
+        let result = auth.lookup("host.lab.example.com", "A").expect("in zone");
+        assert_eq!(result.len(), 1);
+        match &result[0].data {
+            RecordData::A(ip) => assert_eq!(ip.to_string(), "10.0.0.5"),
+            other => panic!("expected A record, got {:?}", other),
+        }
+        assert_eq!(result[0].name, "host.lab.example.com.");
+    }
+
+    #[test]
+    fn wrong_type_returns_authoritative_nxdomain() {
+        let auth = Authority::new(cfg(vec![a("host.lab.example.com", "10.0.0.5")])).unwrap();
+
+        let result = auth.lookup("host.lab.example.com", "AAAA").expect("in zone");
+        assert!(result.is_empty(), "expected authoritative NXDOMAIN (empty Some)");
+    }
+
+    #[test]
+    fn name_outside_any_zone_returns_none() {
+        let auth = Authority::new(cfg(vec![a("host.lab.example.com", "10.0.0.5")])).unwrap();
+
+        // Not in mesh, not in any static zone — pipeline must continue.
+        assert!(auth.lookup("example.org", "A").is_none());
+        assert!(auth.lookup("other.example.com", "A").is_none());
+    }
+
+    #[test]
+    fn name_normalisation_trailing_dot_and_case() {
+        let auth = Authority::new(cfg(vec![a("Host.Lab.Example.COM", "10.0.0.5")])).unwrap();
+
+        // Stored normalised; queries via either form must resolve.
+        let cases = [
+            "host.lab.example.com",
+            "host.lab.example.com.",
+            "HOST.LAB.EXAMPLE.COM",
+            "Host.Lab.Example.Com.",
+        ];
+        for q in cases {
+            let result = auth.lookup(q, "a").unwrap_or_else(|| panic!("`{q}` should resolve"));
+            assert_eq!(result.len(), 1, "lookup of `{q}` should return one record");
+            match &result[0].data {
+                RecordData::A(ip) => assert_eq!(ip.to_string(), "10.0.0.5"),
+                other => panic!("expected A record for `{q}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_static_record_missing_address_errors() {
+        let bad = StaticRecord {
+            name: "broken.example.com".to_string(),
+            record_type: "A".to_string(),
+            address: None, // missing!
+            target: None,
+            ttl: 300,
+            client_filter: None,
+        };
+        let err = Authority::new(cfg(vec![bad])).expect_err("should reject");
+        match err {
+            RustyDnsError::Zone(msg) => {
+                assert!(msg.contains("broken.example.com"), "msg = {msg}");
+                assert!(msg.contains("address"), "msg = {msg}");
+            }
+            other => panic!("expected Zone error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_static_record_unparseable_address_errors() {
+        let err = Authority::new(cfg(vec![a("bad.example.com", "not-an-ip")]))
+            .expect_err("should reject");
+        match err {
+            RustyDnsError::Zone(msg) => {
+                assert!(msg.contains("bad.example.com"), "msg = {msg}");
+            }
+            other => panic!("expected Zone error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_static_record_unknown_type_errors() {
+        let bad = StaticRecord {
+            name: "weird.example.com".to_string(),
+            record_type: "FOO".to_string(),
+            address: None,
+            target: None,
+            ttl: 300,
+            client_filter: None,
+        };
+        let err = Authority::new(cfg(vec![bad])).expect_err("should reject");
+        match err {
+            RustyDnsError::Zone(msg) => assert!(msg.contains("FOO"), "msg = {msg}"),
+            other => panic!("expected Zone error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_authoritative_covers_mesh_zone_and_static_apexes() {
+        let auth = Authority::new(cfg(vec![a("host.lab.example.com", "10.0.0.5")])).unwrap();
+
+        // Mesh zone — apex and subdomains.
+        assert!(auth.is_authoritative_for("mesh"));
+        assert!(auth.is_authoritative_for("mesh."));
+        assert!(auth.is_authoritative_for("router.mesh"));
+        assert!(auth.is_authoritative_for("ROUTER.MESH"));
+        assert!(auth.is_authoritative_for("a.b.c.mesh."));
+
+        // Static zone apex (the record's own name).
+        assert!(auth.is_authoritative_for("host.lab.example.com"));
+        assert!(auth.is_authoritative_for("host.lab.example.com."));
+
+        // Outside any zone.
+        assert!(!auth.is_authoritative_for("example.com"));
+        assert!(!auth.is_authoritative_for("lab.example.com"));
+        assert!(!auth.is_authoritative_for("meshx")); // not a subdomain of "mesh."
+        assert!(!auth.is_authoritative_for("notmesh"));
+    }
+
+    #[test]
+    fn cname_target_is_normalised() {
+        let r = StaticRecord {
+            name: "alias.example.com".to_string(),
+            record_type: "CNAME".to_string(),
+            address: None,
+            target: Some("Target.Example.COM".to_string()),
+            ttl: 300,
+            client_filter: None,
+        };
+        let auth = Authority::new(cfg(vec![r])).unwrap();
+        let result = auth.lookup("alias.example.com", "CNAME").unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].data {
+            RecordData::Cname(t) => assert_eq!(t, "target.example.com."),
+            other => panic!("expected CNAME, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mx_target_parses_preference_and_exchange() {
+        let r = StaticRecord {
+            name: "example.com".to_string(),
+            record_type: "MX".to_string(),
+            address: None,
+            target: Some("10 mail.example.com".to_string()),
+            ttl: 300,
+            client_filter: None,
+        };
+        let auth = Authority::new(cfg(vec![r])).unwrap();
+        let result = auth.lookup("example.com", "MX").unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].data {
+            RecordData::Mx { preference, exchange } => {
+                assert_eq!(*preference, 10);
+                assert_eq!(exchange, "mail.example.com.");
+            }
+            other => panic!("expected MX, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn srv_target_parses_all_four_fields() {
+        let r = StaticRecord {
+            name: "_sip._tcp.example.com".to_string(),
+            record_type: "SRV".to_string(),
+            address: None,
+            target: Some("10 20 5060 sipserver.example.com".to_string()),
+            ttl: 300,
+            client_filter: None,
+        };
+        let auth = Authority::new(cfg(vec![r])).unwrap();
+        let result = auth.lookup("_sip._tcp.example.com", "SRV").unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].data {
+            RecordData::Srv { priority, weight, port, target } => {
+                assert_eq!(*priority, 10);
+                assert_eq!(*weight, 20);
+                assert_eq!(*port, 5060);
+                assert_eq!(target, "sipserver.example.com.");
+            }
+            other => panic!("expected SRV, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ttl_zero_uses_static_record_ttl_default() {
+        let r = StaticRecord {
+            name: "host.example.com".to_string(),
+            record_type: "A".to_string(),
+            address: Some("10.0.0.1".to_string()),
+            target: None,
+            ttl: 0,
+            client_filter: None,
+        };
+        let auth = Authority::new(cfg(vec![r])).unwrap();
+        let result = auth.lookup("host.example.com", "A").unwrap();
+        assert_eq!(result[0].ttl, STATIC_RECORD_TTL);
+    }
+
+    #[test]
+    fn multiple_records_at_same_name_all_returned() {
+        let recs = vec![
+            a("multi.example.com", "10.0.0.1"),
+            a("multi.example.com", "10.0.0.2"),
+        ];
+        let auth = Authority::new(cfg(recs)).unwrap();
+        let result = auth.lookup("multi.example.com", "A").unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Mesh-bundle integration
+    // -----------------------------------------------------------------
+
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now_secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    fn write_temp(name: &str, contents: &[u8]) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!(
+            "rustydns-authority-test-{}-{id}-{name}",
+            std::process::id()
+        ));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(contents).unwrap();
+        p
+    }
+
+    /// Build a valid signed bundle and return (bundle_path, key_path).
+    fn make_bundle(records: &[(&str, &str)], zone: &str) -> (PathBuf, PathBuf) {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let verifier_hex: String = signing
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let now = now_secs();
+        let mut payload = String::new();
+        payload.push_str("version=1\n");
+        payload.push_str(&format!("zone_name={zone}\n"));
+        payload.push_str("subject_node_id=test\n");
+        payload.push_str(&format!("generated_at_unix={now}\n"));
+        payload.push_str(&format!("expires_at_unix={}\n", now + 600));
+        payload.push_str("nonce=42\n");
+        payload.push_str(&format!("record_count={}\n", records.len()));
+        for (i, (label, ip)) in records.iter().enumerate() {
+            payload.push_str(&format!("record.{i}.label={label}\n"));
+            payload.push_str(&format!("record.{i}.fqdn={label}.{zone}\n"));
+            payload.push_str(&format!("record.{i}.target_node_id=node-{i}\n"));
+            payload.push_str(&format!("record.{i}.rr_type=A\n"));
+            payload.push_str(&format!("record.{i}.target_addr_kind=mesh_ipv4\n"));
+            payload.push_str(&format!("record.{i}.expected_ip={ip}\n"));
+            payload.push_str(&format!("record.{i}.ttl_secs=30\n"));
+            payload.push_str(&format!("record.{i}.aliases=\n"));
+        }
+        let sig: String = signing
+            .sign(payload.as_bytes())
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let wire = format!("{payload}signature={sig}\n");
+        let bundle_path = write_temp("auth-bundle", wire.as_bytes());
+        let key_path = write_temp("auth-key", verifier_hex.as_bytes());
+        (bundle_path, key_path)
+    }
+
+    #[test]
+    fn authority_serves_mesh_records_from_bundle() {
+        let (bundle_path, key_path) = make_bundle(&[("router", "100.64.0.1")], "mesh");
+
+        let config = AuthorityConfig {
+            mesh_zone_bundle_path: Some(bundle_path),
+            mesh_zone_verifier_key_path: Some(key_path),
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records: Vec::new(),
+            poll_interval_secs: 30,
+        };
+        let auth = Authority::new(config).unwrap();
+
+        let result = auth.lookup("router.mesh", "A").expect("in zone");
+        assert_eq!(result.len(), 1, "router.mesh must resolve");
+        match &result[0].data {
+            RecordData::A(ip) => assert_eq!(ip.to_string(), "100.64.0.1"),
+            other => panic!("expected A record, got {other:?}"),
+        }
+        // Mesh node id is preserved.
+        assert!(result[0].mesh_node_id.is_some());
+    }
+
+    #[test]
+    fn authority_reload_mesh_picks_up_new_bundle() {
+        let (bundle_path, key_path) = make_bundle(&[("router", "100.64.0.1")], "mesh");
+
+        let config = AuthorityConfig {
+            mesh_zone_bundle_path: Some(bundle_path.clone()),
+            mesh_zone_verifier_key_path: Some(key_path),
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records: Vec::new(),
+            poll_interval_secs: 30,
+        };
+        let auth = Authority::new(config).unwrap();
+
+        // Initially 1 record.
+        assert_eq!(auth.lookup("router.mesh", "A").unwrap().len(), 1);
+        assert!(auth.lookup("nas.mesh", "A").unwrap().is_empty());
+
+        // Rewrite the bundle file with two records, same key.
+        let (new_bundle, _) = make_bundle(
+            &[("router", "100.64.0.1"), ("nas", "100.64.0.2")],
+            "mesh",
+        );
+        std::fs::copy(&new_bundle, &bundle_path).unwrap();
+
+        let count = auth.reload_mesh().unwrap().expect("Some");
+        assert_eq!(count, 2);
+
+        // New record now visible.
+        let nas = auth.lookup("nas.mesh", "A").unwrap();
+        assert_eq!(nas.len(), 1);
+        match &nas[0].data {
+            RecordData::A(ip) => assert_eq!(ip.to_string(), "100.64.0.2"),
+            other => panic!("expected A, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authority_reload_mesh_preserves_snapshot_on_failure() {
+        let (bundle_path, key_path) = make_bundle(&[("router", "100.64.0.1")], "mesh");
+        let config = AuthorityConfig {
+            mesh_zone_bundle_path: Some(bundle_path.clone()),
+            mesh_zone_verifier_key_path: Some(key_path),
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records: Vec::new(),
+            poll_interval_secs: 30,
+        };
+        let auth = Authority::new(config).unwrap();
+
+        // Corrupt the file so reload fails.
+        std::fs::write(&bundle_path, b"garbage").unwrap();
+        let err = auth.reload_mesh().unwrap_err();
+        // Should be MissingSignature (no signature= line found in garbage).
+        assert!(matches!(err, MeshBundleError::MissingSignature), "{err:?}");
+
+        // Previous snapshot still serves.
+        assert_eq!(auth.lookup("router.mesh", "A").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn authority_reload_mesh_returns_none_when_unconfigured() {
+        let auth = Authority::new(cfg(vec![])).unwrap();
+        assert!(matches!(auth.reload_mesh(), Ok(None)));
     }
 }

@@ -84,7 +84,7 @@ pub struct DnsRecord {
 
     /// Rustynet mesh node ID that this record was sourced from, if applicable.
     ///
-    /// `Some` for records read from the `rustynet-dns-zone` SQLite database.
+    /// `Some` for records read from the signed Rustynet `dns-zone` bundle.
     /// `None` for static config records.
     pub mesh_node_id: Option<String>,
 }
@@ -109,8 +109,8 @@ impl DnsRecord {
 
     /// Attach a Rustynet mesh node ID to this record.
     ///
-    /// Called by `rustydns-authority` when loading records from the Rustynet
-    /// SQLite database.
+    /// Called by `rustydns-authority` when loading records from the signed
+    /// Rustynet dns-zone bundle.
     pub fn with_mesh_node(mut self, node_id: impl Into<String>) -> Self {
         self.mesh_node_id = Some(node_id.into());
         self

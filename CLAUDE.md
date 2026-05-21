@@ -14,7 +14,7 @@ Scaffolding. No Rust code exists. Your most likely tasks right now are:
 
 1. Read `AGENTS.md` (invariants, crate order, conventions)
 2. Read `docs/architecture.md` (pipeline design and crate responsibilities)
-3. Check `docs/integration-rustynet.md` if the task involves Rustynet or SQLite
+3. Check `docs/integration-rustynet.md` if the task involves Rustynet (signed dns-zone bundle file — no SQLite, despite older drafts)
 4. Look at the Rustynet workspace for established patterns — particularly how `rustynetd` wires its crates together and how `rustynet-crypto` handles config types
 
 ## Workspace initialisation (first coding task)
@@ -71,6 +71,26 @@ The blocklist engine is the best first Rust target because it has no external de
 ## hickory-dns version note
 
 Use `hickory-*` crates (the renamed fork of `trust-dns`). Do not use `trust-dns-*` crates — they are the old unmaintained names. The `hickory` crates are the actively maintained continuation.
+
+### DoH upstream needs an explicit root-CA feature
+
+`hickory-resolver = { features = ["dns-over-https-rustls", ...] }` does **not** pull in any root certificate source. With `tls_config: None` (the default we pass in `build_name_servers`), hickory builds a `rustls::ClientConfig` with an empty `RootCertStore`, and every upstream cert validates as `UnknownIssuer`.
+
+Symptom: every DoH query → `SERVFAIL` after ~350 ms. At our log level (warn/debug) the error reads `proto error: io error: invalid data` — opaque. The real error only shows with `RUST_LOG=hickory_proto=trace`:
+
+```
+hickory_proto::xfer::dns_exchange: stream errored while connecting,
+  error: io error: invalid peer certificate: UnknownIssuer
+```
+
+The double-wrap (`io error: invalid data`) is hickory's `Display` impl flattening the source chain. If you need the real reason at debug without `hickory_proto=trace`, walk `std::error::Error::source()` and log the chain.
+
+Fix: add one of these features to the `hickory-resolver` line in workspace `Cargo.toml`:
+
+- `webpki-roots` — Mozilla CA bundle compiled in. Deterministic, no host-trust-store surprises. **Preferred for this project.**
+- `native-certs` — reads system trust store via `rustls-native-certs 0.6` at startup. Respects user-added CAs.
+
+Do **not** assume the workspace-level `rustls-native-certs 0.7` covers this — hickory 0.24 is pinned to rustls 0.21 internally and needs its own feature-gated copy of `rustls-native-certs 0.6`. When hickory upgrades to rustls 0.23 we can switch to passing an explicit `TlsClientConfig` (see the TLS 1.3 floor TODO in `rustydns-resolver`).
 
 ## Performance-sensitive paths
 

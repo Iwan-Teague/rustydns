@@ -24,14 +24,15 @@ tokio      = { version = "1",   features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # DNS — hickory-* ONLY (trust-dns-* is unmaintained, do not add)
-hickory-server   = "0.24"
+hickory-server   = { version = "0.24", features = ["dns-over-rustls"] }
 hickory-proto    = "0.24"
-hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "dns-over-quic"] }
+hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "dns-over-quic", "dnssec-ring", "webpki-roots"] }
 
 # HTTP / TLS — rustls backend only, no openssl
 axum              = { version = "0.7", features = ["http2"] }
 rustls            = { version = "0.23", features = ["ring"], default-features = false }
 rustls-native-certs = "0.7"
+rustls-pemfile    = "2"
 tokio-rustls      = "0.26"
 # HTTP client for blocklist fetching — HTTPS-only, rustls, no openssl
 reqwest = { version = "0.12", default-features = false, features = [
@@ -62,20 +63,34 @@ arc-swap = "1"
 # Fast, DoS-resistant hashing (randomised seed per process)
 ahash = "0.8"
 
+# Async trait helpers
+async-trait = "0.1"
+
+# Streams for HTTP body limiting
+futures-util = "0.3"
+
 # Bounded concurrent TTL-aware cache for resolver
 moka = { version = "0.12", features = ["future"] }
 
 # Prometheus metrics
 prometheus = "0.13"
 
-# Read-only access to rustynet-dns-zone SQLite database
-rusqlite = { version = "0.31", features = ["bundled"] }
+# Verifies the ed25519 signature on the Rustynet dns-zone bundle.
+# `default-features = false` drops `rand_core` from the public API surface,
+# which we don't need (we only verify, never sign).
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+
+# SHA-256 used by Rustynet's dns-zone watermark format.
+sha2 = "0.10"
 
 # Zeroize sensitive config fields on drop (tokens, keys)
 zeroize = { version = "1", features = ["derive"] }
 
 # Randomise upstream resolver selection
 rand = "0.8"
+
+# Base64 for DoH query decoding
+base64 = "0.22"
 
 # Test-only: mock HTTP server for resolver integration tests
 wiremock = "0.6"

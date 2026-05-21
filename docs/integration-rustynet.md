@@ -4,15 +4,21 @@
 
 ## Zone data from rustynet-dns-zone
 
-Rustynet's control plane maintains a DNS zone for the mesh via the `rustynet-dns-zone` crate. Every peer that joins the mesh gets an `A`/`AAAA` record under the mesh zone (default `mesh.`). `rustydns-authority` reads this data directly:
+Rustynet's control plane maintains a DNS zone for the mesh via the `rustynet-dns-zone` crate. Every peer that joins the mesh gets an `A` record under the mesh zone (default `mesh.`). The zone is published as a **signed, line-oriented bundle file** that `rustynetd` writes to disk. `rustydns-authority` reads that file, verifies its ed25519 signature against an operator-configured verifier key, and merges the records into its authority store:
 
 ```
 rustynetd
   └─► rustynet-control (membership reconciliation)
-        └─► rustynet-dns-zone (zone writes to SQLite)
-              └─► rustydns-authority (live reads via zone API)
-                    └─► clients get `mydevice.mesh A 100.64.x.x`
+        └─► rustynet-dns-zone (builds + signs zone bundle)
+              └─► /var/lib/rustynet/dns-zone.bundle
+                    └─► rustydns-authority (read + ed25519 verify + serve)
+                          └─► clients get `mydevice.mesh A 100.64.x.x`
 ```
+
+Earlier drafts of this document and `AGENTS.md` referred to a SQLite
+control database. **That was speculative — the real implementation is the
+signed bundle file.** `rustydns` matches the real implementation, not the
+old spec.
 
 ### Recommended deployment
 
@@ -25,24 +31,48 @@ resolvers     = ["100.64.0.1"]   # mesh IP of the node running rustydnsd
 search_domains = ["mesh."]
 ```
 
-### SQLite path and permissions
+### Bundle + verifier-key paths
 
-`rustydns-authority` opens the Rustynet control database read-only:
+`rustydns-authority` reads the signed dns-zone bundle file written by
+`rustynetd`. Both the bundle path and the path to the ed25519 verifier
+public key must be configured:
 
 ```toml
 # In rustydns.toml
 [authority]
-rustynet_db = "/var/lib/rustynet/control.db"
+mesh_zone_bundle_path       = "/var/lib/rustynet/dns-zone.bundle"
+mesh_zone_verifier_key_path = "/var/lib/rustynet/dns-zone-verifier.key"
+mesh_zone_max_age_secs      = 600   # reject bundles older than 10 min
+poll_interval_secs          = 30
 ```
 
-**Required permissions:** The `rustydns` user must be a member of the group that owns `/var/lib/rustynet/control.db`. The file must not be writable by `rustydns` — only by `rustynetd`. Verify with:
+The verifier key file must contain a single hex-encoded 32-byte ed25519
+public key (64 hex chars on one line). The corresponding signing key
+lives inside `rustynetd` and never leaves it — that's what makes the
+bundle trustworthy after it's been written to disk.
+
+**Required permissions:** the `rustydns` user must be in the group that
+owns the bundle file and the key file. Neither file should be writable
+by `rustydns` — only by `rustynetd`. Verify with:
 
 ```bash
-ls -la /var/lib/rustynet/control.db
-# -rw-r----- 1 rustynet rustynet ...
-# rustydns user must be in the rustynet group:
-id rustydns
+ls -la /var/lib/rustynet/dns-zone.bundle /var/lib/rustynet/dns-zone-verifier.key
+# -rw-r----- 1 rustynet rustynet ...   (bundle)
+# -rw-r----- 1 rustynet rustynet ...   (verifier key)
+id rustydns        # confirm rustydns is in the rustynet group
 ```
+
+### Refresh model
+
+The daemon re-reads the bundle every `poll_interval_secs` (default 30s)
+and atomically swaps in the new snapshot via `ArcSwap` — readers never
+block during reload. `SIGHUP` triggers an immediate reload alongside
+the blocklist reload.
+
+A bundle whose `expires_at_unix` is in the past, or whose
+`generated_at_unix` is older than `mesh_zone_max_age_secs`, is rejected
+at load time. The previous snapshot keeps serving — the daemon never
+serves an unsigned, untrusted, or expired bundle.
 
 ## Rustynet policy integration
 
@@ -121,8 +151,9 @@ client_filter = "external"       # served only to non-mesh clients
 - [ ] `rustydnsd` binary installed with `chmod 750` and `CAP_NET_BIND_SERVICE` set
 - [ ] Running as `rustydns` user (verify: `ps aux | grep rustydnsd`)
 - [ ] Config file `rustydns.toml` has permissions `0640` (owner root, group rustydns)
-- [ ] `rustydns` user is in the `rustynet` group (for SQLite read access)
-- [ ] Read access to `/var/lib/rustynet/control.db` confirmed
+- [ ] `rustydns` user is in the `rustynet` group (for bundle/key read access)
+- [ ] Read access to `mesh_zone_bundle_path` and `mesh_zone_verifier_key_path` confirmed
+- [ ] Verifier key file contains the **correct** ed25519 public key (64 hex chars). A mismatched key silently disables the mesh zone.
 - [ ] Rustynet peers configured to use this node as their DNS resolver
 - [ ] Rustynet policy allows `dns` capability for intended nodes
 - [ ] Blocklist sources are all `https://` URLs (verify: `rustydnsd --validate-config`)

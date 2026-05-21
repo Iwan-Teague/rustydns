@@ -20,6 +20,7 @@
 //! - Full IP logging emits a warning
 
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -46,7 +47,7 @@ fn default_resolvers() -> Vec<String> {
     ]
 }
 fn default_ring_size() -> usize { 1_000 }
-fn default_rustynet_db() -> PathBuf { PathBuf::from("/var/lib/rustynet/control.db") }
+fn default_mesh_zone_max_age_secs() -> u64 { 600 }
 fn default_sinkhole_ip() -> String { "0.0.0.0".to_string() }
 fn default_sources() -> Vec<String> {
     vec!["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts".to_string()]
@@ -63,7 +64,7 @@ fn default_true() -> bool { true }
 /// All defaults are the most secure and most private option. Unknown fields
 /// are rejected (`deny_unknown_fields`) to catch typos that would silently
 /// leave a security option un-set.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DnsConfig {
     #[serde(default)]
@@ -89,7 +90,7 @@ pub struct DnsConfig {
 // ---------------------------------------------------------------------------
 
 /// Network listener configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
     /// UDP and TCP listen addresses.
     ///
@@ -186,7 +187,7 @@ pub enum TlsVersion {
 }
 
 /// Upstream resolver configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UpstreamConfig {
     /// Upstream DoH/DoQ resolver URLs. All must use `https://`.
     ///
@@ -254,17 +255,61 @@ impl Default for UpstreamConfig {
 // ---------------------------------------------------------------------------
 
 /// Authoritative zone configuration.
-#[derive(Debug, Deserialize, Serialize)]
+///
+/// # Rustynet mesh integration
+///
+/// `rustydns` consumes the mesh zone via the **signed bundle file**
+/// written by `rustynetd` (the `dns_zone_bundle_path` it configures).
+/// Earlier drafts of this doc and `AGENTS.md` mentioned a SQLite
+/// `control.db` — that was speculative. The actual Rustynet
+/// implementation is a flat, signed, line-oriented bundle file. We
+/// match the real implementation, not the old spec.
+///
+/// The verifier key is a 32-byte ed25519 public key written
+/// hex-encoded on a single line. If `mesh_zone_bundle_path` is unset,
+/// the authority serves static records only.
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AuthorityConfig {
-    /// Path to the Rustynet control SQLite database (opened **read-only**).
-    #[serde(default = "default_rustynet_db")]
-    pub rustynet_db: PathBuf,
+    /// Path to the signed dns-zone bundle file written by `rustynetd`.
+    ///
+    /// If unset, the authority runs in static-only mode (no mesh zone).
+    #[serde(default)]
+    pub mesh_zone_bundle_path: Option<PathBuf>,
+
+    /// Path to the ed25519 verifier public key for the dns-zone bundle.
+    ///
+    /// The file must contain a single hex-encoded 32-byte ed25519 public
+    /// key. Required when `mesh_zone_bundle_path` is set.
+    #[serde(default)]
+    pub mesh_zone_verifier_key_path: Option<PathBuf>,
+
+    /// Maximum age (seconds) of a bundle that is still considered fresh.
+    ///
+    /// A bundle whose `expires_at_unix` is in the past, OR whose
+    /// `generated_at_unix` is older than now minus this value, is
+    /// rejected at load time. Default: 600 seconds (10 minutes).
+    ///
+    /// Set generously enough to tolerate brief `rustynetd` outages but
+    /// not so generously that a stolen-key attacker has a long replay
+    /// window against a daemon that has lost network connectivity.
+    #[serde(default = "default_mesh_zone_max_age_secs")]
+    pub mesh_zone_max_age_secs: u64,
+
+    /// Rustynet mesh zone name. Must end with `'.'`.
+    ///
+    /// Mirrors [`ServerConfig::mesh_zone`] so the authority can answer
+    /// "is this name within the mesh zone?" without holding a reference to
+    /// the server config. The daemon is expected to keep these two values
+    /// in sync (either by reading the same default or by setting both
+    /// explicitly in `rustydns.toml`).
+    #[serde(default = "default_mesh_zone")]
+    pub mesh_zone: String,
 
     /// Static zone records declared in this config.
     #[serde(default)]
     pub static_records: Vec<StaticRecord>,
 
-    /// SQLite poll interval in seconds. Minimum: 5. Default: 30.
+    /// Bundle re-read interval in seconds. Minimum: 5. Default: 30.
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
 }
@@ -272,7 +317,10 @@ pub struct AuthorityConfig {
 impl Default for AuthorityConfig {
     fn default() -> Self {
         Self {
-            rustynet_db: default_rustynet_db(),
+            mesh_zone_bundle_path: None,
+            mesh_zone_verifier_key_path: None,
+            mesh_zone_max_age_secs: default_mesh_zone_max_age_secs(),
+            mesh_zone: default_mesh_zone(),
             static_records: Vec::new(),
             poll_interval_secs: default_poll_interval(),
         }
@@ -317,7 +365,7 @@ pub enum BlockResponse {
 }
 
 /// Blocklist engine configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BlocklistConfig {
     /// Remote blocklist source URLs. **Must use `https://`.**
     ///
@@ -411,7 +459,7 @@ impl Default for BlocklistConfig {
 /// **All options default to the most privacy-preserving value.**
 /// Every option is documented with what it protects against.
 /// To reduce privacy, you must explicitly opt out — nothing degrades silently.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PrivacyConfig {
     /// RFC 7816 — Query Name Minimisation.
     ///
@@ -500,7 +548,7 @@ impl Default for PrivacyConfig {
 // ---------------------------------------------------------------------------
 
 /// Prometheus metrics endpoint configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MetricsConfig {
     /// Listen address. **Bind to `127.0.0.1` only** unless behind an
     /// authenticated reverse proxy. Metrics are unauthenticated and expose
@@ -724,6 +772,35 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         }
     }
 
+    // Trusted RPZ sources must also be HTTPS
+    for source in &cfg.blocklist.trusted_rpz_sources {
+        if source.starts_with("http://") {
+            return Err(crate::RustyDnsError::Config(format!(
+                "blocklist.trusted_rpz_sources entry `{source}` uses plain HTTP — only https:// sources are allowed"
+            )));
+        }
+    }
+
+    // Fetch timeout must be non-zero
+    if cfg.blocklist.fetch_timeout_ms == 0 {
+        return Err(crate::RustyDnsError::Config(
+            "blocklist.fetch_timeout_ms = 0 is invalid — use a positive timeout in milliseconds".to_string(),
+        ));
+    }
+
+    // Max fetch bytes must be bounded
+    if cfg.blocklist.max_fetch_bytes == 0 {
+        return Err(crate::RustyDnsError::Config(
+            "blocklist.max_fetch_bytes = 0 is invalid — use a positive limit".to_string(),
+        ));
+    }
+    if cfg.blocklist.max_fetch_bytes > 100 * 1024 * 1024 {
+        return Err(crate::RustyDnsError::Config(format!(
+            "blocklist.max_fetch_bytes = {} exceeds the maximum of 100 MiB. Reduce to a safer limit.",
+            cfg.blocklist.max_fetch_bytes
+        )));
+    }
+
     // reload_interval_secs minimum (0 is allowed — means SIGHUP only)
     if cfg.blocklist.reload_interval_secs > 0 && cfg.blocklist.reload_interval_secs < 300 {
         return Err(crate::RustyDnsError::Config(format!(
@@ -784,6 +861,25 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
              This identifies individual clients. Consider using the default anonymised form \
              (last two IPv4 octets zeroed → /16 prefix)."
         );
+    }
+
+    // --- Metrics -----------------------------------------------------------------
+
+    match cfg.metrics.listen.parse::<SocketAddr>() {
+        Ok(addr) => {
+            if !addr.ip().is_loopback() {
+                tracing::warn!(
+                    listen = %cfg.metrics.listen,
+                    "metrics.listen is not loopback — metrics are unauthenticated and must not be exposed"
+                );
+            }
+        }
+        Err(_) => {
+            return Err(crate::RustyDnsError::Config(format!(
+                "metrics.listen `{}` is not a valid socket address",
+                cfg.metrics.listen
+            )));
+        }
     }
 
     // --- Per-node policy ---------------------------------------------------------

@@ -340,7 +340,8 @@ contain unsafe code. The known unsafe surface is:
 | `rustls`             | Pure-Rust TLS; some low-level buffer operations                  | Low — formally verified components |
 | `quinn`              | QUIC implementation; unsafe for performance-critical paths       | Medium — active security research |
 | `reqwest`            | HTTP client built on tokio/hyper                                 | Low — no C FFI |
-| `rusqlite`           | Bundles SQLite C library (C FFI); used by mesh authority         | Medium — SQLite is well-fuzzed but is C |
+| `ed25519-dalek`      | ed25519 signature verification for the Rustynet mesh-zone bundle | Low — pure Rust, widely-audited |
+| `sha2`               | SHA-256 used by the Rustynet dns-zone watermark format           | Low — pure Rust |
 | `ring` / `aws-lc-rs` | Cryptographic primitive implementations (mixed Rust + assembly)  | Low — FIPS-audited paths |
 
 We do not use `openssl-sys`, `libc` directly, or any crate that shells out to an
@@ -408,14 +409,26 @@ a connection open indefinitely and consuming a worker thread. Mitigation:
 connection establishment. A source that is slower than `max_fetch_bytes / timeout`
 bytes per second will be aborted.
 
-### SQLite Injection via Zone Data
+### Mesh Bundle Tampering
 
-The authority crate stores local zone records in SQLite (via `rusqlite`). If zone data
-is loaded from untrusted input, a malformed domain name could attempt SQL injection
-through the query parameter. Mitigation: all SQLite queries use parameterised statements
-(`?` placeholders); no zone data is ever interpolated into SQL strings. This is enforced
-in code review; a future automated check (e.g. a custom lint or `cargo audit` policy)
-is planned.
+The authority crate consumes mesh-zone records from a signed bundle file
+written by `rustynetd` (see `docs/integration-rustynet.md`). The bundle
+is ed25519-signed; if an attacker tampers with the bundle on disk the
+signature check fails and the daemon keeps serving the previous trusted
+snapshot. Mitigations:
+
+- ed25519 signature verification with a public verifier key configured
+  at startup. Bundles that fail verification are rejected and logged.
+- Freshness check: a bundle whose `expires_at_unix` is in the past, or
+  whose `generated_at_unix` is older than `mesh_zone_max_age_secs`
+  (default 600s), is rejected at load time. This limits the replay
+  window for an attacker who captures an old signed bundle.
+- Bundle file size cap of 256 KiB at read time (matches the Rustynet
+  writer-side limit); a file over the cap is rejected without
+  allocating memory proportional to its size.
+- The verifier key must be deployed via the operator's normal config
+  channel and never written by `rustydns`. The signing key never leaves
+  `rustynetd`.
 
 ### Log File Access Control
 

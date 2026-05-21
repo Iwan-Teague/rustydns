@@ -96,10 +96,28 @@ max_cache_entries = 10000
 [authority]
 # ---------------------------------------------------------------------------
 
-# Path to the Rustynet control SQLite database (opened read-only).
-rustynet_db = "/var/lib/rustynet/control.db"
+# Path to the signed dns-zone bundle file written by rustynetd.
+# If unset, the authority runs in static-only mode (no mesh zone).
+mesh_zone_bundle_path = "/var/lib/rustynet/dns-zone.bundle"
 
-# How often to poll the database for zone changes (seconds).
+# Path to the ed25519 verifier public key (hex-encoded, 64 chars on a
+# single line). Required when mesh_zone_bundle_path is set. The
+# corresponding signing key lives inside rustynetd and never leaves it.
+mesh_zone_verifier_key_path = "/var/lib/rustynet/dns-zone-verifier.key"
+
+# Maximum age (seconds) of a bundle that is still considered fresh. A
+# bundle whose generated_at_unix is older than now - max_age, OR whose
+# expires_at_unix is in the past, is rejected at load time and the
+# previous snapshot keeps serving. Default 600s (10 min).
+mesh_zone_max_age_secs = 600
+
+# Rustynet mesh zone name. Must end with '.'. Mirror of server.mesh_zone —
+# keep these two in sync (the daemon does not auto-sync them so you can
+# split-horizon if you need to).
+mesh_zone = "mesh."
+
+# How often to re-read the bundle file in seconds (set to 0 to disable
+# polling — operators can still SIGHUP to reload on demand).
 poll_interval_secs = 30
 
 # Static zone records.

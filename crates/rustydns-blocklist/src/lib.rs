@@ -28,5 +28,5 @@ mod engine;
 mod parser;
 
 pub use allowlist::Allowlist;
-pub use engine::BlocklistEngine;
+pub use engine::{BlocklistEngine, BlocklistSource};
 pub use parser::{ListFormat, ParsedEntry, detect_format, parse};

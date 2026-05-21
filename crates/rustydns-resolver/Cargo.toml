@@ -15,13 +15,6 @@ hickory-proto    = { workspace = true }
 tokio            = { workspace = true }
 tracing          = { workspace = true }
 thiserror        = { workspace = true }
-rustls           = { workspace = true }
-rustls-native-certs = { workspace = true }
-tokio-rustls     = { workspace = true }
-rand             = { workspace = true }
-moka             = { workspace = true }
-anyhow           = { workspace = true }
 
 [dev-dependencies]
-wiremock = { workspace = true }
-tokio    = { workspace = true }
+tokio = { workspace = true }

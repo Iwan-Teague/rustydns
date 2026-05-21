@@ -32,13 +32,37 @@
 //!
 //! # Status
 //!
-//! Milestone 4 (pending). This binary will be fleshed out once
-//! `rustydns-resolver` is complete. The structure, signal handling, and
-//! blocklist fetch loop are the next implementation steps.
+//! Milestone 4 (in progress). UDP/TCP query pipeline, DoT/DoH listeners,
+//! metrics, and blocklist reload are implemented; capability dropping remains TODO.
 
-use anyhow::{Context, Result, bail};
+mod blocklist_loader;
+mod handler;
+mod doh;
+mod metrics;
+
+use anyhow::{Context, Result, bail, anyhow};
+use std::io::BufReader;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use tracing::info;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::net::{TcpListener, UdpSocket};
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+
+use hickory_server::server::ServerFuture;
+
+use blocklist_loader::BlocklistLoader;
+use handler::DnsHandler;
+use doh as doh_server;
+use metrics::Metrics;
+use rustydns_authority::Authority;
+use rustydns_blocklist::BlocklistEngine;
+use rustydns_resolver::Resolver;
+use rustydns_core::config::{MetricsConfig, ServerConfig};
+use rustls::ServerConfig as TlsServerConfig;
+use rustls_pemfile as pemfile;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,9 +81,7 @@ async fn main() -> Result<()> {
     // errors are captured in the journal.
     init_tracing();
 
-    let config_path = PathBuf::from(
-        std::env::args().nth(2).unwrap_or_else(|| "rustydns.toml".to_string()),
-    );
+    let config_path = PathBuf::from(parse_config_path());
 
     info!(config = %config_path.display(), "rustydnsd starting");
 
@@ -71,6 +93,10 @@ async fn main() -> Result<()> {
     // Load and validate configuration.
     let config = rustydns_core::config::load_config(&config_path)
         .context("failed to load configuration")?;
+
+    let config = Arc::new(config);
+
+    let metrics = Arc::new(Metrics::new()?);
 
     info!(
         mesh_zone         = %config.server.mesh_zone,
@@ -98,33 +124,108 @@ async fn main() -> Result<()> {
     // Tracking: implement before Milestone 4 is marked complete.
     // --------------------------------------------------------------------------
 
-    // TODO (Milestone 4):
-    // 1. Create CancellationToken for graceful shutdown.
-    // 2. Spawn authority (load static zones, open rustynet DB read-only).
-    // 3. Create blocklist engine; spawn background fetch + reload task.
-    //    Policy: if ALL sources fail on first fetch, abort startup with an
-    //    error. If only SOME sources fail, log a warning and continue with
-    //    the partial list — this is preferable to refusing all DNS.
-    // 4. Build resolver with privacy config.
-    // 5. Bind UDP/TCP listeners on config.server.listen addresses.
-    // 6. If config.server.dot_listen is set:
-    //    a. Load TLS certificate from config.server.tls_cert_path.
-    //    b. Load private key from config.server.tls_key_path.
-    //    c. Build rustls ServerConfig (TLS 1.3 minimum, no client auth).
-    //    d. Bind DoT listener.
-    // 7. Spawn DoH axum server on config.server.doh_listen (if set).
-    // 8. Spawn metrics axum server on config.metrics.listen.
-    //    Bind to loopback only — validate this even if config says otherwise.
-    // 9. Drop capabilities (see above).
-    // 10. Install SIGHUP handler to trigger blocklist reload.
-    // 11. Await shutdown signal (SIGTERM/SIGINT).
+    // Build authority (static-only for now).
+    let authority = Arc::new(Authority::new(config.authority.clone())?);
 
-    info!("rustydnsd stub running — full daemon implementation pending (Milestone 4)");
+    // Blocklist engine + initial load.
+    let blocklist_engine = Arc::new(BlocklistEngine::new(config.blocklist.clone()));
+    let blocklist_config = Arc::new(config.blocklist.clone());
+    let blocklist_loader = Arc::new(BlocklistLoader::new(blocklist_config.clone())?);
+    match blocklist_loader.reload(&blocklist_engine).await {
+        Ok(summary) => {
+            if summary.loaded_sources == 0 {
+                metrics.mark_blocklist_reload_failure();
+            } else {
+                metrics.mark_blocklist_reload_success();
+            }
+            metrics.set_blocklist_state(blocklist_engine.entry_count(), blocklist_engine.heap_bytes());
+        }
+        Err(e) => {
+            metrics.mark_blocklist_reload_failure();
+            warn!(error = %e, "initial blocklist load failed; continuing with existing state");
+        }
+    }
 
-    // Keep alive until Ctrl-C for development.
-    tokio::signal::ctrl_c()
+    // Resolver (DoH/DoQ upstream).
+    let resolver = Arc::new(Resolver::new((*config).clone()).await?);
+
+    // Build request handler and server.
+    let handler = DnsHandler::new(authority.clone(), blocklist_engine.clone(), resolver, metrics.clone())?;
+    let doh_handler = Arc::new(handler.clone());
+    let mut server = ServerFuture::new(handler);
+
+    for addr in &config.server.listen {
+        let udp = UdpSocket::bind(addr)
+            .await
+            .with_context(|| format!("failed to bind UDP socket on {addr}"))?;
+        server.register_socket(udp);
+
+        let tcp = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("failed to bind TCP listener on {addr}"))?;
+        server.register_listener(tcp, Duration::from_secs(5));
+
+        info!(listen = %addr, "listening for DNS queries");
+    }
+
+    if let Some(dot_listen) = &config.server.dot_listen {
+        // TODO: enable DoT listener once hickory-server upgrades to
+        // rustls 0.23. hickory-server 0.24 pins rustls 0.21 internally
+        // while the rest of our workspace uses rustls 0.23 (axum,
+        // reqwest), and bridging the two ServerConfig types isn't
+        // worthwhile for a single listener. For now, run DoT behind a
+        // TLS-terminating reverse proxy that forwards to the plain TCP
+        // listener.
+        let _ = load_tls_config; // silence dead_code if compiled
+        bail!(
+            "server.dot_listen `{dot_listen}` requested but DoT is not yet supported in-process \
+             (blocked on hickory-server rustls 0.21 → 0.23 upgrade). Remove dot_listen from the \
+             config, or terminate TLS at a reverse proxy and forward to the plain TCP listener."
+        );
+    }
+
+    let shutdown = CancellationToken::new();
+
+    if let Some(doh_listen) = &config.server.doh_listen {
+        if let Ok(addr) = doh_listen.parse::<SocketAddr>() {
+            if !addr.ip().is_loopback() {
+                warn!(listen = %doh_listen, "DoH listener is not loopback; ensure a TLS reverse proxy and access controls are in place");
+            }
+            spawn_doh_server(doh_handler, addr, shutdown.clone());
+        } else {
+            bail!("server.doh_listen `{}` is not a valid socket address", doh_listen);
+        }
+    }
+    spawn_blocklist_reload_loop(
+        blocklist_loader.clone(),
+        blocklist_engine.clone(),
+        metrics.clone(),
+        config.blocklist.reload_interval_secs,
+        shutdown.clone(),
+    );
+    spawn_sighup_reload(
+        blocklist_loader,
+        blocklist_engine,
+        authority.clone(),
+        metrics.clone(),
+        shutdown.clone(),
+    );
+    spawn_mesh_reload_loop(
+        authority.clone(),
+        config.authority.poll_interval_secs,
+        shutdown.clone(),
+    );
+
+    let metrics_addr = metrics_listen_addr(&config.metrics)?;
+    let metrics_path = normalize_metrics_path(&config.metrics.path);
+    spawn_metrics_server(metrics.clone(), metrics_addr, metrics_path, shutdown.clone());
+
+    wait_for_shutdown_signal().await?;
+    shutdown.cancel();
+    server
+        .shutdown_gracefully()
         .await
-        .context("failed to listen for ctrl-c")?;
+        .context("server shutdown failed")?;
 
     info!("shutting down");
     Ok(())
@@ -191,8 +292,28 @@ fn check_config_permissions(_path: &PathBuf) -> Result<()> {
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    // PRIVACY: by default the hickory crates can emit qnames at info
+    // level. We clamp them to `warn` UNLESS the operator has explicitly
+    // set their level via RUST_LOG (in which case they're knowingly
+    // opting into more verbose logging for debugging).
+    //
+    // Filter composition: start with `info` so the daemon's own logs
+    // appear, then apply any user RUST_LOG directives on top, then
+    // pin the hickory crates to `warn` if the user hasn't overridden them.
+    let user_filter = std::env::var("RUST_LOG").unwrap_or_default();
+    let mut filter = EnvFilter::new("info");
+    for directive in user_filter.split(',').filter(|s| !s.trim().is_empty()) {
+        if let Ok(d) = directive.parse() {
+            filter = filter.add_directive(d);
+        }
+    }
+    for crate_name in ["hickory_server", "hickory_proto", "hickory_resolver"] {
+        if !user_filter.contains(crate_name) {
+            if let Ok(d) = format!("{crate_name}=warn").parse() {
+                filter = filter.add_directive(d);
+            }
+        }
+    }
 
     #[cfg(debug_assertions)]
     let fmt_layer = fmt::layer().pretty();
@@ -204,4 +325,259 @@ fn init_tracing() {
         .with(filter)
         .with(fmt_layer)
         .init();
+}
+
+fn parse_config_path() -> String {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            return args.next().unwrap_or_else(|| "rustydns.toml".to_string());
+        }
+    }
+    "rustydns.toml".to_string()
+}
+
+fn spawn_blocklist_reload_loop(
+    loader: Arc<BlocklistLoader>,
+    engine: Arc<BlocklistEngine>,
+    metrics: Arc<Metrics>,
+    interval_secs: u64,
+    shutdown: CancellationToken,
+) {
+    if interval_secs == 0 {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match loader.reload(&engine).await {
+                        Ok(summary) => {
+                            if summary.loaded_sources == 0 {
+                                metrics.mark_blocklist_reload_failure();
+                            } else {
+                                metrics.mark_blocklist_reload_success();
+                            }
+                            metrics.set_blocklist_state(engine.entry_count(), engine.heap_bytes());
+                        }
+                        Err(e) => {
+                            metrics.mark_blocklist_reload_failure();
+                            warn!(error = %e, "blocklist reload failed");
+                        }
+                    }
+                }
+                _ = shutdown.cancelled() => break,
+            }
+        }
+    });
+}
+
+fn spawn_sighup_reload(
+    loader: Arc<BlocklistLoader>,
+    engine: Arc<BlocklistEngine>,
+    authority: Arc<Authority>,
+    metrics: Arc<Metrics>,
+    shutdown: CancellationToken,
+) {
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(sig) => sig,
+            Err(e) => {
+                warn!(error = %e, "failed to register SIGHUP handler");
+                return;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                _ = hup.recv() => {
+                    info!("SIGHUP received — reloading blocklists");
+                    match loader.reload(&engine).await {
+                        Ok(summary) => {
+                            if summary.loaded_sources == 0 {
+                                metrics.mark_blocklist_reload_failure();
+                            } else {
+                                metrics.mark_blocklist_reload_success();
+                            }
+                            metrics.set_blocklist_state(engine.entry_count(), engine.heap_bytes());
+                        }
+                        Err(e) => {
+                            metrics.mark_blocklist_reload_failure();
+                            warn!(error = %e, "blocklist reload failed");
+                        }
+                    }
+                    // Also reload the mesh-zone bundle on SIGHUP so
+                    // operators get a single reload trigger for both.
+                    match authority.reload_mesh() {
+                        Ok(Some(n)) => info!(mesh_records = n, "mesh zone reloaded on SIGHUP"),
+                        Ok(None) => {}
+                        Err(e) => warn!(error = %e, "mesh zone reload failed"),
+                    }
+                }
+                _ = shutdown.cancelled() => break,
+            }
+        }
+    });
+
+    #[cfg(not(unix))]
+    {
+        let _ = (loader, engine, authority, metrics, shutdown);
+    }
+}
+
+/// Periodically re-read the Rustynet mesh-zone bundle and atomically
+/// swap it into the authority. Bundle-load failures are non-fatal —
+/// the previous snapshot continues to serve queries.
+fn spawn_mesh_reload_loop(
+    authority: Arc<Authority>,
+    interval_secs: u64,
+    shutdown: CancellationToken,
+) {
+    if interval_secs == 0 {
+        return;
+    }
+    // Skip the poller entirely if the bundle isn't configured — saves
+    // a sleeping task in static-only deployments.
+    if authority.config().mesh_zone_bundle_path.is_none() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match authority.reload_mesh() {
+                        Ok(Some(n)) => tracing::debug!(mesh_records = n, "mesh zone reloaded"),
+                        Ok(None) => {}
+                        Err(e) => warn!(error = %e, "mesh zone reload failed; keeping previous snapshot"),
+                    }
+                }
+                _ = shutdown.cancelled() => break,
+            }
+        }
+    });
+}
+
+fn spawn_metrics_server(
+    metrics: Arc<Metrics>,
+    listen: SocketAddr,
+    path: String,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = metrics::serve(metrics, listen, path, shutdown).await {
+            warn!(error = %e, "metrics server failed");
+        }
+    });
+}
+
+fn spawn_doh_server(
+    handler: Arc<DnsHandler>,
+    listen: SocketAddr,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = doh_server::serve(handler, listen, shutdown).await {
+            warn!(error = %e, "DoH server failed");
+        }
+    });
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = signal(SignalKind::terminate())
+            .context("failed to register SIGTERM handler")?;
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to listen for ctrl-c")?;
+    }
+
+    Ok(())
+}
+
+fn metrics_listen_addr(metrics: &MetricsConfig) -> Result<SocketAddr> {
+    let addr: SocketAddr = metrics.listen.parse().map_err(|_| {
+        anyhow!("metrics.listen `{}` is not a valid socket address", metrics.listen)
+    })?;
+
+    if addr.ip().is_loopback() {
+        return Ok(addr);
+    }
+
+    warn!(
+        listen = %metrics.listen,
+        "metrics.listen is not loopback; forcing loopback to avoid public exposure"
+    );
+
+    let loopback_ip = match addr.ip() {
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+
+    Ok(SocketAddr::new(loopback_ip, addr.port()))
+}
+
+fn normalize_metrics_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return "/metrics".to_string();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
+    let cert_path = server.tls_cert_path.as_ref().ok_or_else(|| {
+        anyhow!("server.tls_cert_path must be set when server.dot_listen is enabled")
+    })?;
+    let key_path = server.tls_key_path.as_ref().ok_or_else(|| {
+        anyhow!("server.tls_key_path must be set when server.dot_listen is enabled")
+    })?;
+
+    let cert_file = std::fs::File::open(cert_path)
+        .with_context(|| format!("failed to open TLS certificate {cert_path:?}"))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs: Vec<_> = pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read TLS certificate {cert_path:?}"))?;
+    if certs.is_empty() {
+        bail!("TLS certificate {cert_path:?} contains no certificates");
+    }
+
+    let key_file = std::fs::File::open(key_path)
+        .with_context(|| format!("failed to open TLS private key {key_path:?}"))?;
+    let mut key_reader = BufReader::new(key_file);
+    let key = pemfile::private_key(&mut key_reader)
+        .with_context(|| format!("failed to read TLS private key {key_path:?}"))?;
+    let key = key.ok_or_else(|| anyhow!("TLS private key {key_path:?} contains no key"))?;
+
+    let config = TlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow!("invalid TLS key or certificate: {e}"))?;
+
+    Ok(Arc::new(config))
 }

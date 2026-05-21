@@ -52,7 +52,7 @@ Key items:
 
 Serves authoritative answers for:
 
-1. **The mesh zone** — live records from the `rustynet-dns-zone` SQLite database (read-only). Changes propagate within one poll interval (default 30 s, configurable to 5 s).
+1. **The mesh zone** — records from a signed bundle file written by `rustynetd` (verified against an operator-configured ed25519 verifier key). Changes propagate within one poll interval (default 30 s, configurable to 5 s). See `docs/integration-rustynet.md` for the file format and refresh model.
 2. **Static zones** — additional records declared in `rustydns.toml`, useful for local overrides.
 
 Authority answers are trusted answers. The authority never forwards to an upstream. It either has the answer (returns it) or it doesn't (returns `None`, continuing the pipeline to blocklist/resolver).
@@ -136,9 +136,9 @@ The binary. Responsibilities:
 ## Rustynet integration
 
 ```
-rustynetd ──writes──► control.db (SQLite)
+rustynetd ──writes──► dns-zone.bundle (signed, ed25519)
                             │
-                 rustynet-dns-zone crate (read API)
+                 read + verify against verifier-key.hex
                             │
               rustydns-authority ──serves──► clients
 ```
@@ -181,7 +181,7 @@ Running on Raspberry Pi Zero 2 W:
 | `quinn` | QUIC transport for DoQ |
 | `axum` | DoH HTTP/2 server + management API |
 | `rustls` | TLS (pure Rust, no OpenSSL) |
-| `rusqlite` | Read-only access to rustynet-dns-zone SQLite DB |
+| `ed25519-dalek` + `sha2` | Verify the signed Rustynet dns-zone bundle |
 | `serde` + `toml` | Configuration |
 | `tracing` | Structured logging |
 | `prometheus` | Metrics exposition |
