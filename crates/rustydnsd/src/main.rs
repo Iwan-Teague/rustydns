@@ -116,8 +116,19 @@ async fn main() -> Result<()> {
         "configuration loaded"
     );
 
-    // Build authority (static-only for now).
+    // Build authority (mesh integration is best-effort — failures are
+    // logged at warn! inside Authority::new and the daemon continues in
+    // static-only mode).
     let authority = Arc::new(Authority::new(config.authority.clone())?);
+    // Seed the mesh-records gauge from the initial snapshot. If the
+    // initial mesh load failed this will be 0 and the next successful
+    // reload will populate it. The `_success_total` counter is left at
+    // 0 — we only count *reloads*, not the initial load, so dashboards
+    // can distinguish reload errors from a never-loaded daemon.
+    let initial_mesh_records = authority.mesh_record_count();
+    if initial_mesh_records > 0 {
+        metrics.mark_mesh_zone_reload_success(initial_mesh_records);
+    }
 
     // Blocklist engine + initial load.
     let blocklist_engine = Arc::new(BlocklistEngine::new(config.blocklist.clone()));
@@ -220,6 +231,7 @@ async fn main() -> Result<()> {
     );
     spawn_mesh_reload_loop(
         authority.clone(),
+        metrics.clone(),
         config.authority.poll_interval_secs,
         shutdown.clone(),
     );
@@ -485,9 +497,15 @@ fn spawn_sighup_reload(
                     // Also reload the mesh-zone bundle on SIGHUP so
                     // operators get a single reload trigger for both.
                     match authority.reload_mesh() {
-                        Ok(Some(n)) => info!(mesh_records = n, "mesh zone reloaded on SIGHUP"),
+                        Ok(Some(n)) => {
+                            metrics.mark_mesh_zone_reload_success(n);
+                            info!(mesh_records = n, "mesh zone reloaded on SIGHUP");
+                        }
                         Ok(None) => {}
-                        Err(e) => warn!(error = %e, "mesh zone reload failed"),
+                        Err(e) => {
+                            metrics.mark_mesh_zone_reload_failure();
+                            warn!(error = %e, "mesh zone reload failed");
+                        }
                     }
                 }
                 _ = shutdown.cancelled() => break,
@@ -506,6 +524,7 @@ fn spawn_sighup_reload(
 /// the previous snapshot continues to serve queries.
 fn spawn_mesh_reload_loop(
     authority: Arc<Authority>,
+    metrics: Arc<Metrics>,
     interval_secs: u64,
     shutdown: CancellationToken,
 ) {
@@ -525,9 +544,15 @@ fn spawn_mesh_reload_loop(
             tokio::select! {
                 _ = interval.tick() => {
                     match authority.reload_mesh() {
-                        Ok(Some(n)) => tracing::debug!(mesh_records = n, "mesh zone reloaded"),
+                        Ok(Some(n)) => {
+                            metrics.mark_mesh_zone_reload_success(n);
+                            tracing::debug!(mesh_records = n, "mesh zone reloaded");
+                        }
                         Ok(None) => {}
-                        Err(e) => warn!(error = %e, "mesh zone reload failed; keeping previous snapshot"),
+                        Err(e) => {
+                            metrics.mark_mesh_zone_reload_failure();
+                            warn!(error = %e, "mesh zone reload failed; keeping previous snapshot");
+                        }
                     }
                 }
                 _ = shutdown.cancelled() => break,

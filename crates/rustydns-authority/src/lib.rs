@@ -243,6 +243,19 @@ impl Authority {
     pub fn config(&self) -> &AuthorityConfig {
         &self.config
     }
+
+    /// Count of mesh-zone records currently live in the snapshot
+    /// (records contributed by the Rustynet bundle, NOT by static
+    /// config). Used by the daemon to seed `rustydns_mesh_records` at
+    /// startup.
+    pub fn mesh_record_count(&self) -> usize {
+        let snap = self.snapshot.load();
+        snap.records
+            .values()
+            .flat_map(|recs| recs.iter())
+            .filter(|r| r.mesh_node_id.is_some())
+            .count()
+    }
 }
 
 /// Build a [`Snapshot`] from the immutable static state plus the optional
@@ -849,5 +862,33 @@ mod tests {
     fn authority_reload_mesh_returns_none_when_unconfigured() {
         let auth = Authority::new(cfg(vec![])).unwrap();
         assert!(matches!(auth.reload_mesh(), Ok(None)));
+    }
+
+    #[test]
+    fn mesh_record_count_excludes_static_records() {
+        let (bundle_path, key_path) = make_bundle(
+            &[("router", "100.64.0.1"), ("nas", "100.64.0.2")],
+            "mesh",
+        );
+        let cfg = AuthorityConfig {
+            mesh_zone_bundle_path: Some(bundle_path),
+            mesh_zone_verifier_key_path: Some(key_path),
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            // Two static records — must NOT be counted in mesh_record_count.
+            static_records: vec![
+                a("static1.example.com", "10.0.0.1"),
+                a("static2.example.com", "10.0.0.2"),
+            ],
+            poll_interval_secs: 30,
+        };
+        let auth = Authority::new(cfg).unwrap();
+        assert_eq!(auth.mesh_record_count(), 2, "only the 2 mesh records count");
+    }
+
+    #[test]
+    fn mesh_record_count_zero_when_no_bundle() {
+        let auth = Authority::new(cfg(vec![a("static.example.com", "10.0.0.1")])).unwrap();
+        assert_eq!(auth.mesh_record_count(), 0);
     }
 }

@@ -29,6 +29,10 @@ pub struct Metrics {
     blocklist_entries: IntGauge,
     blocklist_heap_bytes: IntGauge,
     blocklist_last_reload: IntGauge,
+    mesh_records: IntGauge,
+    mesh_zone_reload_success_total: IntCounter,
+    mesh_zone_reload_failure_total: IntCounter,
+    mesh_zone_last_reload: IntGauge,
 }
 
 impl Metrics {
@@ -88,6 +92,27 @@ impl Metrics {
             "Unix timestamp of the most recent blocklist reload",
         )?;
 
+        let mesh_records = register_gauge(
+            &registry,
+            "rustydns_mesh_records",
+            "Current mesh-zone record count loaded from the Rustynet bundle",
+        )?;
+        let mesh_zone_reload_success_total = register_counter(
+            &registry,
+            "rustydns_mesh_zone_reload_success_total",
+            "Successful mesh-zone bundle reloads",
+        )?;
+        let mesh_zone_reload_failure_total = register_counter(
+            &registry,
+            "rustydns_mesh_zone_reload_failure_total",
+            "Mesh-zone bundle reloads that failed verification or parsing",
+        )?;
+        let mesh_zone_last_reload = register_gauge(
+            &registry,
+            "rustydns_mesh_zone_last_reload_seconds",
+            "Unix timestamp of the most recent mesh-zone reload attempt",
+        )?;
+
         Ok(Self {
             registry,
             dns_queries_total,
@@ -100,6 +125,10 @@ impl Metrics {
             blocklist_entries,
             blocklist_heap_bytes,
             blocklist_last_reload,
+            mesh_records,
+            mesh_zone_reload_success_total,
+            mesh_zone_reload_failure_total,
+            mesh_zone_last_reload,
         })
     }
 
@@ -147,12 +176,31 @@ impl Metrics {
     }
 
     fn set_blocklist_last_reload(&self) {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        self.blocklist_last_reload.set(ts);
+        self.blocklist_last_reload.set(now_unix_secs());
     }
+
+    /// Record a successful mesh-zone bundle reload and update gauges.
+    pub fn mark_mesh_zone_reload_success(&self, record_count: usize) {
+        self.mesh_zone_reload_success_total.inc();
+        self.mesh_records.set(record_count as i64);
+        self.mesh_zone_last_reload.set(now_unix_secs());
+    }
+
+    /// Record a failed mesh-zone bundle reload (signature mismatch,
+    /// stale bundle, I/O error). The previous mesh_records gauge value
+    /// is intentionally NOT zeroed — the daemon is still serving from
+    /// the previous valid snapshot.
+    pub fn mark_mesh_zone_reload_failure(&self) {
+        self.mesh_zone_reload_failure_total.inc();
+        self.mesh_zone_last_reload.set(now_unix_secs());
+    }
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Serve the Prometheus metrics endpoint until shutdown.
@@ -163,13 +211,20 @@ pub async fn serve(
     shutdown: CancellationToken,
 ) -> Result<(), RustyDnsError> {
     let metrics_clone = metrics.clone();
-    let app = Router::new().route(&path, get(move || metrics_handler(metrics_clone.clone())));
+    let app = Router::new()
+        .route(&path, get(move || metrics_handler(metrics_clone.clone())))
+        // Liveness endpoint for orchestrators (k8s, runit, systemd's
+        // ExecStartPost healthcheck wrappers). 200 OK means the daemon
+        // process is up and its loopback listener is serving — it
+        // doesn't claim anything about upstream resolver reachability
+        // or blocklist freshness (those are visible on /metrics).
+        .route("/health", get(health_handler));
 
     let listener = TcpListener::bind(listen)
         .await
         .map_err(RustyDnsError::Io)?;
 
-    info!(listen = %listen, path = %path, "metrics listener started");
+    info!(listen = %listen, metrics_path = %path, health_path = "/health", "metrics listener started");
 
     // `with_graceful_shutdown` requires a 'static future. Move the
     // cancellation token into an owned async block so it outlives the
@@ -198,6 +253,14 @@ async fn metrics_handler(metrics: Arc<Metrics>) -> Response {
         .status(200)
         .header("Content-Type", encoder.format_type())
         .body(Body::from(buffer))
+        .unwrap()
+}
+
+async fn health_handler() -> Response {
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "application/json")
+        .body(Body::from("{\"status\":\"ok\"}"))
         .unwrap()
 }
 
