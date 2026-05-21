@@ -35,3 +35,8 @@ futures-util       = { workspace = true }
 rustls             = { workspace = true }
 rustls-pemfile     = { workspace = true }
 base64             = { workspace = true }
+
+# Capability dropping is Linux-only. On other targets `drop_capabilities`
+# in main.rs is a no-op stub.
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = { workspace = true }

@@ -92,6 +92,10 @@ rand = "0.8"
 # Base64 for DoH query decoding
 base64 = "0.22"
 
+# In-process Linux capability dropping. Pulled in only on Linux targets
+# (see crates/rustydnsd/Cargo.toml). macOS dev builds compile without it.
+caps = "0.5"
+
 # Test-only: mock HTTP server for resolver integration tests
 wiremock = "0.6"
 

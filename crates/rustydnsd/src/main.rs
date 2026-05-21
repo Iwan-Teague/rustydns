@@ -116,23 +116,6 @@ async fn main() -> Result<()> {
         "configuration loaded"
     );
 
-    // --- TODO (Milestone 4): in-process capability dropping ---------------
-    // After binding sockets, drop all Linux capabilities except those
-    // explicitly needed. Under systemd this is handled by the unit
-    // (CapabilityBoundingSet + AmbientCapabilities), but for non-systemd
-    // deployments we must do it ourselves:
-    //
-    //   1. Bind all sockets (port 53 UDP/TCP, port 853 DoT, DoH port).
-    //   2. Call prctl(PR_SET_SECUREBITS, SECBIT_KEEP_CAPS_LOCKED | …)
-    //      to prevent privilege re-acquisition.
-    //   3. Call capset() to drop all capabilities from the effective,
-    //      permitted, and inheritable sets.
-    //   4. Log the resulting capability state with capget() for auditability.
-    //
-    // Reference: `caps` crate (https://crates.io/crates/caps)
-    // Tracking: implement before Milestone 4 is marked complete.
-    // --------------------------------------------------------------------------
-
     // Build authority (static-only for now).
     let authority = Arc::new(Authority::new(config.authority.clone())?);
 
@@ -176,6 +159,22 @@ async fn main() -> Result<()> {
 
         info!(listen = %addr, "listening for DNS queries");
     }
+
+    // --- Capability discipline -------------------------------------------
+    // All privileged ports are bound. We no longer need
+    // CAP_NET_BIND_SERVICE or any other capability for the lifetime of
+    // the daemon. Drop everything so a future bug or compromise can't
+    // re-bind privileged ports or escalate privileges.
+    //
+    // Under systemd this is belt-and-braces (the unit already pins the
+    // capability bounding set). For non-systemd deployments (Docker,
+    // runit, OpenRC) this is the only enforcement.
+    //
+    // Non-fatal: a failure to drop is logged at warn! and the daemon
+    // continues. The systemd-level bounding set is the primary defence
+    // in supported deployments; we never refuse to serve DNS because
+    // capability dropping failed.
+    drop_capabilities();
 
     if let Some(dot_listen) = &config.server.dot_listen {
         // TODO: enable DoT listener once hickory-server upgrades to
@@ -618,6 +617,85 @@ fn normalize_metrics_path(path: &str) -> String {
     } else {
         format!("/{trimmed}")
     }
+}
+
+/// Drop every Linux capability from every set after the daemon has
+/// finished binding privileged ports.
+///
+/// Called once at startup, after the UDP/TCP listeners are bound. From
+/// that point on the daemon needs no special privileges — it just
+/// reads, decodes, and writes DNS messages on already-bound sockets.
+/// Dropping caps means a later code-injection bug, dependency CVE, or
+/// kernel-side capability check can't be used to re-bind privileged
+/// ports or escalate to other privileged operations.
+///
+/// Per `AGENTS.md §Operational invariants`, failure is logged at
+/// `warn!` but never aborts startup — the systemd unit's
+/// `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` is the primary defence
+/// in supported deployments, and we never refuse to serve DNS because
+/// of a defence-in-depth measure failing.
+#[cfg(target_os = "linux")]
+fn drop_capabilities() {
+    use caps::{CapSet, Capability};
+
+    // Snapshot caps we hold before dropping, for the audit log.
+    let before = caps::read(None, CapSet::Effective)
+        .map(|set| {
+            set.iter()
+                .map(Capability::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|e| format!("<read failed: {e}>"));
+
+    let sets = [
+        CapSet::Effective,
+        CapSet::Permitted,
+        CapSet::Inheritable,
+        CapSet::Ambient,
+        CapSet::Bounding,
+    ];
+
+    for set in sets {
+        if let Err(e) = caps::clear(None, set) {
+            warn!(
+                set = ?set,
+                error = %e,
+                "failed to clear capability set; continuing — systemd CapabilityBoundingSet \
+                 is the primary defence and daemon operation is unaffected"
+            );
+        }
+    }
+
+    // Confirm by re-reading.
+    let after = caps::read(None, CapSet::Effective)
+        .map(|set| {
+            if set.is_empty() {
+                "<empty>".to_string()
+            } else {
+                set.iter()
+                    .map(Capability::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        })
+        .unwrap_or_else(|e| format!("<read failed: {e}>"));
+
+    info!(
+        before = %before,
+        after  = %after,
+        "capability dropping complete"
+    );
+}
+
+/// No-op on non-Linux platforms. macOS dev builds, FreeBSD ports, etc.
+/// rely on OS-level access controls instead of Linux capabilities.
+#[cfg(not(target_os = "linux"))]
+fn drop_capabilities() {
+    info!(
+        target_os = std::env::consts::OS,
+        "capability dropping not applicable on this platform — relying on OS access controls"
+    );
 }
 
 fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
