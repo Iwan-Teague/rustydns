@@ -81,7 +81,8 @@ async fn main() -> Result<()> {
     // errors are captured in the journal.
     init_tracing();
 
-    let config_path = PathBuf::from(parse_config_path());
+    let args = parse_args()?;
+    let config_path = PathBuf::from(&args.config_path);
 
     info!(config = %config_path.display(), "rustydnsd starting");
 
@@ -93,6 +94,14 @@ async fn main() -> Result<()> {
     // Load and validate configuration.
     let config = rustydns_core::config::load_config(&config_path)
         .context("failed to load configuration")?;
+
+    // `--validate-config`: stop here. We've already parsed the file and
+    // run `validate_config` (inside `load_config`). Exit 0 to signal
+    // success to the install script or CI step that invoked us.
+    if args.validate_only {
+        info!("configuration validated — exiting (--validate-config)");
+        return Ok(());
+    }
 
     let config = Arc::new(config);
 
@@ -327,14 +336,76 @@ fn init_tracing() {
         .init();
 }
 
-fn parse_config_path() -> String {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--config" {
-            return args.next().unwrap_or_else(|| "rustydns.toml".to_string());
+/// Parsed command-line arguments.
+#[derive(Debug)]
+struct CliArgs {
+    config_path: String,
+    /// `--validate-config`: load config, run validation, exit. Never
+    /// binds sockets. Useful in deployment checklists and CI.
+    validate_only: bool,
+}
+
+fn parse_args() -> Result<CliArgs> {
+    let argv: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    let mut config_path = "rustydns.toml".to_string();
+    let mut validate_only = false;
+
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--config" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("--config requires a path argument");
+                }
+                config_path = argv[i].clone();
+            }
+            "--validate-config" => validate_only = true,
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("rustydnsd {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            other => bail!("unknown argument `{other}` (try --help)"),
         }
+        i += 1;
     }
-    "rustydns.toml".to_string()
+
+    Ok(CliArgs {
+        config_path,
+        validate_only,
+    })
+}
+
+fn print_help() {
+    let exe = std::env::args()
+        .next()
+        .unwrap_or_else(|| "rustydnsd".to_string());
+    println!(
+        "rustydnsd — mesh-native DNS resolver and ad blocker
+
+USAGE:
+    {exe} [OPTIONS]
+
+OPTIONS:
+    --config <PATH>       Path to rustydns.toml (default: ./rustydns.toml)
+    --validate-config     Load and validate the config, then exit 0 if it
+                          parses cleanly and passes every invariant in
+                          AGENTS.md. Sockets are never bound. Exit 1 on
+                          validation failure. Useful in install scripts
+                          and CI.
+    -V, --version         Print version and exit.
+    -h, --help            Show this help and exit.
+
+ENVIRONMENT:
+    RUST_LOG              Override log filter. Default is `info` with the
+                          hickory crates clamped to `warn` for privacy.
+                          Setting this opts in to deeper diagnostics —
+                          qnames may appear at `debug` level."
+    );
 }
 
 fn spawn_blocklist_reload_loop(
