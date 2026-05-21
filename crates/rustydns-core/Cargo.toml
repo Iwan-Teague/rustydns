@@ -1,0 +1,17 @@
+[package]
+name        = "rustydns-core"
+version     = "0.1.0"
+description = "Shared config, error types, and record model for rustydns"
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[dependencies]
+hickory-proto = { workspace = true }
+serde         = { workspace = true }
+toml          = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+zeroize       = { workspace = true }

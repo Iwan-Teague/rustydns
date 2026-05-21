@@ -1,0 +1,148 @@
+# rustydns example configuration
+# Copy to /etc/rustydns/rustydns.toml and edit before starting the daemon.
+#
+# All settings shown here are the defaults unless marked otherwise.
+# Security-sensitive settings are documented with their implications.
+
+# ---------------------------------------------------------------------------
+[server]
+# ---------------------------------------------------------------------------
+
+# UDP and TCP listen addresses.
+# For network-wide use, change to "0.0.0.0:53" and point your router's
+# DHCP DNS option at this host's mesh IP.
+listen = ["127.0.0.53:53"]
+
+# Rustynet mesh zone name.
+mesh_zone = "mesh."
+
+# DNS-over-HTTPS listener (non-standard port to avoid conflicts).
+# Change to "0.0.0.0:443" only if behind an authenticated reverse proxy.
+doh_listen = "127.0.0.1:8053"
+
+# DNS-over-TLS listener (comment out to disable).
+# dot_listen = "0.0.0.0:853"
+
+# ---------------------------------------------------------------------------
+[upstream]
+# ---------------------------------------------------------------------------
+
+# Upstream DoH resolver URLs. All must use https://.
+# With randomize_upstream_selection = true (the default), queries are
+# distributed across these resolvers to reduce per-resolver query history.
+resolvers = [
+    "https://cloudflare-dns.com/dns-query",   # Cloudflare 1.1.1.1
+    "https://dns.quad9.net/dns-query",         # Quad9 (privacy-focused)
+]
+
+# Upstream protocol: "doh" (default), "doq", or "plain" (insecure, warns).
+protocol = "doh"
+
+# Return SERVFAIL when all upstreams fail (never fall back to plain DNS).
+fail_closed = true
+
+# Minimum TLS version for upstream connections.
+# "1.3" (default) provides mandatory forward secrecy.
+# "1.2" is accepted but not recommended.
+min_tls_version = "1.3"
+
+# Validate DNSSEC signatures. Disabling allows spoofed answers.
+dnssec_validation = true
+
+# Per-upstream query timeout.
+timeout_ms = 5000
+
+# Maximum cached upstream responses (LRU eviction).
+max_cache_entries = 10000
+
+# ---------------------------------------------------------------------------
+[authority]
+# ---------------------------------------------------------------------------
+
+# Path to the Rustynet control SQLite database (opened read-only).
+rustynet_db = "/var/lib/rustynet/control.db"
+
+# How often to poll the database for zone changes (seconds).
+poll_interval_secs = 30
+
+# Static zone records (add your own here).
+# [[authority.static_records]]
+# name    = "myserver.mesh."
+# type    = "A"
+# address = "100.64.0.10"
+# ttl     = 300
+
+# ---------------------------------------------------------------------------
+[blocklist]
+# ---------------------------------------------------------------------------
+
+# Remote blocklist sources. Must use https://.
+sources = [
+    "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+    # "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/pro.txt",
+]
+
+# Local blocklist files (plain domain list, hosts format, RPZ, or AdGuard).
+# local_files = ["/etc/rustydns/custom-blocklist.txt"]
+
+# How to respond to blocked queries:
+# "nxdomain" (default) — doesn't reveal sinkhole IP or that blocking is active
+# "sinkhole"           — return sinkhole_ip (useful for block pages)
+# "refused"            — return REFUSED
+block_response = "nxdomain"
+sinkhole_ip = "0.0.0.0"
+
+# Reload interval for remote sources (seconds). 0 = only on SIGHUP.
+reload_interval_secs = 86400
+
+# Allowlist — never blocked even if in a blocklist source.
+# Supports exact ("safe.ads.example.com") and wildcard ("*.example.com").
+allowlist = [
+    # "fonts.googleapis.com",
+    # "*.cdn.example.com",
+]
+
+# ---------------------------------------------------------------------------
+[privacy]
+# ---------------------------------------------------------------------------
+# All options default to maximum privacy.
+# To reduce privacy, explicitly set the option to false/true as shown.
+
+# RFC 7816: only send minimum necessary labels to each upstream.
+query_minimization = true
+
+# Strip EDNS0 Client Subnet from all outgoing queries.
+no_edns_client_subnet = true
+
+# RFC 8467: pad DoH queries to fixed block sizes.
+upstream_padding = true
+
+# Distribute queries across upstreams randomly (not always resolvers[0] first).
+randomize_upstream_selection = true
+
+# Write query logs to disk (false = in-memory ring buffer only).
+query_log_to_disk = false
+
+# Size of the in-memory query log ring buffer.
+query_log_ring_size = 1000
+
+# Log full client IP addresses (false = anonymised, last octet zeroed).
+log_client_ips = false
+
+# ---------------------------------------------------------------------------
+[metrics]
+# ---------------------------------------------------------------------------
+
+# Bind to localhost only — metrics are unauthenticated.
+listen = "127.0.0.1:9153"
+path   = "/metrics"
+
+# ---------------------------------------------------------------------------
+# Per-node policy (optional)
+# ---------------------------------------------------------------------------
+
+# [[policy]]
+# node_id = "ed25519:AbCdEf..."
+# blocklist_bypass = false
+# zones_allowed = []        # empty = unrestricted
+# log_all_queries = false

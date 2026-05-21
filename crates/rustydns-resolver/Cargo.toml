@@ -1,0 +1,27 @@
+[package]
+name        = "rustydns-resolver"
+version     = "0.1.0"
+description = "Recursive resolver with DoH/DoQ upstream, DNSSEC, query minimisation, no ECS"
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[dependencies]
+rustydns-core    = { path = "../rustydns-core" }
+hickory-resolver = { workspace = true }
+hickory-proto    = { workspace = true }
+tokio            = { workspace = true }
+tracing          = { workspace = true }
+thiserror        = { workspace = true }
+rustls           = { workspace = true }
+rustls-native-certs = { workspace = true }
+tokio-rustls     = { workspace = true }
+rand             = { workspace = true }
+moka             = { workspace = true }
+anyhow           = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio    = { workspace = true }

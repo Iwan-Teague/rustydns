@@ -1,0 +1,30 @@
+[package]
+name        = "rustydnsd"
+version     = "0.1.0"
+description = "rustydns daemon — wires authority, blocklist, and resolver together"
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "rustydnsd"
+path = "src/main.rs"
+
+[dependencies]
+rustydns-core      = { path = "../rustydns-core" }
+rustydns-blocklist = { path = "../rustydns-blocklist" }
+rustydns-authority = { path = "../rustydns-authority" }
+rustydns-resolver  = { path = "../rustydns-resolver" }
+tokio              = { workspace = true }
+tokio-util         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum               = { workspace = true }
+prometheus         = { workspace = true }
+anyhow             = { workspace = true }
+reqwest            = { workspace = true }
+rand               = { workspace = true }
+serde              = { workspace = true }
+toml               = { workspace = true }

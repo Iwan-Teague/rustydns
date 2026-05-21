@@ -1,0 +1,93 @@
+[workspace]
+members = [
+    "crates/rustydns-core",
+    "crates/rustydns-blocklist",
+    "crates/rustydns-authority",
+    "crates/rustydns-resolver",
+    "crates/rustydnsd",
+]
+resolver = "2"
+
+[workspace.package]
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT OR Apache-2.0"
+authors      = ["Iwan Teague <iwanteague@gmail.com>"]
+repository   = "https://github.com/Iwan-Teague/rustydns"
+
+# ---------------------------------------------------------------------------
+# Workspace-wide dependency versions — all crates pull from here.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# Async runtime
+tokio      = { version = "1",   features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# DNS — hickory-* ONLY (trust-dns-* is unmaintained, do not add)
+hickory-server   = "0.24"
+hickory-proto    = "0.24"
+hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "dns-over-quic"] }
+
+# HTTP / TLS — rustls backend only, no openssl
+axum              = { version = "0.7", features = ["http2"] }
+rustls            = { version = "0.23", features = ["ring"], default-features = false }
+rustls-native-certs = "0.7"
+tokio-rustls      = "0.26"
+# HTTP client for blocklist fetching — HTTPS-only, rustls, no openssl
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "gzip",
+    "deflate",
+    "stream",
+] }
+
+# QUIC transport for DNS-over-QUIC
+quinn = "0.11"
+
+# Error handling
+thiserror = "2"
+anyhow    = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml  = "0.8"
+
+# Structured logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Lock-free hot-reload of blocklist state
+arc-swap = "1"
+
+# Fast, DoS-resistant hashing (randomised seed per process)
+ahash = "0.8"
+
+# Bounded concurrent TTL-aware cache for resolver
+moka = { version = "0.12", features = ["future"] }
+
+# Prometheus metrics
+prometheus = "0.13"
+
+# Read-only access to rustynet-dns-zone SQLite database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Zeroize sensitive config fields on drop (tokens, keys)
+zeroize = { version = "1", features = ["derive"] }
+
+# Randomise upstream resolver selection
+rand = "0.8"
+
+# Test-only: mock HTTP server for resolver integration tests
+wiremock = "0.6"
+
+# ---------------------------------------------------------------------------
+[profile.release]
+lto           = "thin"      # cross-crate inlining, smaller binary
+codegen-units = 1
+strip         = "symbols"
+opt-level     = 3
+panic         = "abort"     # no unwinding machinery in binary
+
+[profile.dev]
+opt-level = 0
+debug     = true
