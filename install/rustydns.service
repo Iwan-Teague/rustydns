@@ -1,13 +1,15 @@
 # rustydns systemd service unit
-# Install: cp install/rustydns.service /etc/systemd/system/
-# Enable: systemctl daemon-reload && systemctl enable --now rustydns
+# ─────────────────────────────────────────────────────────────────────────────
+# Install:  cp install/rustydns.service /etc/systemd/system/rustydns.service
+# Enable:   systemctl daemon-reload && systemctl enable --now rustydns
+# ─────────────────────────────────────────────────────────────────────────────
 
 [Unit]
 Description=rustydns — mesh-native DNS resolver and ad-blocker
 Documentation=https://github.com/Iwan-Teague/rustydns
 After=network-online.target
 Wants=network-online.target
-# Start after rustynet if present on the same host
+# Start after rustynet if present on the same host.
 After=rustynet.service
 PartOf=rustynet.service
 
@@ -18,12 +20,16 @@ Group=rustydns
 
 ExecStart=/usr/local/bin/rustydnsd --config /etc/rustydns/rustydns.toml
 ExecReload=/bin/kill -HUP $MAINPID
+
 Restart=on-failure
 RestartSec=5s
+# Limit restart attempts to prevent a crash-loop from flooding the journal.
+StartLimitIntervalSec=60s
+StartLimitBurst=5
 
 # ---------------------------------------------------------------------------
 # Privilege hardening
-# Bind port 53/853 via ambient capability, then drop everything else.
+# Bind port 53/853 via ambient capability; all other capabilities are removed.
 # ---------------------------------------------------------------------------
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -31,6 +37,7 @@ NoNewPrivileges=true
 
 # ---------------------------------------------------------------------------
 # Filesystem restrictions
+# The entire filesystem is read-only except for explicitly listed paths.
 # ---------------------------------------------------------------------------
 ProtectSystem=strict
 ProtectHome=true
@@ -38,12 +45,28 @@ PrivateTmp=true
 PrivateDevices=true
 ReadOnlyPaths=/
 ReadWritePaths=/var/lib/rustydns
-
 # Allow read access to the rustynet control database.
 ReadOnlyPaths=/var/lib/rustynet/control.db
 
 # ---------------------------------------------------------------------------
-# Network restrictions — only DNS and HTTPS sockets allowed
+# File creation umask
+# New files created by the daemon (log files, temp files) are 600 by default.
+# The in-process umask(0o077) in main.rs provides the same protection for
+# non-systemd deployments.
+# ---------------------------------------------------------------------------
+UMask=0077
+
+# ---------------------------------------------------------------------------
+# Resource limits
+# Prevent unbounded memory or thread growth from a misbehaving blocklist
+# source or runaway goroutine.
+# ---------------------------------------------------------------------------
+TasksMax=64
+MemoryHigh=192M
+MemoryMax=256M
+
+# ---------------------------------------------------------------------------
+# Network restrictions
 # ---------------------------------------------------------------------------
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
@@ -54,9 +77,12 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# Prevents the process from mapping memory as both writable and executable.
+# This is a hard barrier against most code-injection exploits.
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

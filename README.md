@@ -1,97 +1,213 @@
-# rustydns
+# RustyDNS
 
-Mesh-native DNS resolver and ad-blocker for the Rusty Suite.
+A privacy-first, security-hardened DNS resolver for home and small-office networks,
+built in Rust. RustyDNS acts as a local DNS proxy that:
 
-`rustydns` is a single Rust binary that serves as the authoritative DNS server for a Rustynet mesh, a recursive upstream resolver with DoH/DoQ support, and a blocklist engine for ad and tracker blocking — all in one lightweight, policy-aware daemon.
+- **Blocks ads, trackers, and malware domains** using community blocklists (Pi-hole
+  compatible hosts files, AdGuard filter lists, and RPZ zone files)
+- **Encrypts all upstream queries** over DNS-over-HTTPS (RFC 8484) or DNS-over-QUIC
+  (RFC 9250) — plain DNS over UDP/TCP is not used
+- **Strips client subnet information** from upstream queries (RFC 7871) so upstream
+  resolvers cannot see your network's IP address
+- **Minimises query names** sent to upstream resolvers (RFC 7816) so intermediate
+  servers receive only the labels they need
+- **Validates DNSSEC** and rejects forged upstream responses with no silent fallback
+- **Anonymises client logs** at /16 (IPv4) or /64 (IPv6) prefix granularity — full
+  IPs are never logged by default
+- **Integrates with the Rusty Suite mesh** for per-node DNS policy (planned)
 
-## How it fits the suite
+Security, privacy, and anonymity are first-class design constraints. All other
+trade-offs — performance, convenience, feature completeness — are secondary.
 
-```
-rustyfin ──┐
-rustytorrent ┤  ← all resolve via  →  rustydns  ← zone authority from rustynet-dns-zone
-rustyjack ──┘                               │
-                                      upstream DoH/DoQ
-                                      (Cloudflare, NextDNS, etc.)
-```
+---
 
-- **Rustynet** provides the mesh and already has a `rustynet-dns-zone` crate that manages zone records. `rustydns` is the runtime that serves those zones over UDP/TCP/DoH.
-- **rustyfin** and other suite services become resolvable at stable `.mesh` names instead of IP addresses that shift as the mesh topology changes.
-- **rustyjack** operators understand DNS offensively; `rustydns` gives the same understanding defensively, and the daemon can run on the same Pi hardware.
-- **rustytorrent** benefits from private DNS that doesn't leak query history to upstream resolvers.
+## Quick Start
 
-## Design goals
+### Prerequisites
 
-- **Single static binary.** No runtime dependencies, no Python, no dnsmasq. Drop it on a Pi Zero 2 W or a Debian 12 server and it runs.
-- **Mesh-first.** Authoritative for the local mesh zone by default. Rustynet policy gates which clients can query which records.
-- **Fail-closed.** If the upstream resolver is unreachable and no cached answer exists, `rustydns` returns SERVFAIL rather than leaking queries to a fallback it doesn't trust.
-- **Privacy-preserving upstream.** Upstream resolution uses DNS-over-HTTPS or DNS-over-QUIC. Plaintext UDP port 53 upstream is explicitly opt-in.
-- **Blocklist as a first-class feature.** Hosts-format and RPZ blocklists, hot-reloaded without daemon restart.
-- **Observable.** Prometheus-compatible `/metrics` endpoint. Per-client query logs written to a ring buffer, not unbounded disk.
+- Rust 1.75+ (install from [rustup.rs](https://rustup.rs))
+- Linux with systemd (for the hardened service unit)
+- A DoH upstream resolver (e.g. `https://dns.quad9.net/dns-query`)
 
-## Crate layout
+### Build
 
-```
-rustydns/
-├── crates/
-│   ├── rustydns-core        # Shared config, error types, record model
-│   ├── rustydns-authority   # Authoritative zone server (mesh + static zones)
-│   ├── rustydns-resolver    # Recursive resolver with DoH/DoQ upstream
-│   ├── rustydns-blocklist   # Blocklist engine: hosts format, RPZ, hot-reload
-│   └── rustydnsd            # Daemon binary — wires everything together
-├── docs/
-│   ├── architecture.md
-│   ├── integration-rustynet.md
-│   └── blocklist-format.md
-├── scripts/
-├── Cargo.toml               # Workspace manifest
-├── README.md
-├── AGENTS.md
-└── CLAUDE.md
+```sh
+git clone https://github.com/Iwan-Teague/rustydns.git
+cd rustydns
+cargo build --release
 ```
 
-## Quick start
+### Install
 
-```bash
-# Install
-cargo install --path crates/rustydnsd
-
-# Run with default config (serves 127.0.0.53:53, upstream DoH to Cloudflare)
-rustydnsd --config rustydns.toml
-
-# Query the local resolver
-dig @127.0.0.53 rustyfin.mesh A
+```sh
+sudo bash scripts/install.sh
 ```
 
-## Configuration sketch
+The install script:
+
+1. Creates a `rustydns` system user and group
+2. Copies the binary to `/usr/local/bin/rustydns` (mode 750, `root:rustydns`)
+3. Installs an example config at `/etc/rustydns/rustydns.toml` (mode 640, `rustydns:rustydns`)
+4. Installs the systemd unit and enables it
+
+### Configure
+
+Edit `/etc/rustydns/rustydns.toml`. The most important fields:
 
 ```toml
 [server]
-listen = ["0.0.0.0:53", "0.0.0.0:853"]   # UDP/TCP + DoT
-mesh_zone = "mesh."
+# ⚠ Binding to 0.0.0.0 exposes the resolver to ALL network interfaces.
+# Use "127.0.0.1:53" if you only need local resolution, or a specific
+# interface IP (e.g. "192.168.1.1:53") to serve your LAN only.
+# Never expose port 53 to the public internet.
+listen = "127.0.0.1:53"
 
-[upstream]
-resolvers = [
-  "https://cloudflare-dns.com/dns-query",
-  "https://dns.nextdns.io/YOUR_ID",
-]
-protocol = "doh"          # doh | doq | plain (opt-in, insecure)
-fail_closed = true
+[[resolvers]]
+url      = "https://dns.quad9.net/dns-query"
+protocol = "doh"   # or "doq"
 
-[authority]
-# Rustynet zone integration (reads from rustynet-dns-zone's SQLite)
-rustynet_db = "/var/lib/rustynet/control.db"
-
-[blocklist]
-sources = [
-  "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
-]
-reload_interval_secs = 86400
-
-[metrics]
-listen = "127.0.0.1:9153"
-path   = "/metrics"
+[[blocklist.sources]]
+url    = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+format = "hosts"
 ```
 
-## Status
+Then restart the daemon:
 
-Early planning / scaffolding phase. See `docs/architecture.md` for the intended design and `AGENTS.md` for contribution guidance.
+```sh
+sudo systemctl restart rustydns
+sudo systemctl status rustydns
+```
+
+---
+
+## Architecture
+
+```
+Client query
+     │
+     ▼
+┌─────────────────┐
+│  Authority zone  │  Local mesh records (.rusty. zone) — checked first
+└────────┬────────┘
+         │ no match
+         ▼
+┌─────────────────┐
+│  Blocklist      │  AHashSet lookup — O(1), lock-free hot-reload via arc-swap
+└────────┬────────┘
+         │ not blocked
+         ▼
+┌─────────────────┐
+│  Cache          │  Bounded LRU (moka) with TTL enforcement
+└────────┬────────┘
+         │ cache miss
+         ▼
+┌─────────────────┐
+│  Resolver       │  DoH / DoQ to upstream, DNSSEC validation, ECS stripped,
+│                 │  query name minimised, padded to fixed-size blocks
+└─────────────────┘
+```
+
+For a detailed description of each component, see [`docs/architecture.md`](docs/architecture.md).
+
+---
+
+## Privacy Features
+
+| Feature                         | Status    | RFC       |
+|---------------------------------|-----------|-----------|
+| DNS-over-HTTPS upstream         | Planned   | RFC 8484  |
+| DNS-over-QUIC upstream          | Planned   | RFC 9250  |
+| EDNS0 Client Subnet stripping   | Planned   | RFC 7871  |
+| Query Name Minimisation         | Planned   | RFC 7816  |
+| Query padding                   | Planned   | RFC 8467  |
+| DNSSEC validation               | Planned   | RFC 4033  |
+| Randomised upstream selection   | Planned   | —         |
+| Client IP anonymisation (/16)   | Implemented | —      |
+| In-memory query logs only       | Implemented | —      |
+
+---
+
+## Security Design
+
+- **`#![forbid(unsafe_code)]`** in all first-party crates
+- **`rustls`** for all TLS — no OpenSSL dependency
+- **TLS 1.3** minimum (TLS 1.2 configurable with startup warning)
+- **TLS certificate validation always on** — there is no `verify_tls_certs = false` option
+- **Fail-closed** — on validation failure or upstream error, return SERVFAIL; no stale answers
+- **HTTPS-only blocklist sources** — `http://` URLs are rejected at startup
+- **RPZ passthru injection protection** — untrusted blocklist sources cannot inject allowlist entries
+- **`panic = "abort"`** in release builds — no unwinding machinery
+- **Systemd hardening** — `MemoryDenyWriteExecute`, `ProtectSystem=strict`, `NoNewPrivileges`, minimal capabilities
+- **Config file permission check** at startup — world-readable config is a hard error
+- **`deny_unknown_fields`** on config structs — typos that would silently disable security options are caught at startup
+
+Read the full threat model and deployment checklist in [`docs/security.md`](docs/security.md).
+
+---
+
+## Documentation
+
+| Document | Contents |
+|----------|----------|
+| [`docs/architecture.md`](docs/architecture.md) | Component overview, data flow, crate boundaries |
+| [`docs/security.md`](docs/security.md) | Threat model, countermeasures, deployment checklist |
+| [`docs/blocklist-format.md`](docs/blocklist-format.md) | Supported blocklist formats, source security, RPZ passthru |
+| [`docs/integration-rustynet.md`](docs/integration-rustynet.md) | Rusty Suite mesh integration, per-node policy |
+| [`AGENTS.md`](AGENTS.md) | Invariants and rules for AI coding agents working on this repo |
+
+---
+
+## Project Structure
+
+```
+rustydns/
+├── Cargo.toml                    # Workspace root
+├── rustydns.example.toml         # Annotated example configuration
+├── AGENTS.md                     # Coding-agent invariants
+├── crates/
+│   ├── rustydns-core/            # Shared types: config, errors, DNS records, client identity
+│   ├── rustydns-blocklist/       # Blocklist engine, parser, hot-reload
+│   ├── rustydns-authority/       # Local zone authority (Rusty Suite mesh records)
+│   ├── rustydns-resolver/        # Upstream DoH/DoQ resolver (stub)
+│   └── rustydnsd/                # Daemon entry point
+├── docs/
+├── install/
+│   └── rustydns.service          # Systemd unit with kernel hardening
+└── scripts/
+    └── install.sh                # Installation script
+```
+
+---
+
+## Configuration Reference
+
+See [`rustydns.example.toml`](rustydns.example.toml) for a fully annotated example.
+The most security-sensitive options:
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `server.listen` | `"127.0.0.1:53"` | ⚠ `0.0.0.0` exposes to all interfaces |
+| `privacy.log_client_ips` | `false` | Full IPs; enable only for debugging |
+| `privacy.log_queries_to_disk` | `false` | Queries are in-memory only by default |
+| `privacy.anonymize_prefix_v4` | `16` | Last two octets zeroed; do not reduce |
+| `resolver.dnssec` | `true` | Do not disable |
+| `resolver.strip_ecs` | `true` | Do not disable |
+| `blocklist.trusted_rpz_sources` | `[]` | Only add URLs you control |
+| `metrics_listen` | `"127.0.0.1:9153"` | ⚠ Do not change to `0.0.0.0` |
+
+---
+
+## Contributing
+
+Before modifying this repository, read [`AGENTS.md`](AGENTS.md). It lists the
+security and privacy invariants that must be upheld. Any change that weakens an
+invariant must include a documented threat model justification.
+
+All pull requests must pass `cargo check`, `cargo clippy -- -D warnings`, and
+`cargo deny check advisories`.
+
+---
+
+## License
+
+MIT OR Apache-2.0

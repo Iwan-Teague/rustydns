@@ -1,347 +1,489 @@
-# rustydns — Security and Privacy Architecture
+# RustyDNS Security Guide
 
-This document is the authoritative reference for every security and privacy
-decision in `rustydns`. It explains **what** is protected, **how**, and
-**why** — and what is explicitly out of scope.
-
-Every feature documented here defaults to the most secure and most private
-option. Operators must explicitly opt out; they cannot accidentally degrade
-security by omission.
+Security, privacy, and anonymity are the highest-priority design goals of RustyDNS.
+Every architectural choice has been made under those constraints. This document explains
+the threat model, the countermeasures implemented or planned, and the configuration
+checklist operators must follow before exposing the daemon to a network.
 
 ---
 
-## Threat model
+## Table of Contents
 
-`rustydns` is a DNS resolver and ad-blocker running on a Rustynet mesh node
-(typically a Raspberry Pi or home server). The threats it is designed to
-defend against:
-
-| Threat | Mechanism | Defence |
-|--------|-----------|---------|
-| Network observer watching DNS queries | Plaintext UDP port 53 leaks domain names | DoH/DoQ upstream only (plaintext is opt-in with loud warning) |
-| Upstream resolver logging all queries | Single resolver sees complete query history | Randomised upstream selection distributes queries |
-| Resolver inferring client location | EDNS0 Client Subnet (ECS) sends IP subnet | ECS stripped from all outgoing queries |
-| Traffic analysis from query sizes | Encrypted but variable-length payloads are fingerprintable | RFC 8467 query padding to fixed block sizes |
-| DNS cache poisoning | Forged upstream responses | DNSSEC validation on all upstream responses |
-| Fake blocklist injection | HTTP blocklist sources tampered in transit | HTTPS-only blocklist sources (HTTP rejected at startup) |
-| Unauthorised mesh peers querying DNS | No network-level restriction | Rustynet policy gates which nodes can reach `rustydns.mesh:53` |
-| Query history on disk | Log files persist after daemon exit | Query logs in-memory ring buffer only (disk logging opt-in) |
-| Client IP in log files | Full IPs identify users | Anonymised logging by default (last octet/64 bits zeroed) |
-| Memory exhaustion from huge blocklist | Unbounded `HashMap` growth | Heap estimate logged and warned at > 100 MiB |
-| Privilege escalation | Running as root | Unprivileged `rustydns` user + `CAP_NET_BIND_SERVICE` only |
-| Unsafe memory operations | Buffer overflows, UAF | `#![forbid(unsafe_code)]` in all workspace crates |
-
-### Out of scope
-
-- **DNSSEC signing**: We validate signatures on upstream responses, but
-  `rustydns` does not sign any zone it serves. We do not own a public zone.
-- **DDoS amplification mitigation**: The daemon runs on a private mesh; it is
-  not exposed to the public internet. If you expose it publicly, add rate
-  limiting at the network layer.
-- **Client authentication**: DNS has no client authentication mechanism at the
-  protocol level. Access control is at the Rustynet policy layer (which nodes
-  can reach the DNS port).
+1. [Threat Model](#threat-model)
+2. [Privacy: Hiding Your Queries from Upstream Resolvers](#privacy-hiding-your-queries-from-upstream-resolvers)
+3. [Transport Security](#transport-security)
+4. [Blocklist Supply-Chain Security](#blocklist-supply-chain-security)
+5. [Logging and Data Minimisation](#logging-and-data-minimisation)
+6. [Privilege Model](#privilege-model)
+7. [Memory Safety and Unsafe Code Surface](#memory-safety-and-unsafe-code-surface)
+8. [Additional Threats and Mitigations](#additional-threats-and-mitigations)
+9. [Deployment Security Checklist](#deployment-security-checklist)
 
 ---
 
-## Encrypted upstream DNS
+## Threat Model
 
-### DNS-over-HTTPS (DoH, RFC 8484) — default
+RustyDNS sits between clients on a local network and upstream recursive resolvers.
+The trust boundaries are:
 
-All upstream queries are sent over HTTPS (HTTP/2 + TLS). An observer on the
-network sees only that the resolver is making HTTPS connections to a known DoH
-provider — not which domains are being queried.
+| Zone                  | Trust level  | Notes                                            |
+|-----------------------|--------------|--------------------------------------------------|
+| Local clients         | Semi-trusted | They are on the operator's network               |
+| Upstream resolvers    | Untrusted    | Treat as adversarial observers                   |
+| Blocklist CDNs        | Untrusted    | Assume any CDN may be compromised                |
+| `trusted_rpz_sources` | Operator-controlled | Only URLs the operator explicitly lists  |
+| Rusty Suite mesh      | Partially trusted | Governed by capability grants in config    |
 
-**TLS configuration:**
-- Minimum version: **TLS 1.3** by default (configurable down to 1.2 — not recommended).
-- TLS 1.3 provides mandatory forward secrecy (every connection uses ephemeral
-  Diffie-Hellman) and has a smaller fingerprinting surface than TLS 1.2.
-- Certificate validation is always on and not configurable to off.
-- TLS implementation: `rustls` (pure Rust, no OpenSSL dependency, no C code
-  in the TLS path).
+### Actors and Goals
 
-**To use DoH:**
-```toml
-[upstream]
-protocol = "doh"
-resolvers = [
-    "https://cloudflare-dns.com/dns-query",
-    "https://dns.quad9.net/dns-query",
-]
-```
+**Passive observer on the wire** — an ISP, transit provider, or co-located attacker who
+can read network traffic. Goal: learn what domains you resolve. Countermeasure:
+DNS-over-HTTPS (DoH, RFC 8484) or DNS-over-QUIC (DoQ, RFC 9250) to upstream.
 
-### DNS-over-QUIC (DoQ, RFC 9250) — opt-in
+**Upstream resolver** — the DoH/DoQ server receives your queries. Goal: build a profile
+by IP address and correlate queries over time. Countermeasures: query name minimisation
+(RFC 7816), EDNS0 Client Subnet stripping (RFC 7871), query padding (RFC 8467),
+and randomised upstream selection across the resolver pool.
 
-QUIC provides lower latency than TCP (no TLS handshake round-trip after the
-first connection, 0-RTT reconnect). The privacy properties are equivalent to
-DoH. Use on low-latency paths where the extra QUIC connection setup overhead
-is worthwhile.
+**Compromised upstream resolver** — returns forged DNS answers. Countermeasure:
+DNSSEC validation; responses that fail validation are dropped and SERVFAIL is returned.
 
-```toml
-[upstream]
-protocol = "doq"
-```
+**Compromised blocklist CDN** — a supply-chain attack in which the CDN is taken over and
+the attacker injects entries to allowlist their own infrastructure (RPZ passthru injection).
+Countermeasure: `BlocklistSource::Trusted/Untrusted` separation; passthru/allowlist entries
+from untrusted sources are silently discarded with a warning metric.
 
-### Plaintext DNS — opt-in with persistent warnings
+**Attacker on the LAN** — a rogue device on the local network sending crafted DNS
+requests. Countermeasure: authority-zone lookup before blocklist lookup (invariant order),
+validated query parsing, and bounded memory allocation.
 
-`protocol = "plain"` is available for development and debugging only. When
-configured, the daemon emits a `WARN`-level log on every startup:
-
-```
-WARN upstream.protocol = "plain" — DNS queries will be sent UNENCRYPTED.
-     This leaks all resolved domain names to network observers.
-```
-
-**Never use `plain` in production.**
+**Log file exfiltration** — an attacker who obtains log files learns which clients
+resolved which domains. Countermeasure: query logs are in-memory only by default;
+client IPs are anonymised at /16 (IPv4) or /64 (IPv6); the type system prevents
+accidental full-IP logging.
 
 ---
 
-## Query Name Minimisation (RFC 7816)
+## Privacy: Hiding Your Queries from Upstream Resolvers
 
-Without minimisation, a query for `www.example.com` sent to an upstream
-resolver exposes the full QNAME. With minimisation enabled:
+### Query Name Minimisation (RFC 7816)
 
-1. To resolve `.com`, the query is `?.com` (only the zone label).
-2. To resolve `example.com`, the query is `?.example.com`.
-3. Only the final resolver for `example.com` sees `www.example.com`.
+When resolving `www.example.com`, a naive resolver sends the full QNAME to every
+nameserver in the chain. RustyDNS (planned) will send only the minimum labels needed
+at each delegation step — the root sees only `.com`, the TLD sees only `example.com`,
+and only the authoritative server sees the full name. This limits the data each party
+receives to what they strictly need.
 
-No single resolver sees the complete query history. This is enabled by default:
+### EDNS0 Client Subnet Stripping (RFC 7871)
 
-```toml
-[privacy]
-query_minimization = true   # RFC 7816, default
-```
+Upstream resolvers may request the client's IP subnet via the ECS EDNS0 option to
+return geographically relevant answers. RustyDNS strips ECS options from all outgoing
+queries and never adds them. The upstream resolver sees only the RustyDNS server's IP,
+not the originating client's subnet.
 
----
+### Query Padding (RFC 8467)
 
-## EDNS0 Client Subnet stripping (RFC 7871)
+Even over an encrypted transport, an observer who can see packet sizes may infer the
+queried domain from the packet length. RustyDNS pads outgoing DoH queries to fixed-size
+blocks (planned: 128-byte blocks per RFC 8467 recommendation). An observer sees only
+that a block of N×128 bytes was sent, not the domain name length.
 
-EDNS0 Client Subnet (ECS) is an extension that allows resolvers to include the
-client's IP subnet in upstream queries to improve CDN geolocation. This leaks
-the client's network identity to upstream resolvers and CDN providers.
+### Randomised Upstream Selection
 
-`rustydns` strips the ECS option from all outgoing queries unconditionally
-when `no_edns_client_subnet = true` (the default). The upstream resolver sees
-only the resolver's own IP, not the client's subnet.
+When multiple upstream resolvers are configured, RustyDNS selects among them randomly
+per query. No single resolver builds a complete query history. Operators should configure
+resolvers from different jurisdictions and operators.
 
-```toml
-[privacy]
-no_edns_client_subnet = true   # default
-```
+### DNSSEC Validation
 
----
-
-## DoH query padding (RFC 8467)
-
-Even with TLS encryption, an observer can infer which domain was queried by
-measuring the size of the encrypted payload. Short queries are likely common
-short domains; long queries may be specific rare domains.
-
-With padding enabled, all DoH query and response messages are padded to a
-multiple of 128 bytes. The padding bytes carry no information; they exist only
-to make all queries the same size class.
-
-```toml
-[privacy]
-upstream_padding = true   # RFC 8467, default
-```
+Responses from upstream are DNSSEC-validated. A resolver that returns a forged answer
+— whether due to compromise, BGP hijacking, or protocol downgrade — will be rejected and
+the client receives SERVFAIL. There is no fallback to unvalidated answers, and there is
+no stale-answer mode that could serve a cached response after validation failure.
 
 ---
 
-## Randomised upstream selection
+## Transport Security
 
-With a fixed resolver order (`resolvers[0]` always first), one resolver sees
-the majority of query history. If that resolver is compromised or compelled to
-log, the full query history is exposed.
+### Encrypted Transport to Upstream
 
-With randomised selection (the default), each query is routed to a uniformly
-random upstream from the configured list. Across many queries, each resolver
-sees approximately 1/N of the history (where N is the number of configured
-resolvers).
+All upstream communication uses DNS-over-HTTPS (RFC 8484) or DNS-over-QUIC (RFC 9250).
+Plain DNS over UDP/TCP to upstream resolvers is not supported. If no encrypted resolver
+is configured, the daemon refuses to start.
 
-```toml
-[privacy]
-randomize_upstream_selection = true   # default
+The `protocol` field in `[[resolvers]]` accepts `"doh"` or `"doq"` only. Setting
+`"plain"` logs a startup warning and will become a hard error in a future release.
 
-[upstream]
-resolvers = [
-    "https://cloudflare-dns.com/dns-query",
-    "https://dns.quad9.net/dns-query",
-    # Add more for better distribution
-]
+### TLS Implementation
+
+All TLS is implemented by `rustls` — a pure-Rust TLS library with no dependency on
+OpenSSL or any system TLS library. `rustls` supports TLS 1.3 and 1.2 only; older
+protocol versions are not implemented. TLS 1.3 is the default minimum; configuring TLS
+1.2 as the minimum emits a startup warning.
+
+TLS certificate validation is always enabled and is not configurable. There is no
+`verify_tls_certs = false` option and no plan to add one. Operators who need to trust
+a private CA should add it to the system trust store.
+
+### DNS-over-TLS Listener (Planned)
+
+For clients on the local network, RustyDNS will support a DoT listener (port 853).
+This requires `tls_cert_path` and `tls_key_path` to be set in `[server]`. If
+`dot_listen` is configured without both paths, the daemon refuses to start.
+
+Certificate and key files must be readable only by the `rustydns` user:
+
 ```
+chmod 640 /etc/rustydns/tls.crt
+chmod 600 /etc/rustydns/tls.key
+chown rustydns:rustydns /etc/rustydns/tls.crt /etc/rustydns/tls.key
+```
+
+### DoH Listener Security
+
+If you expose a DoH listener to the local network, do not expose it to the public
+internet without a reverse proxy (nginx, Caddy) that enforces rate limiting, access
+control, and TLS termination with a trusted certificate. A public DoH endpoint can be
+used as a DNS amplification vector. The metrics endpoint must remain on `127.0.0.1`
+and must not be proxied externally.
 
 ---
 
-## DNSSEC validation
+## Blocklist Supply-Chain Security
 
-DNSSEC (RFC 4033–4035) allows DNS responses to be cryptographically signed.
-When a resolver validates a DNSSEC-signed response, a forged or cache-poisoned
-answer is detected and rejected (the response fails signature validation and
-the resolver returns `SERVFAIL`).
+### HTTPS Enforcement
 
-DNSSEC validation is enabled by default and applies to all upstream responses:
+All blocklist sources must use `https://` URLs. HTTP sources are rejected at startup.
+HTTPS provides transport integrity and authenticity for the blocklist download, protecting
+against on-path injection by an ISP or network attacker.
 
-```toml
-[upstream]
-dnssec_validation = true   # default
-```
+### What HTTPS Does Not Protect Against
 
-Disabling DNSSEC validation is possible but emits a startup warning. Do not
-disable it in production — it is the primary defence against DNS cache
-poisoning.
+HTTPS protects the transport. It does not protect against:
 
----
+- **Compromised CDN or origin server** — the CDN operator, or an attacker who has
+  compromised them, can serve malicious blocklist content over a valid HTTPS connection.
+- **Domain takeover** — if the blocklist maintainer's domain expires or is hijacked,
+  the attacker controls the content served to your resolver.
+- **RPZ passthru injection** — an attacker who controls a blocklist source can inject
+  allowlist entries (passthru rules in RPZ format) to permanently exempt their own
+  domains from blocking.
 
-## Fail-closed upstream policy
+### RPZ Passthru Isolation
 
-When all configured upstream resolvers fail (network unreachable, timeout, TLS
-error, DNSSEC validation failure), the daemon returns `SERVFAIL` to the client
-rather than:
+To mitigate passthru injection, RustyDNS distinguishes between trusted and untrusted
+blocklist sources:
 
-- Silently retrying with a different (potentially untrusted) resolver.
-- Returning a stale cached answer without indicating it is stale.
-- Falling back to plaintext DNS.
+- **Untrusted** (the default): remote URLs that are not in `trusted_rpz_sources`. Any
+  allowlist / passthru entry from an untrusted source is **discarded** with a warning.
+  The source can only add domains to the blocklist, never remove them.
+- **Trusted**: local files on disk and any URL listed in `trusted_rpz_sources`. Allowlist
+  entries from trusted sources are honoured. Only add URLs to `trusted_rpz_sources` if
+  you control the origin server end-to-end.
 
-This is the default and is controlled by:
+### Fetch Limits
 
-```toml
-[upstream]
-fail_closed = true   # default
-```
+Blocklist fetches are bounded to prevent memory exhaustion from a slow or malicious
+source:
 
-The client receives `SERVFAIL` and must retry. This is a deliberate trade-off:
-availability is sacrificed to prevent silent privacy or security degradation.
+- `fetch_timeout_ms` (default 30,000 ms): the entire fetch must complete within this
+  window, or the source is skipped for this reload cycle.
+- `max_fetch_bytes` (default 52,428,800 bytes = 50 MiB): if a response body exceeds
+  this limit, the download is aborted and the source is skipped.
 
----
+### Domain Validation
 
-## Blocklist source integrity
+Every domain parsed from a blocklist is validated before insertion:
 
-Blocklist content fetched over plain HTTP could be tampered with in transit
-(by a network attacker injecting arbitrary domains into the blocklist, either
-to block legitimate traffic or to whitelist known ad domains).
+- Label length ≤ 63 bytes (RFC 1035 §2.3.4)
+- Total domain length ≤ 253 bytes
+- No control characters (0x00–0x1f, 0x7f)
+- No empty labels (consecutive dots)
 
-`rustydns` enforces HTTPS for all remote blocklist sources. Any source URL
-using `http://` is **rejected at startup** with an error:
+Entries that fail validation are skipped with a warning. They are never inserted into
+the blocklist, preventing a malformed entry from causing unexpected behaviour at query
+time.
 
-```
-ERROR configuration error: blocklist source `http://...` uses plain HTTP —
-      only HTTPS sources are allowed.
-```
+### Overbroad Allowlist Entries
 
-Local files (`blocklist.local_files`) are not subject to this restriction
-(they are read from the local filesystem, not fetched over the network).
-
----
-
-## Anonymised query logging
-
-By default, query logs record only an anonymised form of the client IP:
-
-- **IPv4**: last octet zeroed (`192.168.1.100` → `192.168.1.0/anon`)
-- **IPv6**: interface identifier zeroed (last 64 bits)
-
-The Rustynet node ID (if known) is included in logs unchanged — node IDs are
-public keys, not personally-identifying information.
-
-```toml
-[privacy]
-log_client_ips = false   # default — anonymised IPs only
-```
-
-Setting `log_client_ips = true` records full IP addresses and emits a startup
-warning.
-
-### No persistent query logs
-
-Query logs are written to an in-memory ring buffer (default: 1000 entries).
-The oldest entries are evicted when the buffer is full. Nothing is written to
-disk by default.
-
-```toml
-[privacy]
-query_log_to_disk = false      # default
-query_log_ring_size = 1000     # entries in the ring buffer
-```
-
-Enabling disk logging (`query_log_to_disk = true`) creates a persistent record
-of every domain resolved by every client. If you enable this, ensure the log
-file has appropriate permissions and a retention policy.
+Single-label wildcard allowlist entries such as `*.com` or `*.net` that would exempt an
+entire TLD are rejected at startup by `validate_config()`. This prevents a misconfigured
+or malicious trusted source from allowlisting broad swaths of the namespace.
 
 ---
 
-## Privilege model
+## Logging and Data Minimisation
 
-### Linux capability model
+### No Client IP in Logs by Default
 
-`rustydnsd` uses `CAP_NET_BIND_SERVICE` to bind privileged ports (53, 853)
-and immediately drops all other capabilities. It runs as the `rustydns` user
-(UID/GID created by `scripts/install.sh`), which has:
+The `ClientId` type has no `Display` implementation. Every logging call-site must
+explicitly choose between `client.anonymized()` or `client.full()`. The latter must only
+appear inside a `if config.privacy.log_client_ips { ... }` guard. This is enforced by
+the type system, not by convention. A future lint or audit can mechanically verify
+compliance by grepping for `.full()` call-sites.
 
-- No home directory.
-- No shell (`/usr/sbin/nologin`).
-- Read access to `/var/lib/rustynet/control.db` (via group membership).
-- Read/write access to its own state directory only.
+### IPv4 /16 Anonymisation
 
-### systemd hardening
+When anonymised logging is active, the last **two** octets of IPv4 addresses are zeroed,
+producing a /16 prefix (`192.168.0.0/16/anon`). Zeroing only the last octet (/24) is
+insufficient for home networks where the entire address space may contain only tens of
+devices, making re-identification trivial from auxiliary data.
 
-The provided `install/rustydns.service` systemd unit applies additional
-kernel-level restrictions:
+IPv6 addresses have the last 64 bits zeroed, producing a /64 prefix.
+
+### Node ID Suppression
+
+Node IDs (Rusty Suite mesh identifiers) are stable long-lived device fingerprints. Even
+if source IP logging is disabled, logging a node ID uniquely identifies a device. Node
+IDs are therefore governed by the same `log_client_ips` flag. The `anonymized()` view
+of a `ClientId` omits the node ID entirely.
+
+### In-Memory Query Logs Only
+
+Query logs are held in a bounded ring buffer in memory (default size 10,000 entries,
+configurable up to 100,000). They are not written to disk by default. Disk logging must
+be explicitly enabled; doing so emits a startup warning reminding the operator that log
+files are persistent and require their own access control.
+
+### Metrics Endpoint Binding
+
+The Prometheus metrics endpoint must be bound to `127.0.0.1` (loopback) only. Binding
+to `0.0.0.0` exposes query rate, blocklist hit rate, and upstream latency to anyone on
+the local network. A startup warning is emitted if the metrics listen address is not
+loopback.
+
+---
+
+## Privilege Model
+
+### Linux Capabilities
+
+RustyDNS requires `CAP_NET_BIND_SERVICE` to bind to port 53 (and 853 for DoT). All
+other capabilities are unnecessary.
+
+The systemd unit (see `install/rustydns.service`) uses `AmbientCapabilities=CAP_NET_BIND_SERVICE`
+and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` to ensure no other capability is ever
+available to the process, and runs the daemon as an unprivileged `rustydns` user.
+
+For deployments without systemd, the binary will perform in-process capability dropping
+after binding its sockets (planned: `caps::securebits` + `prctl(PR_SET_SECUREBITS)`).
+Until that is implemented, operators should use a capability-aware service manager or
+bind the sockets via a privileged helper and pass them via socket activation.
+
+### Systemd Hardening
+
+The provided systemd unit applies kernel-level sandboxing:
 
 ```ini
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+[Service]
+User=rustydns
+Group=rustydns
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
 ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-PrivateDevices=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-RestrictNamespaces=true
+ProtectHome=yes
+ReadWritePaths=/var/lib/rustydns /var/log/rustydns
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
-MemoryDenyWriteExecute=true
+SystemCallErrorNumber=EPERM
+UMask=0077
+TasksMax=64
 ```
 
-These restrictions prevent the daemon from:
-- Gaining new privileges after startup.
-- Writing to system directories.
-- Opening network sockets outside of DNS protocols.
-- Executing new processes.
-- Using `mmap(PROT_EXEC)` (common exploit primitive).
+`MemoryDenyWriteExecute` prevents the process from mapping memory as both writable and
+executable — a hard barrier against code injection. `ProtectSystem=strict` makes the
+entire filesystem read-only except for explicitly listed `ReadWritePaths`. The full unit
+file in `install/rustydns.service` is authoritative; the snippet above is illustrative.
+
+### Configuration File Permissions
+
+The daemon checks at startup that the configuration file is not world-readable. If
+`/etc/rustydns/rustydns.toml` is readable by users other than `rustydns`, a hard error
+is emitted and the daemon exits. This prevents other local users from reading upstream
+resolver credentials or other sensitive configuration.
+
+Recommended permissions:
+
+```sh
+chown rustydns:rustydns /etc/rustydns/rustydns.toml
+chmod 640 /etc/rustydns/rustydns.toml
+chmod 750 /etc/rustydns
+```
 
 ---
 
-## Memory safety
+## Memory Safety and Unsafe Code Surface
 
-All workspace crates enforce `#![forbid(unsafe_code)]`. This means:
+### `#![forbid(unsafe_code)]` in All First-Party Crates
 
-- No raw pointer dereferences within `rustydns` code.
-- No `unsafe` blocks anywhere in the workspace.
-- The Rust borrow checker enforces memory safety at compile time.
+Every crate in the RustyDNS workspace declares `#![forbid(unsafe_code)]`. The compiler
+will reject any `unsafe` block, including in generated code from macros. This is verified
+on every `cargo build`.
 
-Dependencies (`hickory-dns`, `quinn`, `rustls`) contain `unsafe` code
-internally. Both are widely-used, audited crates. The `quinn` QUIC
-implementation and `rustls` TLS stack are the only `unsafe` surface in the
-dependency tree.
+### Unsafe in the Dependency Tree
+
+The `forbid` attribute applies to first-party code only. Third-party dependencies
+contain unsafe code. The known unsafe surface is:
+
+| Crate / component    | Unsafe reason                                                    | Risk level |
+|----------------------|------------------------------------------------------------------|------------|
+| `tokio`              | Async runtime, I/O, threading primitives                         | Medium — well-audited |
+| `rustls`             | Pure-Rust TLS; some low-level buffer operations                  | Low — formally verified components |
+| `quinn`              | QUIC implementation; unsafe for performance-critical paths       | Medium — active security research |
+| `reqwest`            | HTTP client built on tokio/hyper                                 | Low — no C FFI |
+| `rusqlite`           | Bundles SQLite C library (C FFI); used by mesh authority         | Medium — SQLite is well-fuzzed but is C |
+| `ring` / `aws-lc-rs` | Cryptographic primitive implementations (mixed Rust + assembly)  | Low — FIPS-audited paths |
+
+We do not use `openssl-sys`, `libc` directly, or any crate that shells out to an
+external process. `cargo deny` is configured to reject crates with known CVEs.
+
+### Panic Policy
+
+The release profile sets `panic = "abort"`. An unexpected panic terminates the process
+cleanly rather than unwinding the stack, which eliminates a class of exploit primitives
+that rely on stack unwinding side effects. The systemd unit is configured to restart the
+service on exit, so an abort is not a permanent denial of service.
 
 ---
 
-## Configuration security checklist
+## Additional Threats and Mitigations
 
-Before deploying `rustydns` in production, verify:
+### DNS Rebinding
 
-- [ ] `upstream.protocol` is `"doh"` or `"doq"` (not `"plain"`)
-- [ ] `upstream.fail_closed = true` (default)
-- [ ] `upstream.dnssec_validation = true` (default)
-- [ ] `upstream.min_tls_version = "1.3"` (default)
-- [ ] All `blocklist.sources` use `https://` URLs
-- [ ] `privacy.query_minimization = true` (default)
-- [ ] `privacy.no_edns_client_subnet = true` (default)
-- [ ] `privacy.upstream_padding = true` (default)
-- [ ] `privacy.randomize_upstream_selection = true` (default)
-- [ ] `privacy.query_log_to_disk = false` (default)
-- [ ] `privacy.log_client_ips = false` (default)
-- [ ] `metrics.listen` is bound to `127.0.0.1` (not `0.0.0.0`)
-- [ ] Daemon runs as `rustydns` user (not `root`)
-- [ ] `CAP_NET_BIND_SERVICE` granted; all other capabilities dropped
-- [ ] systemd unit with hardening directives deployed
+An attacker-controlled domain returns a short-TTL record pointing to `127.0.0.1` or
+a private IP. After the TTL expires the browser re-resolves and the attacker's JS can
+now make requests to the local interface. RustyDNS (planned) will optionally reject
+responses from upstream that resolve to RFC 1918, loopback, or link-local addresses
+(`block_private_rdata = true`). Operators on networks where internal names resolve to
+private IPs should leave this option off and instead rely on DNS firewall rules.
+
+### DNS Amplification Between Mesh Nodes
+
+Mesh nodes that are granted the `dns` capability can query RustyDNS. A compromised mesh
+node could use RustyDNS as a DNS amplification vector to flood third parties. Mitigations:
+
+- The daemon binds only to local interfaces by default (`listen = "127.0.0.1:53"`).
+- Rate limiting per source IP is planned.
+- The systemd unit sets `TasksMax=64` to limit concurrency.
+- `MemoryDenyWriteExecute` and `SystemCallFilter` limit what a compromised process
+  can do even if it achieves code execution inside the daemon.
+
+### Blocklist Source Compromise (Supply Chain)
+
+A maintainer's infrastructure is compromised and begins serving a blocklist that
+contains the attacker's C2 domains in the allowlist. Mitigations:
+
+- Untrusted sources cannot inject allowlist entries (see RPZ passthru isolation above).
+- `fetch_timeout_ms` and `max_fetch_bytes` limit the damage a malicious source can do
+  via a slow/large response.
+- Operators should configure multiple independent blocklist sources. The blocklist
+  engine takes the union of all block entries; a single compromised source cannot
+  remove entries added by other sources.
+
+### DoH Listener Exploitation
+
+If a DoH listener is exposed to untrusted clients, a crafted HTTP request could exploit
+a parsing vulnerability in `hickory-server` or `hyper`. Mitigations:
+
+- HTTP parsing is handled by `hyper` and `tower`, both well-fuzzed.
+- The daemon runs as an unprivileged user with a strict systemd sandbox.
+- `panic = "abort"` ensures a parsing panic kills the process cleanly.
+- Operators should place a reverse proxy with request size limits and rate limiting
+  in front of any externally reachable DoH endpoint.
+
+### Slow Loris on Blocklist Fetch
+
+A malicious blocklist server opens a response but sends data at 1 byte/second, holding
+a connection open indefinitely and consuming a worker thread. Mitigation:
+`fetch_timeout_ms` (default 30 s) applies to the entire download, not just the
+connection establishment. A source that is slower than `max_fetch_bytes / timeout`
+bytes per second will be aborted.
+
+### SQLite Injection via Zone Data
+
+The authority crate stores local zone records in SQLite (via `rusqlite`). If zone data
+is loaded from untrusted input, a malformed domain name could attempt SQL injection
+through the query parameter. Mitigation: all SQLite queries use parameterised statements
+(`?` placeholders); no zone data is ever interpolated into SQL strings. This is enforced
+in code review; a future automated check (e.g. a custom lint or `cargo audit` policy)
+is planned.
+
+### Log File Access Control
+
+If disk logging is enabled, query logs may contain domain names that reveal sensitive
+browsing behaviour. Mitigations:
+
+- Disk logging is opt-in and emits a startup warning.
+- The systemd unit sets `UMask=0077`, ensuring new log files created by the daemon
+  are `600` (owner-read only) by default.
+- Operators should configure log rotation (e.g. `logrotate`) with `create 600 rustydns rustydns`.
+- Log files should not be placed in world-readable directories.
+
+---
+
+## Deployment Security Checklist
+
+Complete this checklist before putting RustyDNS on a network.
+
+### Binary and Installation
+
+- [ ] Binary installed at `/usr/local/bin/rustydns` with mode `750` (not 755)
+- [ ] Binary owned by `root:rustydns`
+- [ ] Binary checksum verified against a release signature (when releases are tagged)
+
+### Configuration
+
+- [ ] Config directory: `chmod 750 /etc/rustydns`
+- [ ] Config file: `chmod 640 /etc/rustydns/rustydns.toml`, owner `rustydns:rustydns`
+- [ ] `listen` is not `0.0.0.0:53` unless you intend to serve the entire network
+- [ ] All `[[resolvers]]` entries use `protocol = "doh"` or `protocol = "doq"`
+- [ ] All `[[resolvers]]` URLs use `https://`
+- [ ] No `http://` blocklist URLs in `[[blocklist.sources]]`
+- [ ] `trusted_rpz_sources` contains only URLs you control end-to-end
+- [ ] No single-label wildcard allowlist entries (e.g., `*.com`)
+- [ ] `privacy.log_client_ips = false` unless there is a specific operational need
+- [ ] `privacy.log_queries_to_disk = false` unless there is a specific operational need
+- [ ] If disk logging is enabled, `logrotate` is configured with `create 600 rustydns rustydns`
+- [ ] `metrics_listen` is `127.0.0.1:9153` (loopback only)
+- [ ] `max_cache_entries` ≤ 500,000
+- [ ] `reload_interval_secs` ≥ 300 (or 0 to disable auto-reload)
+
+### TLS (if using DoT listener)
+
+- [ ] `tls_cert_path` and `tls_key_path` are both set when `dot_listen` is configured
+- [ ] `chmod 640 /etc/rustydns/tls.crt`, owner `rustydns:rustydns`
+- [ ] `chmod 600 /etc/rustydns/tls.key`, owner `rustydns:rustydns`
+- [ ] Certificate is from a trusted CA (not self-signed) or clients are configured to
+      trust the CA explicitly
+
+### Systemd Unit
+
+- [ ] Systemd unit installed: `systemctl enable --now rustydns`
+- [ ] Unit runs as `User=rustydns` (not root)
+- [ ] `MemoryDenyWriteExecute=yes` is present in the unit
+- [ ] `ProtectSystem=strict` is present in the unit
+- [ ] `UMask=0077` is present in the unit
+- [ ] `TasksMax=64` is present in the unit
+- [ ] `AmbientCapabilities=CAP_NET_BIND_SERVICE` is the only capability granted
+
+### Network
+
+- [ ] Port 53 is not exposed to the public internet (firewall rule or `listen` binding)
+- [ ] If a DoH listener is public-facing, a reverse proxy enforces rate limiting and TLS
+- [ ] Metrics endpoint (port 9153) is not reachable from outside the host
+
+### Ongoing
+
+- [ ] `cargo deny check advisories` runs in CI and blocks on new CVEs
+- [ ] Blocklist sources are reviewed periodically; removed if they become unmaintained
+- [ ] `trusted_rpz_sources` is reviewed whenever a blocklist source changes CDN
+- [ ] Log retention policy is documented and enforced

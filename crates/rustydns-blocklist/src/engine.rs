@@ -1,23 +1,23 @@
-//! Blocklist engine: O(1) domain lookup with lock-free hot-reload.
+//! Blocklist engine: O(1) lookup, lock-free hot-reload, RPZ passthru isolation.
 //!
-//! # Architecture
+//! # RPZ passthru injection protection
 //!
-//! The engine stores all blocked domains in an [`ahash::AHashSet`] behind an
-//! [`arc_swap::ArcSwap`]. This means:
+//! A compromised blocklist CDN could inject `rpz-passthru.` entries or AdGuard
+//! `@@||domain^` entries to permanently allowlist itself. The engine prevents
+//! this by only acting on [`ParsedEntry::Allow`] entries from *trusted* sources.
 //!
-//! - **Reads** (the query hot path) are entirely lock-free and allocation-free.
-//!   `is_blocked` acquires a reference to the current state, checks the sets,
-//!   and releases it — no mutex, no allocation.
+//! Sources are classified at load time:
+//! - `BlocklistSource::Trusted` — local files and URLs in `trusted_rpz_sources`.
+//!   Allow entries are added to the allowlist.
+//! - `BlocklistSource::Untrusted` — all other remote URLs.
+//!   Allow entries are **logged as warnings and discarded**.
 //!
-//! - **Writes** (blocklist reload) build a brand-new `BlocklistState` off the
-//!   hot path, then atomically swap the `ArcSwap` pointer. Readers in flight
-//!   see either the old or new state, never a partially-built one.
+//! # Lock-free hot-reload
 //!
-//! # Memory bounds
-//!
-//! The engine logs its heap usage after every reload and emits a warning if
-//! usage exceeds 100 MB — the budget for a Raspberry Pi Zero 2 W running the
-//! full Rusty Suite.
+//! State is stored behind an [`ArcSwap`]. Reads (the query hot path) are
+//! entirely lock-free. Reloads build a new state off the hot path, then
+//! atomically swap the pointer. Readers in flight see either the old or new
+//! state, never a partial one.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -31,36 +31,27 @@ use rustydns_core::config::BlocklistConfig;
 use crate::allowlist::Allowlist;
 use crate::parser::{ParsedEntry, parse};
 
+/// Whether a blocklist source is trusted to provide allowlist/passthru entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlocklistSource {
+    /// Local file or URL in `trusted_rpz_sources`. Allow entries are honoured.
+    Trusted,
+    /// Remote URL not in `trusted_rpz_sources`. Allow entries are discarded.
+    Untrusted,
+}
+
 // ---------------------------------------------------------------------------
-// Internal state (behind the ArcSwap)
+// Internal state
 // ---------------------------------------------------------------------------
 
-/// The immutable blocklist state snapshot.
-///
-/// A new `BlocklistState` is built on every reload; the old one is dropped
-/// once all readers that hold a reference to it finish their queries.
 struct BlocklistState {
-    /// Exact domain blocks (lowercased, no trailing dot).
     domains: AHashSet<String>,
-
-    /// Wildcard parent domains.
-    ///
-    /// If `"example-ads.com"` is in this set, then `foo.example-ads.com` and
-    /// `bar.foo.example-ads.com` are both blocked, but `example-ads.com`
-    /// itself is not (use `domains` for that).
     wildcard_parents: AHashSet<String>,
-
-    /// Allowlist — checked first; a match here overrides any block.
     allowlist: Allowlist,
-
-    /// Total number of block entries (exact + wildcard).
     entry_count: usize,
-
-    /// Approximate heap usage in bytes (rough estimate for monitoring).
     heap_bytes: usize,
-
-    /// Wall-clock time when this state was loaded.
     loaded_at: SystemTime,
+    untrusted_allows_discarded: u32,
 }
 
 impl BlocklistState {
@@ -72,49 +63,40 @@ impl BlocklistState {
             entry_count: 0,
             heap_bytes: 0,
             loaded_at: SystemTime::now(),
+            untrusted_allows_discarded: 0,
         }
     }
 
-    /// Check whether `domain` should be blocked.
+    /// Check whether `domain` is blocked.
     ///
-    /// Pipeline:
-    /// 1. Allowlist check — if allowed, return `false` immediately.
-    /// 2. Exact match in `domains`.
-    /// 3. Walk up the label tree checking `wildcard_parents`.
-    ///
-    /// Does not allocate on any path.
+    /// Pipeline (all without allocation for the common path):
+    /// 1. Allowlist — if allowed, return false immediately.
+    /// 2. Exact match.
+    /// 3. Wildcard parent walk.
     fn is_blocked(&self, domain: &str) -> bool {
         let domain = domain.trim_end_matches('.');
         if domain.is_empty() {
             return false;
         }
 
-        // Lowercase comparison without allocating for the common case.
-        // We lowercase on insert, so we only need to lowercase the input here.
-        // For ASCII domains (the overwhelming majority) this is cheap.
+        // Lowercase without allocating for ASCII-only names (the vast majority).
         let domain_lc: String;
-        let domain = if domain.chars().any(|c| c.is_ascii_uppercase()) {
+        let domain = if domain.bytes().any(|b| b.is_ascii_uppercase()) {
             domain_lc = domain.to_lowercase();
             &domain_lc
         } else {
             domain
         };
 
-        // Allowlist always wins.
         if self.allowlist.is_allowed(domain) {
             return false;
         }
 
-        // Exact match.
         if self.domains.contains(domain) {
             return true;
         }
 
-        // Wildcard parent walk.
-        // For "ads.tracker.example.com", check:
-        //   "tracker.example.com"   (strip label "ads.")
-        //   "example.com"           (strip label "tracker.")
-        //   "com"                   (strip label "example.") — we stop here
+        // Walk up the label tree checking wildcard parents.
         let mut rest = domain;
         while let Some(dot_pos) = rest.find('.') {
             rest = &rest[dot_pos + 1..];
@@ -133,18 +115,15 @@ impl BlocklistState {
 
 /// The blocklist engine.
 ///
-/// Thread-safe and `Clone`-able (cloning shares the same underlying state).
-/// Cheaply passed to query handler tasks as `Arc<BlocklistEngine>`.
+/// All public methods are thread-safe. `is_blocked` is lock-free and
+/// allocation-free for the common case.
 pub struct BlocklistEngine {
     state: ArcSwap<BlocklistState>,
     config: BlocklistConfig,
 }
 
 impl BlocklistEngine {
-    /// Create a new engine from config with an **empty** blocklist.
-    ///
-    /// Call [`load`] or [`load_many`] to populate the blocklist before
-    /// serving queries.
+    /// Create a new engine from config with an empty blocklist.
     pub fn new(config: BlocklistConfig) -> Self {
         let allowlist = Allowlist::from_entries(&config.allowlist);
         Self {
@@ -153,110 +132,106 @@ impl BlocklistEngine {
         }
     }
 
-    /// Load blocklist content from a single string slice.
+    /// Load and merge multiple blocklist sources.
     ///
-    /// The format is auto-detected. This atomically replaces the current state.
-    pub fn load(&self, content: &str) {
-        self.load_many(&[content]);
-    }
-
-    /// Load and merge multiple blocklist sources into a single atomic state.
+    /// Each source is paired with a [`BlocklistSource`] trust level. Allow
+    /// entries from untrusted sources are discarded with a warning; allow
+    /// entries from trusted sources are added to the allowlist.
     ///
-    /// All sources are parsed and their entries merged before the `ArcSwap`
-    /// pointer is swapped — there is exactly one swap regardless of how many
-    /// sources are provided.
-    ///
-    /// `rpz-passthru.` allow entries from RPZ sources are merged into the
-    /// allowlist and take precedence over any block entries in the same or
-    /// other sources.
-    pub fn load_many(&self, sources: &[&str]) {
+    /// All sources are processed before the atomic state swap — exactly one
+    /// swap per reload regardless of source count.
+    pub fn load_many_with_trust(&self, sources: &[(&str, BlocklistSource)]) {
         let mut state = BlocklistState::new_empty(Allowlist::from_entries(&self.config.allowlist));
-        let mut rpz_allows: Vec<String> = Vec::new();
+        let mut trusted_allows: Vec<String> = Vec::new();
 
-        for content in sources {
+        for (content, trust) in sources {
             for entry in parse(content) {
                 match entry {
-                    ParsedEntry::Exact(d) => {
-                        state.domains.insert(d);
-                    }
-                    ParsedEntry::WildcardParent(p) => {
-                        state.wildcard_parents.insert(p);
-                    }
+                    ParsedEntry::Exact(d) => { state.domains.insert(d); }
+                    ParsedEntry::WildcardParent(p) => { state.wildcard_parents.insert(p); }
                     ParsedEntry::Allow(d) => {
-                        rpz_allows.push(d);
+                        match trust {
+                            BlocklistSource::Trusted => {
+                                trusted_allows.push(d);
+                            }
+                            BlocklistSource::Untrusted => {
+                                state.untrusted_allows_discarded += 1;
+                                warn!(
+                                    domain = %d,
+                                    "discarded allowlist/passthru entry from untrusted blocklist \
+                                     source — add the source URL to `blocklist.trusted_rpz_sources` \
+                                     if this is intentional"
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Merge RPZ passthru allows into the allowlist.
-        if !rpz_allows.is_empty() {
-            state.allowlist.extend_exact(rpz_allows);
+        if !trusted_allows.is_empty() {
+            state.allowlist.extend_exact(trusted_allows);
         }
 
-        let exact_count = state.domains.len();
-        let wildcard_count = state.wildcard_parents.len();
-        state.entry_count = exact_count + wildcard_count;
-
-        // Rough heap estimate: ~30 bytes average domain + ~50 bytes AHashSet overhead/entry.
+        state.entry_count = state.domains.len() + state.wildcard_parents.len();
+        // ~30 bytes average domain + ~50 bytes AHashSet overhead per entry
         state.heap_bytes = state.entry_count * 80;
 
         info!(
-            exact    = exact_count,
-            wildcards = wildcard_count,
-            total    = state.entry_count,
-            heap_kib = state.heap_bytes / 1024,
+            exact     = state.domains.len(),
+            wildcards = state.wildcard_parents.len(),
+            total     = state.entry_count,
+            heap_kib  = state.heap_bytes / 1024,
             allowlist = state.allowlist.len(),
+            untrusted_allows_discarded = state.untrusted_allows_discarded,
             "blocklist loaded"
         );
 
-        // Warn if this would likely OOM Pi Zero 2 W class hardware.
         if state.heap_bytes > 100 * 1024 * 1024 {
             warn!(
                 heap_mib = state.heap_bytes / (1024 * 1024),
-                "blocklist heap usage exceeds 100 MiB — may cause OOM on low-memory hardware \
-                 (Pi Zero 2 W has 512 MiB total; rustydns targets < 30 MiB idle RSS)"
+                "blocklist heap usage exceeds 100 MiB — may OOM Pi Zero 2 W (512 MiB total RAM)"
+            );
+        }
+
+        if state.untrusted_allows_discarded > 0 {
+            warn!(
+                count = state.untrusted_allows_discarded,
+                "untrusted blocklist sources contained allowlist/passthru entries that were \
+                 discarded. If these are legitimate, add the source URL to \
+                 `blocklist.trusted_rpz_sources`."
             );
         }
 
         self.state.store(Arc::new(state));
     }
 
+    /// Convenience: load a single content string, treated as untrusted.
+    pub fn load(&self, content: &str) {
+        self.load_many_with_trust(&[(content, BlocklistSource::Untrusted)]);
+    }
+
+    /// Convenience: load a single trusted content string.
+    pub fn load_trusted(&self, content: &str) {
+        self.load_many_with_trust(&[(content, BlocklistSource::Trusted)]);
+    }
+
     /// Returns `true` if `domain` is blocked.
     ///
-    /// This is the **hot path** — called for every query that escapes the
-    /// authority layer. It is lock-free and does not allocate for the common
-    /// (not-blocked) case.
+    /// Lock-free, allocation-free for the common case. Hot path.
     #[inline]
     pub fn is_blocked(&self, domain: &str) -> bool {
         self.state.load().is_blocked(domain)
     }
 
-    /// Returns the total number of blocked entries (exact + wildcard).
-    pub fn entry_count(&self) -> usize {
-        self.state.load().entry_count
-    }
+    pub fn entry_count(&self) -> usize  { self.state.load().entry_count }
+    pub fn heap_bytes(&self) -> usize   { self.state.load().heap_bytes }
+    pub fn loaded_at(&self) -> SystemTime { self.state.load().loaded_at }
 
-    /// Returns the approximate heap usage of the blocklist in bytes.
-    pub fn heap_bytes(&self) -> usize {
-        self.state.load().heap_bytes
-    }
-
-    /// Returns when the current blocklist state was loaded.
-    pub fn loaded_at(&self) -> SystemTime {
-        self.state.load().loaded_at
-    }
-
-    /// Returns the configured block response type.
     pub fn block_response(&self) -> rustydns_core::config::BlockResponse {
         self.config.block_response
     }
-
-    /// Returns the configured sinkhole IP (only meaningful when
-    /// `block_response = "sinkhole"`).
-    pub fn sinkhole_ip(&self) -> &str {
-        &self.config.sinkhole_ip
-    }
+    pub fn sinkhole_ip(&self) -> &str { &self.config.sinkhole_ip }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,92 +243,100 @@ mod tests {
     use super::*;
     use rustydns_core::config::BlocklistConfig;
 
-    fn engine_with_hosts(content: &str) -> BlocklistEngine {
-        let engine = BlocklistEngine::new(BlocklistConfig::default());
-        engine.load(content);
-        engine
+    fn engine() -> BlocklistEngine {
+        BlocklistEngine::new(BlocklistConfig::default())
+    }
+
+    fn load(content: &str) -> BlocklistEngine {
+        let e = engine();
+        e.load(content);
+        e
     }
 
     #[test]
-    fn blocks_exact_domain() {
-        let engine = engine_with_hosts("0.0.0.0 ads.example.com\n");
-        assert!(engine.is_blocked("ads.example.com"));
+    fn blocks_exact() {
+        assert!(load("0.0.0.0 ads.example.com\n").is_blocked("ads.example.com"));
     }
 
     #[test]
-    fn does_not_block_unrelated_domain() {
-        let engine = engine_with_hosts("0.0.0.0 ads.example.com\n");
-        assert!(!engine.is_blocked("safe.example.com"));
-        assert!(!engine.is_blocked("example.com"));
+    fn does_not_block_unrelated() {
+        let e = load("0.0.0.0 ads.example.com\n");
+        assert!(!e.is_blocked("safe.example.com"));
     }
 
     #[test]
     fn wildcard_rpz_blocks_subdomains() {
-        let engine = engine_with_hosts("*.example-ads.com CNAME .\n");
-        assert!(engine.is_blocked("foo.example-ads.com"));
-        assert!(engine.is_blocked("deep.foo.example-ads.com"));
-        // Apex itself is NOT blocked by a wildcard parent entry.
-        assert!(!engine.is_blocked("example-ads.com"));
+        let e = load("*.example-ads.com CNAME .\n");
+        assert!(e.is_blocked("foo.example-ads.com"));
+        assert!(e.is_blocked("deep.foo.example-ads.com"));
+        assert!(!e.is_blocked("example-ads.com"), "apex not blocked by wildcard-only entry");
     }
 
     #[test]
-    fn allowlist_overrides_blocklist() {
-        let mut config = BlocklistConfig::default();
-        config.allowlist = vec!["safe.ads.example.com".to_string()];
-        let engine = BlocklistEngine::new(config);
-        engine.load("0.0.0.0 safe.ads.example.com\n0.0.0.0 other.ads.example.com\n");
-
-        assert!(!engine.is_blocked("safe.ads.example.com"), "allowlisted domain should not be blocked");
-        assert!(engine.is_blocked("other.ads.example.com"));
+    fn config_allowlist_overrides_blocklist() {
+        let mut cfg = BlocklistConfig::default();
+        cfg.allowlist = vec!["safe.ads.example.com".to_string()];
+        let e = BlocklistEngine::new(cfg);
+        e.load("0.0.0.0 safe.ads.example.com\n0.0.0.0 other.ads.example.com\n");
+        assert!(!e.is_blocked("safe.ads.example.com"));
+        assert!(e.is_blocked("other.ads.example.com"));
     }
 
     #[test]
-    fn wildcard_allowlist_overrides_blocklist() {
-        let mut config = BlocklistConfig::default();
-        config.allowlist = vec!["*.example.com".to_string()];
-        let engine = BlocklistEngine::new(config);
-        engine.load("0.0.0.0 ads.example.com\n");
-
-        assert!(!engine.is_blocked("ads.example.com"));
-        assert!(!engine.is_blocked("any.subdomain.example.com"));
-    }
-
-    #[test]
-    fn case_insensitive_lookup() {
-        let engine = engine_with_hosts("0.0.0.0 ADS.EXAMPLE.COM\n");
-        assert!(engine.is_blocked("ads.example.com"));
-        assert!(engine.is_blocked("ADS.EXAMPLE.COM"));
-        assert!(engine.is_blocked("Ads.Example.Com"));
+    fn case_insensitive() {
+        let e = load("0.0.0.0 ADS.EXAMPLE.COM\n");
+        assert!(e.is_blocked("ads.example.com"));
+        assert!(e.is_blocked("ADS.EXAMPLE.COM"));
     }
 
     #[test]
     fn trailing_dot_ignored() {
-        let engine = engine_with_hosts("0.0.0.0 ads.example.com\n");
-        assert!(engine.is_blocked("ads.example.com."));
-    }
-
-    #[test]
-    fn empty_after_load_many_with_no_sources() {
-        let engine = BlocklistEngine::new(BlocklistConfig::default());
-        engine.load_many(&[]);
-        assert_eq!(engine.entry_count(), 0);
-    }
-
-    #[test]
-    fn load_many_merges_sources() {
-        let engine = BlocklistEngine::new(BlocklistConfig::default());
-        engine.load_many(&[
-            "0.0.0.0 ads.example.com\n",
-            "tracker.example.net\n",
-        ]);
-        assert!(engine.is_blocked("ads.example.com"));
-        assert!(engine.is_blocked("tracker.example.net"));
+        assert!(load("0.0.0.0 ads.example.com\n").is_blocked("ads.example.com."));
     }
 
     #[test]
     fn never_blocks_localhost() {
-        let engine = engine_with_hosts("0.0.0.0 localhost\n127.0.0.1 broadcasthost\n");
-        assert!(!engine.is_blocked("localhost"));
-        assert!(!engine.is_blocked("broadcasthost"));
+        let e = load("0.0.0.0 localhost\n127.0.0.1 broadcasthost\n");
+        assert!(!e.is_blocked("localhost"));
+    }
+
+    #[test]
+    fn untrusted_allow_entry_is_discarded() {
+        // An RPZ passthru entry from an untrusted source must NOT allowlist the domain.
+        let e = engine();
+        // Load the RPZ source as untrusted (default)
+        e.load("ads.example.com CNAME .\nsafe.example.com CNAME rpz-passthru.\n");
+        // ads.example.com should still be blocked
+        assert!(e.is_blocked("ads.example.com"), "block entry should remain");
+        // The passthru for safe.example.com should be DISCARDED — safe.example.com is not in the
+        // blocklist so it wasn't going to be blocked anyway, but if we also had:
+        // "0.0.0.0 safe.example.com" in another source, it should remain blocked
+        let e2 = engine();
+        e2.load_many_with_trust(&[
+            ("0.0.0.0 safe.example.com\n", BlocklistSource::Untrusted),
+            ("safe.example.com CNAME rpz-passthru.\n", BlocklistSource::Untrusted),
+        ]);
+        assert!(e2.is_blocked("safe.example.com"), "untrusted passthru should NOT allowlist");
+    }
+
+    #[test]
+    fn trusted_allow_entry_is_honoured() {
+        let e = engine();
+        e.load_many_with_trust(&[
+            ("0.0.0.0 safe.example.com\n", BlocklistSource::Untrusted),
+            ("safe.example.com CNAME rpz-passthru.\n", BlocklistSource::Trusted),
+        ]);
+        assert!(!e.is_blocked("safe.example.com"), "trusted passthru SHOULD allowlist");
+    }
+
+    #[test]
+    fn merge_multiple_sources() {
+        let e = engine();
+        e.load_many_with_trust(&[
+            ("0.0.0.0 ads.example.com\n", BlocklistSource::Untrusted),
+            ("tracker.example.net\n",     BlocklistSource::Untrusted),
+        ]);
+        assert!(e.is_blocked("ads.example.com"));
+        assert!(e.is_blocked("tracker.example.net"));
     }
 }

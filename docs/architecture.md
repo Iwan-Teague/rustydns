@@ -2,7 +2,9 @@
 
 ## Overview
 
-`rustydns` is structured as a pipeline of three cooperating subsystems: an **authority** layer for mesh-local and static records, a **blocklist** layer that intercepts queries before they hit the wire, and a **resolver** layer that handles everything that escapes the first two. A single **daemon binary** (`rustydnsd`) wires them together, owns the UDP/TCP/DoT listeners, and exposes an HTTP management API.
+`rustydns` is a single Rust binary structured as a pipeline of three cooperating subsystems: an **authority** layer for mesh-local and static records, a **blocklist** layer that intercepts queries before they hit the network, and a **resolver** layer for everything else. A **daemon binary** (`rustydnsd`) owns the listeners, wires the pipeline together, and exposes the management API.
+
+Security, privacy, and anonymity are first-class design constraints — not features. Every decision in this document has been made with those three properties as the primary criterion.
 
 ```
  client query (UDP/TCP/DoT/DoH)
@@ -14,117 +16,124 @@
          │
          ▼
   ┌─────────────┐
-  │  Authority  │  — is this a mesh zone or static zone record?
-  │   (cache)   │    yes → answer immediately, NOERROR
-  └──────┬──────┘
+  │  Authority  │  — mesh zone or static zone hit?
+  │   (cache)   │    yes → answer immediately (NOERROR or NXDOMAIN)
+  └──────┬──────┘    mesh records are NEVER blocked — authority wins
          │ miss
          ▼
   ┌─────────────┐
-  │  Blocklist  │  — is this domain on a blocklist?
-  │   engine    │    yes → NXDOMAIN or 0.0.0.0, log it
+  │  Blocklist  │  — domain on blocklist?
+  │   engine    │    yes → NXDOMAIN / REFUSED / sinkhole; log it
   └──────┬──────┘
          │ pass
          ▼
   ┌─────────────┐
-  │  Resolver   │  — recursive resolver, upstream DoH/DoQ
-  │  + cache    │    fail_closed=true → SERVFAIL if no upstream
-  └─────────────┘
+  │  Resolver   │  — DoH/DoQ upstream only (plaintext is explicit opt-in)
+  │  + cache    │    fail_closed=true → SERVFAIL if all upstreams fail
+  └─────────────┘    (there is no stale-answer fallback mode)
 ```
+
+**Pipeline order is an invariant.** Authority answers before blocklist; blocklist before resolver. This order must never change.
 
 ## Crate responsibilities
 
 ### `rustydns-core`
 
-Shared types, configuration schema, and error model. Everything else depends on this; it depends on nothing in the workspace.
+Shared types, configuration schema, error model. No I/O. Everything else depends on this; it depends on nothing in the workspace.
 
 Key items:
-- `DnsConfig` — deserialised from `rustydns.toml` via `serde`
-- `DnsRecord` — thin wrapper around `hickory-proto` record types with suite-specific metadata (mesh node ID, TTL policy)
-- `ClientId` — identifies a querying host; used by the authority and blocklist to apply per-client policy
+- `DnsConfig` — deserialised from `rustydns.toml` via `serde` with `deny_unknown_fields`
+- `PrivacyConfig` — query minimisation, ECS stripping, padding, upstream randomisation, log anonymisation
+- `DnsRecord` — thin wrapper with suite-specific metadata (mesh node ID, TTL policy)
+- `ClientId` — identifies a querying host; no `Display` impl to prevent accidental full-IP logging
 - `RustyDnsError` — unified error enum (`thiserror`)
 
 ### `rustydns-authority`
 
 Serves authoritative answers for:
 
-1. **The mesh zone** — reads live records from the `rustynet-dns-zone` SQLite database (same DB that `rustynetd` writes to). Records are cached in memory with an invalidation signal from a SQLite change-notification hook.
-2. **Static zones** — additional zone files in standard RFC 1035 format, useful for local overrides and split-horizon entries that don't belong in the Rustynet control plane.
+1. **The mesh zone** — live records from the `rustynet-dns-zone` SQLite database (read-only). Changes propagate within one poll interval (default 30 s, configurable to 5 s).
+2. **Static zones** — additional records declared in `rustydns.toml`, useful for local overrides.
 
-The authority speaks the `hickory-server` `Authority` trait so it can be composed with the upstream resolver in `rustydnsd`.
-
-Integration point with Rustynet:
-
-```rust
-// rustydns-authority reads this via rustynet-dns-zone's public API
-pub trait MeshZoneSource: Send + Sync {
-    fn records_for_zone(&self, zone: &Name) -> Vec<DnsRecord>;
-    fn subscribe_changes(&self) -> broadcast::Receiver<ZoneChange>;
-}
-```
+Authority answers are trusted answers. The authority never forwards to an upstream. It either has the answer (returns it) or it doesn't (returns `None`, continuing the pipeline to blocklist/resolver).
 
 ### `rustydns-resolver`
 
-A recursive resolver that forwards to configured upstream servers using:
+Recursive resolver forwarding to upstream servers using DoH (default) or DoQ. Privacy features applied to every outgoing query:
 
-- **DoH** (DNS-over-HTTPS, RFC 8484) — default
-- **DoQ** (DNS-over-QUIC, RFC 9250) — optional, faster on low-latency paths
-- **Plain UDP/TCP** — explicit opt-in only, logged as a security event
+| Feature | RFC | Default |
+|---------|-----|---------|
+| DNS-over-HTTPS upstream | RFC 8484 | ✓ (planned) |
+| TLS 1.3 minimum | RFC 8446 | ✓ (planned) |
+| Certificate validation (always-on, not configurable) | — | ✓ (planned) |
+| DNSSEC validation | RFC 4033–4035 | ✓ (planned) |
+| Query Name Minimisation | RFC 7816 | ✓ (planned) |
+| Strip EDNS0 Client Subnet | RFC 7871 | ✓ (planned) |
+| DoH query/response padding | RFC 8467 | ✓ (planned) |
+| Randomised upstream selection | — | ✓ (planned) |
+| Fail-closed (SERVFAIL, no stale fallback) | — | ✓ (planned) |
 
-Behaviour:
-- Maintains a TTL-respecting in-memory cache (bounded by `max_cache_entries` config).
-- Tries upstreams in order; on failure, tries the next. If all fail and `fail_closed = true`, returns SERVFAIL. Never falls back to plain UDP unless configured.
-- DNSSEC validation is on by default; responses that fail validation return SERVFAIL.
+**There is no stale-answer mode.** When `fail_closed = true` (the default), a failure of all upstreams returns `SERVFAIL`. Returning a stale answer without indicating staleness is a silent privacy degradation — a client might rely on that answer for a domain that has since changed, or the cached answer may have been for a different client's query.
 
 ### `rustydns-blocklist`
 
-A fast in-memory blocklist that intercepts queries before they reach the resolver.
+Fast in-memory blocklist engine. Key properties:
 
-Supported formats:
-- **Hosts format** (`0.0.0.0 ads.example.com`) — the most common, used by StevenBlack/hosts and many others
-- **RPZ zone** (Response Policy Zone) — for more expressive rules including wildcard subtree blocking
-- **Plain domain list** — one domain per line, no IP prefix
+- **O(1) lookup** via `AHashSet` (randomised hash seed per process).
+- **Lock-free hot-reload** via `arc-swap` — readers never block during reload.
+- **Wildcard blocking** — RPZ `*.example.com` and AdGuard `||example.com^` rules.
+- **Suffix-aware allowlist** — `*.example.com` whitelists all subdomains; exact match does not.
+- **Four input formats** — hosts, plain domain list, RPZ, AdGuard/uBlock (auto-detected per source).
+- **Domain validation** — label length (63 bytes), total length (253 bytes), control character rejection.
+- **RPZ passthru isolation** — allow/passthru entries from untrusted remote sources are discarded with a warning. See `docs/security.md` for the threat this mitigates.
 
-Behaviour:
-- Blocked queries return `NXDOMAIN` by default, or a configurable sinkhole IP.
-- Blocklists are fetched from HTTP(S) URLs on startup and reloaded on a configurable interval without daemon restart (atomic pointer swap).
-- Per-client allowlist: a Rustynet node can be given a bypass policy so it skips the blocklist (e.g. a server that legitimately needs to resolve ad-network endpoints for testing).
-- Metrics: blocked query count, list size, last-reload timestamp — all exposed on `/metrics`.
+**Startup behaviour on blocklist fetch failure:** if a remote source fails to fetch at startup, the daemon starts with whatever sources loaded successfully (potentially an empty blocklist if all fail). A warning is logged for each failed source. The daemon does NOT fail to start — DNS resolution must continue even if blocklist fetching is temporarily broken.
 
 ### `rustydnsd`
 
 The binary. Responsibilities:
-- Parse config, validate, and fail fast on bad configuration.
-- Bind listeners (UDP 53, TCP 53, DoT 853). DoH listener is a separate axum HTTP server on port 443 or a configured port.
-- Spawn the query pipeline as a tower `Service` stack: `Authority → Blocklist → Resolver`.
+- Parse config, validate, fail fast on bad configuration (before binding any ports).
+- Attempt in-process capability dropping after binding privileged ports (also enforced by systemd unit).
+- Check config file permissions at startup — warn if world-readable.
+- Spawn the query pipeline as a `tower` `Service` stack: `Authority → Blocklist → Resolver`.
 - Serve the management HTTP API (`/metrics`, `/blocklist/reload`, `/cache/flush`, `/zones`).
-- Handle signals: `SIGHUP` reloads config and blocklists; `SIGTERM`/`SIGINT` shuts down cleanly.
+- Background task: fetch blocklist sources on schedule; swap `ArcSwap` atomically on success.
+- Signal handling: `SIGHUP` reloads config and blocklists; `SIGTERM`/`SIGINT` shuts down cleanly.
+- DoH listener: axum HTTP/2 server. **No TLS on the listener itself** — TLS is on upstream connections going out. If DoH is exposed externally, a TLS-terminating reverse proxy must be in front.
+- DoT listener (optional): requires `tls_cert_path` and `tls_key_path` in config.
 
 ## Data flow — detailed
 
 ```
-1.  UDP packet arrives on 0.0.0.0:53
+1.  UDP packet arrives on configured listen address
 2.  Listener decodes DNS message (hickory-proto)
-3.  ClientId resolved from source IP → Rustynet node identity if known
-4.  Authority checked: is qname in mesh_zone or a static zone?
-    a. Yes → return cached/live record, increment authority_hits counter
+3.  ClientId resolved from source IP
+      → if mesh peer: populate node_id from Rustynet peer table
+      → if unknown: ClientId::from_ip only
+4.  Check per-node policy (blocklist_bypass, zones_allowed)
+5.  Authority checked: is qname in mesh_zone or a static zone?
+    a. Yes → return record, increment authority_hits counter
     b. No  → continue
-5.  Blocklist checked: does qname or any parent match a blocklist entry?
-    a. Yes → return NXDOMAIN (or sinkhole), increment blocked_queries counter
+6.  Blocklist checked: does qname match a blocklist entry?
+    a. Yes → NXDOMAIN / REFUSED / sinkhole, increment blocked_queries counter
+              log: tracing::info!(client = %client.anonymized(), qname = %name, "query blocked")
+              (full qname is logged here because the blocklist hit is the event of interest;
+               note this is at info level — see AGENTS.md log redaction invariant)
     b. No  → continue
-6.  Resolver: look up in cache
-    a. Cache hit → return, update access time
-    b. Cache miss → forward to upstream DoH/DoQ
-       i.  Upstream responds → cache with TTL, return to client
-       ii. All upstreams fail → SERVFAIL (fail_closed) or log + return stale (if configured)
-7.  Response encoded and sent back to client
-8.  Metrics updated (latency histogram, per-step counters)
+7.  Resolver: check cache
+    a. Hit  → return, no upstream query
+    b. Miss → forward to upstream DoH/DoQ with privacy features applied:
+               - Select upstream at random (if privacy.randomize_upstream_selection)
+               - Apply query name minimisation (if privacy.query_minimization)
+               - Strip ECS option (if privacy.no_edns_client_subnet)
+               - Pad query to 128-byte blocks (if privacy.upstream_padding)
+               - Validate DNSSEC on response
+               - On failure: SERVFAIL (fail_closed=true — there is no other mode)
+8.  Response encoded and returned to client
+9.  Metrics updated (latency histogram, per-step counters)
 ```
 
 ## Rustynet integration
-
-`rustydns` is designed to be deployed as a standard Rustynet service — meaning it appears in the mesh with a stable DNS name (`rustydns.mesh`) and is reachable only by nodes that have the appropriate Rustynet policy.
-
-The tighter integration is through `rustynet-dns-zone`:
 
 ```
 rustynetd ──writes──► control.db (SQLite)
@@ -134,21 +143,22 @@ rustynetd ──writes──► control.db (SQLite)
               rustydns-authority ──serves──► clients
 ```
 
-When `rustynetd` adds or removes a peer, the zone change propagates to `rustydns-authority` within one TTL cycle (default 30 seconds for mesh records, configurable down to 5 seconds).
-
-A future tighter integration would have `rustynetd` push zone changes over IPC rather than polling SQLite, bringing propagation latency to sub-second.
+Zone changes propagate to clients within one poll interval + record TTL (default: 30 s each = 60 s worst case). A future IPC push mode would reduce this to sub-second.
 
 ## Security posture
 
-- Runs as an unprivileged user (`rustydns`) after binding privileged ports via `CAP_NET_BIND_SERVICE`.
-- No `unsafe` code in workspace crates. `hickory-dns` and `quinn` (DoQ) contain unsafe internally; both are audited upstream crates.
-- All upstream connections use TLS. Certificate validation is always on.
-- Query logs written to a fixed-size ring buffer in memory; nothing written to disk by default. Optional structured logging to a file with configurable retention.
-- Rustynet policy can restrict which mesh nodes are allowed to query which zones, enforced at the `ClientId` layer before any answer is returned.
+- Runs as an unprivileged user (`rustydns`) after binding privileged ports via `CAP_NET_BIND_SERVICE`. The systemd unit enforces this; the binary also attempts in-process capability dropping for non-systemd deployments.
+- `#![forbid(unsafe_code)]` in all workspace crates.
+- All upstream connections use TLS (DoH/DoQ). Certificate validation is always on and is not configurable. TLS 1.3 is the default minimum.
+- No upstream plain DNS by default. Plaintext is an explicit opt-in that emits a persistent startup warning.
+- Query logs: in-memory ring buffer only by default. Nothing written to disk.
+- Client IPs: anonymised by default (IPv4 /16, IPv6 /64). Full IPs require explicit opt-in.
+- Blocklist sources: HTTPS only. Plain HTTP sources rejected at startup.
+- RPZ passthru entries: honoured only from trusted sources (local files + `trusted_rpz_sources`).
 
 ## Performance targets
 
-Running on a Raspberry Pi Zero 2 W (the same hardware as rustyjack):
+Running on Raspberry Pi Zero 2 W:
 
 | Metric | Target |
 |--------|--------|
@@ -164,15 +174,22 @@ Running on a Raspberry Pi Zero 2 W (the same hardware as rustyjack):
 
 | Crate | Use |
 |-------|-----|
-| `hickory-server` | DNS server framework (authority + resolver) |
+| `hickory-server` | DNS server framework |
 | `hickory-proto` | DNS wire protocol |
-| `hickory-resolver` | Recursive resolver with caching |
-| `tokio` (full) | Async runtime |
+| `hickory-resolver` | Recursive resolver with DoH/DoQ |
+| `tokio` | Async runtime |
 | `quinn` | QUIC transport for DoQ |
-| `axum` | DoH HTTP server + management API |
-| `rusqlite` | Read access to rustynet-dns-zone SQLite DB |
+| `axum` | DoH HTTP/2 server + management API |
+| `rustls` | TLS (pure Rust, no OpenSSL) |
+| `rusqlite` | Read-only access to rustynet-dns-zone SQLite DB |
 | `serde` + `toml` | Configuration |
 | `tracing` | Structured logging |
 | `prometheus` | Metrics exposition |
-| `thiserror` | Error types |
+| `thiserror` | Error types in library crates |
+| `anyhow` | Error handling in the binary |
+| `arc-swap` | Lock-free hot-reload |
+| `ahash` | Fast, DoS-resistant hashing |
+| `moka` | Bounded LRU cache for resolver |
 | `zeroize` | Clear sensitive config values on drop |
+| `rand` | Upstream randomisation |
+| `reqwest` (rustls backend) | Blocklist HTTP fetching — no OpenSSL |

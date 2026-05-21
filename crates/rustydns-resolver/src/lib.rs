@@ -8,23 +8,42 @@
 //! All features default to the most secure/private option. They are controlled
 //! by [`rustydns_core::config::PrivacyConfig`] and [`rustydns_core::config::UpstreamConfig`].
 //!
-//! | Feature | RFC | Default | Config key |
-//! |---------|-----|---------|------------|
-//! | DNS-over-HTTPS upstream | RFC 8484 | ✓ | `upstream.protocol = "doh"` |
-//! | DNS-over-QUIC upstream | RFC 9250 | opt-in | `upstream.protocol = "doq"` |
-//! | TLS 1.3 minimum | RFC 8446 | ✓ | `upstream.min_tls_version = "1.3"` |
-//! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` |
-//! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` |
-//! | Query Name Minimisation | RFC 7816 | ✓ | `privacy.query_minimization = true` |
-//! | Strip EDNS Client Subnet | RFC 7871 | ✓ | `privacy.no_edns_client_subnet = true` |
-//! | DoH query padding | RFC 8467 | ✓ | `privacy.upstream_padding = true` |
-//! | Randomise upstream selection | — | ✓ | `privacy.randomize_upstream_selection = true` |
+//! | Feature | RFC | Default | Config key | Status |
+//! |---------|-----|---------|------------|--------|
+//! | DNS-over-HTTPS upstream | RFC 8484 | ✓ | `upstream.protocol = "doh"` | planned |
+//! | DNS-over-QUIC upstream | RFC 9250 | opt-in | `upstream.protocol = "doq"` | planned |
+//! | TLS 1.3 minimum | RFC 8446 | ✓ | `upstream.min_tls_version = "1.3"` | planned |
+//! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | planned |
+//! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | planned |
+//! | Query Name Minimisation | RFC 7816 | ✓ | `privacy.query_minimization = true` | planned |
+//! | Strip EDNS Client Subnet | RFC 7871 | ✓ | `privacy.no_edns_client_subnet = true` | planned |
+//! | DoH query padding | RFC 8467 | ✓ | `privacy.upstream_padding = true` | planned |
+//! | Randomise upstream selection | — | ✓ | `privacy.randomize_upstream_selection = true` | planned |
+//!
+//! Every row above is **planned** — this crate is a stub. The status column
+//! intentionally does NOT show ✓ for unimplemented features. Do not mark a
+//! feature as implemented until the integration test for it passes.
 //!
 //! # Fail-closed guarantee
 //!
 //! When `upstream.fail_closed = true` (the default), a failure of all configured
 //! upstreams results in `SERVFAIL` being returned to the client. The resolver
 //! **never** silently falls back to plain DNS or to a stale cached answer.
+//! There is no stale-answer mode. Do not add one.
+//!
+//! # Log redaction
+//!
+//! Query names (`qname`) are sensitive data. See `AGENTS.md §Privacy invariants`
+//! and `rustydns_core::client` for the full policy. Summary:
+//!
+//! - `qname` must **never** appear in `tracing::info!`, `warn!`, or `error!`
+//!   events that are written to persistent storage or sent to a log aggregator.
+//! - `qname` is permitted in `tracing::debug!` and `trace!` events because
+//!   those levels are disabled by default and require explicit opt-in via
+//!   `RUST_LOG=debug`. Even so, prefer a hashed or truncated form wherever
+//!   possible.
+//! - When adding new log call-sites, grep for existing `qname =` occurrences
+//!   to verify the level is correct before committing.
 //!
 //! # Status
 //!
@@ -66,14 +85,14 @@ impl Resolver {
         }
 
         tracing::info!(
-            resolvers = config.upstream.resolvers.len(),
-            protocol  = ?config.upstream.protocol,
-            dnssec    = config.upstream.dnssec_validation,
+            resolvers   = config.upstream.resolvers.len(),
+            protocol    = ?config.upstream.protocol,
+            dnssec      = config.upstream.dnssec_validation,
             fail_closed = config.upstream.fail_closed,
-            qmin      = config.privacy.query_minimization,
-            no_ecs    = config.privacy.no_edns_client_subnet,
-            padding   = config.privacy.upstream_padding,
-            randomize = config.privacy.randomize_upstream_selection,
+            qmin        = config.privacy.query_minimization,
+            no_ecs      = config.privacy.no_edns_client_subnet,
+            padding     = config.privacy.upstream_padding,
+            randomize   = config.privacy.randomize_upstream_selection,
             "resolver initialised (stub — hickory integration pending)"
         );
 
@@ -93,13 +112,24 @@ impl Resolver {
     /// - If `privacy.randomize_upstream_selection = true`, the upstream is
     ///   chosen uniformly at random from the configured list.
     ///
+    /// # Log redaction
+    ///
+    /// The `qname` parameter is logged at `debug` level only. Never promote
+    /// this to `info` or above without explicit approval — see module-level
+    /// doc for the full policy.
+    ///
     /// # Errors
     ///
     /// Returns [`RustyDnsError::AllUpstreamsFailed`] if all configured
     /// upstreams fail and `fail_closed = true`. Never falls back to plain DNS.
     pub async fn resolve(&self, name: &str, qtype: &str) -> ResolverResult<Vec<String>> {
-        // TODO (Milestone 3): implement hickory-resolver integration.
-        tracing::debug!(qname = name, qtype = qtype, "resolver stub called");
+        // PRIVACY: qname is logged at debug level only. Do not change the level.
+        // See module-level documentation for the full log redaction policy.
+        tracing::debug!(
+            qname = name,
+            qtype = qtype,
+            "resolver stub called (hickory integration pending)"
+        );
         Err(RustyDnsError::AllUpstreamsFailed)
     }
 }
