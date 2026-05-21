@@ -241,11 +241,32 @@ async fn main() -> Result<()> {
     spawn_metrics_server(metrics.clone(), metrics_addr, metrics_path, shutdown.clone());
 
     wait_for_shutdown_signal().await?;
+    info!("shutdown signal received");
     shutdown.cancel();
-    server
-        .shutdown_gracefully()
-        .await
-        .context("server shutdown failed")?;
+
+    // Bounded graceful shutdown. If hickory's `shutdown_gracefully`
+    // hasn't drained within SHUTDOWN_TIMEOUT we force-exit by dropping
+    // the future — better to abandon a stuck in-flight query than to
+    // sit unresponsive while systemd / Docker / k8s wait on us.
+    //
+    // A second SIGTERM/SIGINT during the drain window collapses the
+    // timeout to zero (operator wants out now).
+    let shutdown_timeout = shutdown_timeout_from_env();
+    tokio::select! {
+        result = tokio::time::timeout(shutdown_timeout, server.shutdown_gracefully()) => {
+            match result {
+                Ok(Ok(())) => info!("server drained cleanly"),
+                Ok(Err(e)) => warn!(error = %e, "server reported error during graceful shutdown"),
+                Err(_) => warn!(
+                    timeout_secs = shutdown_timeout.as_secs(),
+                    "graceful shutdown timed out — forcing exit"
+                ),
+            }
+        }
+        _ = wait_for_shutdown_signal() => {
+            warn!("second shutdown signal received — forcing exit");
+        }
+    }
 
     info!("shutting down");
     Ok(())
@@ -584,6 +605,23 @@ fn spawn_doh_server(
             warn!(error = %e, "DoH server failed");
         }
     });
+}
+
+/// How long to wait for in-flight queries to drain before forcing exit.
+///
+/// Reads `RUSTYDNS_SHUTDOWN_TIMEOUT_SECS` from the environment (clamped
+/// to `[1, 60]` seconds; out-of-range or unparseable values fall back
+/// to the 10-second default). 10s is below systemd's default
+/// `TimeoutStopSec=90s` and k8s's default `terminationGracePeriodSeconds=30s`,
+/// so we always finish before the orchestrator SIGKILLs us.
+fn shutdown_timeout_from_env() -> Duration {
+    const DEFAULT_SECS: u64 = 10;
+    let secs = std::env::var("RUSTYDNS_SHUTDOWN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| (1..=60).contains(&v))
+        .unwrap_or(DEFAULT_SECS);
+    Duration::from_secs(secs)
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {
