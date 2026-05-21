@@ -67,17 +67,22 @@ fn default_true() -> bool { true }
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DnsConfig {
+    /// Network listener settings (UDP/TCP/DoT/DoH ports and TLS material).
     #[serde(default)]
     pub server: ServerConfig,
+    /// Upstream DoH/DoQ resolver settings.
     #[serde(default)]
     pub upstream: UpstreamConfig,
+    /// Authoritative zone settings (static + Rustynet mesh bundle).
     #[serde(default)]
     pub authority: AuthorityConfig,
+    /// Blocklist engine settings (sources, allowlist, response).
     #[serde(default)]
     pub blocklist: BlocklistConfig,
     /// Privacy and anonymity settings. All default to maximum privacy.
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    /// Prometheus metrics endpoint settings (loopback-only by default).
     #[serde(default)]
     pub metrics: MetricsConfig,
     /// Per-Rustynet-node DNS policy. Use `[[policy]]` in TOML.

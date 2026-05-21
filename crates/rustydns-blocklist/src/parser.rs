@@ -60,9 +60,13 @@ pub enum ParsedEntry {
 /// Auto-detected blocklist format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListFormat {
+    /// Hosts file format: `0.0.0.0 domain` or `127.0.0.1 domain` (StevenBlack, etc.).
     Hosts,
+    /// One domain per line, no IP prefix.
     Plain,
+    /// Response Policy Zone — `domain CNAME .` / `*.domain CNAME rpz-passthru.`.
     Rpz,
+    /// AdGuard / uBlock filter syntax — `||domain^`, `@@||domain^`, etc.
     AdGuard,
 }
 

@@ -42,8 +42,12 @@ pub enum RecordData {
     Ns(String),
     /// Service locator (SRV record).
     Srv {
+        /// Lower values are preferred when multiple SRVs share a name.
         priority: u16,
+        /// Relative weight among SRVs at the same priority — higher
+        /// weights get chosen proportionally more often.
         weight: u16,
+        /// TCP/UDP port number where the service is listening.
         port: u16,
         /// Target hostname (FQDN).
         target: String,

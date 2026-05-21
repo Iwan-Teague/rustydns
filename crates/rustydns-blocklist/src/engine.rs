@@ -224,13 +224,18 @@ impl BlocklistEngine {
         self.state.load().is_blocked(domain)
     }
 
+    /// Number of blocking entries currently loaded (exact + wildcard).
     pub fn entry_count(&self) -> usize  { self.state.load().entry_count }
+    /// Approximate heap usage of the blocklist state, in bytes.
     pub fn heap_bytes(&self) -> usize   { self.state.load().heap_bytes }
+    /// Wall-clock time at which the current state was loaded.
     pub fn loaded_at(&self) -> SystemTime { self.state.load().loaded_at }
 
+    /// Configured response code for a blocked query.
     pub fn block_response(&self) -> rustydns_core::config::BlockResponse {
         self.config.block_response
     }
+    /// Configured sinkhole IP (only used when `block_response = "sinkhole"`).
     pub fn sinkhole_ip(&self) -> &str { &self.config.sinkhole_ip }
 }
 
