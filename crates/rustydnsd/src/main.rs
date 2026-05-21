@@ -39,6 +39,7 @@ mod blocklist_loader;
 mod handler;
 mod doh;
 mod metrics;
+mod query_log;
 
 use anyhow::{Context, Result, bail, anyhow};
 use std::io::BufReader;
@@ -153,7 +154,20 @@ async fn main() -> Result<()> {
     let resolver = Arc::new(Resolver::new((*config).clone()).await?);
 
     // Build request handler and server.
-    let handler = DnsHandler::new(authority.clone(), blocklist_engine.clone(), resolver, metrics.clone())?;
+    // In-memory query log ring buffer (privacy invariant: never on disk).
+    let query_log = Arc::new(query_log::QueryLog::new(config.privacy.query_log_ring_size));
+    info!(
+        capacity = query_log.capacity(),
+        "query log ring buffer initialised (in-memory only)"
+    );
+
+    let handler = DnsHandler::new(
+        authority.clone(),
+        blocklist_engine.clone(),
+        resolver,
+        metrics.clone(),
+        query_log.clone(),
+    )?;
     let doh_handler = Arc::new(handler.clone());
     let mut server = ServerFuture::new(handler);
 

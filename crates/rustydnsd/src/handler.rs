@@ -21,6 +21,7 @@ use rustydns_core::RustyDnsError;
 use rustydns_resolver::Resolver;
 
 use crate::metrics::Metrics;
+use crate::query_log::{QueryLog, ServedBy};
 
 const SINKHOLE_TTL_SECS: u32 = 60;
 
@@ -31,16 +32,19 @@ pub struct DnsHandler {
     blocklist: Arc<BlocklistEngine>,
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
+    query_log: Arc<QueryLog>,
     sinkhole_ip: Option<IpAddr>,
 }
 
 impl DnsHandler {
-    /// Construct a new handler with shared authority, blocklist, and resolver.
+    /// Construct a new handler with shared authority, blocklist, resolver,
+    /// and query-log ring buffer.
     pub fn new(
         authority: Arc<Authority>,
         blocklist: Arc<BlocklistEngine>,
         resolver: Arc<Resolver>,
         metrics: Arc<Metrics>,
+        query_log: Arc<QueryLog>,
     ) -> Result<Self, RustyDnsError> {
         let sinkhole_ip = if blocklist.block_response() == BlockResponse::Sinkhole {
             Some(IpAddr::from_str(blocklist.sinkhole_ip()).map_err(|_| {
@@ -58,8 +62,44 @@ impl DnsHandler {
             blocklist,
             resolver,
             metrics,
+            query_log,
             sinkhole_ip,
         })
+    }
+
+    /// Borrow the query log buffer (for inspection / future
+    /// management endpoint).
+    #[allow(dead_code)]
+    pub fn query_log(&self) -> &Arc<QueryLog> {
+        &self.query_log
+    }
+
+    /// Record one query into the ring buffer. Centralised so every
+    /// pipeline arm uses the same hashing rules and `ServedBy`
+    /// label.
+    fn log_query(
+        &self,
+        client: &ClientId,
+        qname: &str,
+        qtype: &str,
+        rcode: ResponseCode,
+        served_by: ServedBy,
+    ) {
+        // Static qtype label — `qtype.to_string()` would allocate
+        // every query. The hickory `RecordType: Display` form is
+        // already lowercase/uppercase ascii so we copy into a small
+        // static interning table.
+        let qtype_static = intern_qtype(qtype);
+        self.query_log.record(
+            client,
+            &qname.to_ascii_lowercase(),
+            qtype_static,
+            // ResponseCode lacks `From<ResponseCode> for u8` but does
+            // expose `.low()` for the wire-level value (top nibble is
+            // for EDNS extended codes which we don't surface here).
+            rcode.low(),
+            served_by,
+        );
     }
 
     async fn respond<R: ResponseHandler>(
@@ -137,8 +177,11 @@ impl RequestHandler for DnsHandler {
 
         self.metrics.inc_queries();
 
+        let client = ClientId::from_ip(info.src.ip());
+
         if request.op_code() != OpCode::Query {
             let builder = MessageResponseBuilder::from_message_request(request);
+            self.log_query(&client, &qname, &qtype_str, ResponseCode::NotImp, ServedBy::Rejected);
             return self
                 .respond(request, response_handle, builder, ResponseCode::NotImp, false, Vec::new())
                 .await;
@@ -146,12 +189,11 @@ impl RequestHandler for DnsHandler {
 
         if qclass != DNSClass::IN {
             let builder = MessageResponseBuilder::from_message_request(request);
+            self.log_query(&client, &qname, &qtype_str, ResponseCode::NotImp, ServedBy::Rejected);
             return self
                 .respond(request, response_handle, builder, ResponseCode::NotImp, false, Vec::new())
                 .await;
         }
-
-        let client = ClientId::from_ip(info.src.ip());
 
         // PRIVACY: qname logged at debug only; do not enable debug in production.
         debug!(client = %client.anonymized(), qname = %qname, qtype = %qtype, "query received");
@@ -161,6 +203,7 @@ impl RequestHandler for DnsHandler {
         if let Some(records) = self.authority.lookup(&qname, &qtype_str) {
             self.metrics.inc_authority_hits();
             let answers = Self::dns_records_to_rrs(&records);
+            self.log_query(&client, &qname, &qtype_str, ResponseCode::NoError, ServedBy::Authority);
             return self
                 .respond(request, response_handle, builder, ResponseCode::NoError, true, answers)
                 .await;
@@ -183,6 +226,7 @@ impl RequestHandler for DnsHandler {
                 }
             };
 
+            self.log_query(&client, &qname, &qtype_str, code, ServedBy::Blocklist);
             return self.respond(request, response_handle, builder, code, false, answers).await;
         }
 
@@ -190,6 +234,7 @@ impl RequestHandler for DnsHandler {
         match self.resolver.resolve(&qname, &qtype_str).await {
             Ok(records) => {
                 let answers = Self::dns_records_to_rrs(&records);
+                self.log_query(&client, &qname, &qtype_str, ResponseCode::NoError, ServedBy::Resolver);
                 self.respond(request, response_handle, builder, ResponseCode::NoError, false, answers)
                     .await
             }
@@ -209,10 +254,34 @@ impl RequestHandler for DnsHandler {
                         warn!(client = %client.anonymized(), "resolver error");
                     }
                 }
+                self.log_query(&client, &qname, &qtype_str, ResponseCode::ServFail, ServedBy::ServerFailure);
                 self.respond(request, response_handle, builder, ResponseCode::ServFail, false, Vec::new())
                     .await
             }
         }
+    }
+}
+
+/// Map a hickory `RecordType` Display string to a stable `&'static str`.
+/// Centralising this avoids allocating a `String` per query just for
+/// the log buffer.
+fn intern_qtype(s: &str) -> &'static str {
+    match s {
+        "A" => "A",
+        "AAAA" => "AAAA",
+        "CNAME" => "CNAME",
+        "MX" => "MX",
+        "NS" => "NS",
+        "PTR" => "PTR",
+        "SOA" => "SOA",
+        "SRV" => "SRV",
+        "TXT" => "TXT",
+        "CAA" => "CAA",
+        "DS" => "DS",
+        "DNSKEY" => "DNSKEY",
+        "RRSIG" => "RRSIG",
+        "ANY" => "ANY",
+        _ => "OTHER",
     }
 }
 
@@ -280,6 +349,7 @@ mod tests {
     /// assigned loopback port. `port` is the bound UDP port.
     struct Harness {
         port: u16,
+        query_log: Arc<crate::query_log::QueryLog>,
         // Hold the server future so it isn't dropped (which would shut
         // the listener down). The test drops it at the end of scope.
         _server: ServerFuture<DnsHandler>,
@@ -338,8 +408,10 @@ mod tests {
                 .expect("resolver builds even with bogus upstreams (bootstrap is best-effort)"),
         );
 
+        let query_log = Arc::new(crate::query_log::QueryLog::new(64));
         let handler =
-            DnsHandler::new(authority, blocklist, resolver, metrics).expect("handler");
+            DnsHandler::new(authority, blocklist, resolver, metrics, query_log.clone())
+                .expect("handler");
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         let port = socket.local_addr().unwrap().port();
@@ -348,6 +420,7 @@ mod tests {
 
         Harness {
             port,
+            query_log,
             _server: server,
         }
     }
@@ -492,6 +565,44 @@ mod tests {
             "fail-closed must return SERVFAIL when no upstream is reachable"
         );
         assert_eq!(resp.answers().len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_log_captures_each_pipeline_arm() {
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "0.0.0.0 ads.example.com\n",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        // 1. authority hit
+        let _ = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        // 2. blocklist hit
+        let _ = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
+        // 3. resolver / fail-closed
+        let _ = query(harness.port, "definitely-uncached.example.test.", ProtoRecordType::A).await;
+
+        let snap = harness.query_log.snapshot();
+        assert_eq!(snap.len(), 3, "every query should be recorded");
+
+        // Snapshots are newest-first: resolver-fail, blocklist, authority.
+        assert_eq!(snap[0].served_by, crate::query_log::ServedBy::ServerFailure);
+        assert_eq!(snap[0].rcode, 2 /* SERVFAIL */);
+        assert_eq!(snap[1].served_by, crate::query_log::ServedBy::Blocklist);
+        assert_eq!(snap[1].rcode, 3 /* NXDOMAIN */);
+        assert_eq!(snap[2].served_by, crate::query_log::ServedBy::Authority);
+        assert_eq!(snap[2].rcode, 0 /* NoError */);
+
+        // Hashes line up with the qnames if we hash again with the
+        // same buffer's salt.
+        let h_authority = harness.query_log.hash_qname("router.mesh.");
+        let h_block = harness.query_log.hash_qname("ads.example.com.");
+        let h_resolver = harness.query_log.hash_qname("definitely-uncached.example.test.");
+        assert_eq!(snap[2].qname_hash, h_authority);
+        assert_eq!(snap[1].qname_hash, h_block);
+        assert_eq!(snap[0].qname_hash, h_resolver);
     }
 
     #[tokio::test(flavor = "current_thread")]
