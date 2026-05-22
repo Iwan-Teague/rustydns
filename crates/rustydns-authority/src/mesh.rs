@@ -44,7 +44,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use thiserror::Error;
 
 use rustydns_core::record::{DnsRecord, RecordData};
@@ -167,9 +167,8 @@ fn read_verifier_key(path: &Path) -> Result<VerifyingKey, MeshBundleError> {
         .ok_or_else(|| {
             MeshBundleError::InvalidVerifierKey("verifier key file is empty".to_string())
         })?;
-    let bytes = decode_hex_fixed::<32>(line).map_err(|e| {
-        MeshBundleError::InvalidVerifierKey(format!("hex decode failed: {e}"))
-    })?;
+    let bytes = decode_hex_fixed::<32>(line)
+        .map_err(|e| MeshBundleError::InvalidVerifierKey(format!("hex decode failed: {e}")))?;
     VerifyingKey::from_bytes(&bytes)
         .map_err(|e| MeshBundleError::InvalidVerifierKey(format!("not a valid ed25519 key: {e}")))
 }
@@ -222,7 +221,9 @@ fn parse_signature(hex: &str) -> Result<Signature, MeshBundleError> {
 // ---------------------------------------------------------------------------
 
 /// Parse a `key=value` line-oriented payload into a flat map.
-fn parse_fields(payload: &[u8]) -> Result<std::collections::BTreeMap<String, String>, MeshBundleError> {
+fn parse_fields(
+    payload: &[u8],
+) -> Result<std::collections::BTreeMap<String, String>, MeshBundleError> {
     let text = std::str::from_utf8(payload).map_err(|_| MeshBundleError::InvalidField {
         field: "<payload>".to_string(),
         reason: "payload is not valid UTF-8".to_string(),
@@ -232,12 +233,17 @@ fn parse_fields(payload: &[u8]) -> Result<std::collections::BTreeMap<String, Str
         if line.is_empty() {
             continue;
         }
-        let (k, v) = line.split_once('=').ok_or_else(|| MeshBundleError::InvalidField {
-            field: line.to_string(),
-            reason: "line is not `key=value`".to_string(),
-        })?;
+        let (k, v) = line
+            .split_once('=')
+            .ok_or_else(|| MeshBundleError::InvalidField {
+                field: line.to_string(),
+                reason: "line is not `key=value`".to_string(),
+            })?;
         // Rustynet rejects duplicates; we mirror that.
-        if map.insert(k.trim().to_string(), v.trim().to_string()).is_some() {
+        if map
+            .insert(k.trim().to_string(), v.trim().to_string())
+            .is_some()
+        {
             return Err(MeshBundleError::InvalidField {
                 field: k.trim().to_string(),
                 reason: "duplicate field in bundle".to_string(),
@@ -322,10 +328,12 @@ fn build_record(
             reason: format!("only `mesh_ipv4` is supported (got `{target_addr_kind}`)"),
         });
     }
-    let ip: Ipv4Addr = expected_ip.parse().map_err(|e| MeshBundleError::InvalidField {
-        field: format!("record.{index}.expected_ip"),
-        reason: format!("not a valid IPv4 address: {e}"),
-    })?;
+    let ip: Ipv4Addr = expected_ip
+        .parse()
+        .map_err(|e| MeshBundleError::InvalidField {
+            field: format!("record.{index}.expected_ip"),
+            reason: format!("not a valid IPv4 address: {e}"),
+        })?;
     let ttl_secs: u64 = ttl_secs_str
         .parse()
         .map_err(|_| MeshBundleError::InvalidField {
@@ -343,8 +351,8 @@ fn build_record(
     let mut out = Vec::with_capacity(names.len());
     for n in names {
         let fqdn = format!("{}{}", n, mesh_zone_dotted(mesh_zone));
-        let rec = DnsRecord::new(fqdn, RecordData::A(ip), ttl)
-            .with_mesh_node(target_node_id.clone());
+        let rec =
+            DnsRecord::new(fqdn, RecordData::A(ip), ttl).with_mesh_node(target_node_id.clone());
         out.push(rec);
     }
     Ok(out)
@@ -521,7 +529,11 @@ mod tests {
             payload.push_str(&format!("record.{i}.aliases={}\n", aliases.join(",")));
         }
         let sig = signing.sign(payload.as_bytes());
-        let sig_hex = sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let sig_hex = sig
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let wire = format!("{payload}signature={sig_hex}\n");
         (wire.into_bytes(), verifier_hex)
     }
@@ -535,7 +547,10 @@ mod tests {
     }
 
     fn now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     #[test]
@@ -543,15 +558,18 @@ mod tests {
         let now = now();
         let (wire, key_hex) = build_signed_bundle(
             "mesh",
-            &[("router", "100.64.0.1", &[]), ("nas", "100.64.0.2", &["storage"])],
+            &[
+                ("router", "100.64.0.1", &[]),
+                ("nas", "100.64.0.2", &["storage"]),
+            ],
             now,
             now + 300,
         );
         let bundle_path = write_temp(&wire, "loads-ok-bundle");
         let key_path = write_temp(key_hex.as_bytes(), "loads-ok-key");
 
-        let loaded = load_mesh_bundle(&bundle_path, &key_path, "mesh.", 600)
-            .expect("bundle must load");
+        let loaded =
+            load_mesh_bundle(&bundle_path, &key_path, "mesh.", 600).expect("bundle must load");
         // router + nas + storage alias = 3 records
         assert_eq!(loaded.records.len(), 3);
         let names: Vec<&str> = loaded.records.iter().map(|r| r.name.as_str()).collect();
@@ -568,12 +586,8 @@ mod tests {
     #[test]
     fn rejects_bad_signature() {
         let now = now();
-        let (mut wire, key_hex) = build_signed_bundle(
-            "mesh",
-            &[("router", "100.64.0.1", &[])],
-            now,
-            now + 300,
-        );
+        let (mut wire, key_hex) =
+            build_signed_bundle("mesh", &[("router", "100.64.0.1", &[])], now, now + 300);
         // Flip a byte in the payload so the signature no longer matches.
         let payload_pos = wire.iter().position(|&b| b == b'r').unwrap();
         wire[payload_pos] ^= 0x01;
@@ -625,12 +639,8 @@ mod tests {
     #[test]
     fn rejects_zone_name_mismatch() {
         let now = now();
-        let (wire, key_hex) = build_signed_bundle(
-            "internal",
-            &[("router", "100.64.0.1", &[])],
-            now,
-            now + 300,
-        );
+        let (wire, key_hex) =
+            build_signed_bundle("internal", &[("router", "100.64.0.1", &[])], now, now + 300);
         let bundle_path = write_temp(&wire, "wrong-zone-bundle");
         let key_path = write_temp(key_hex.as_bytes(), "wrong-zone-key");
 
@@ -672,7 +682,11 @@ mod tests {
         payload.push_str("record.0.ttl_secs=60\n");
         payload.push_str("record.0.aliases=\n");
         let sig = signing.sign(payload.as_bytes());
-        let sig_hex = sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let sig_hex = sig
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let wire = format!("{payload}signature={sig_hex}\n");
 
         let bundle_path = write_temp(wire.as_bytes(), "txt-bundle");
@@ -705,7 +719,10 @@ mod tests {
         let key_path = write_temp(&[b'0'; 64], "nosig-key");
         let err = load_mesh_bundle(&bundle_path, &key_path, "mesh.", 600).unwrap_err();
         assert!(
-            matches!(err, MeshBundleError::MissingSignature | MeshBundleError::InvalidVerifierKey(_)),
+            matches!(
+                err,
+                MeshBundleError::MissingSignature | MeshBundleError::InvalidVerifierKey(_)
+            ),
             "got {err:?}"
         );
     }

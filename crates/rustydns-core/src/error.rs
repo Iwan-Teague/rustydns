@@ -6,7 +6,6 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum RustyDnsError {
     // --- Configuration ------------------------------------------------------
-
     /// A configuration value failed validation.
     #[error("configuration error: {0}")]
     Config(String),
@@ -16,7 +15,6 @@ pub enum RustyDnsError {
     TomlParse(#[from] toml::de::Error),
 
     // --- Zone / Authority ---------------------------------------------------
-
     /// An error in zone data or zone loading.
     #[error("zone error: {0}")]
     Zone(String),
@@ -28,13 +26,11 @@ pub enum RustyDnsError {
     Database(String),
 
     // --- Blocklist ----------------------------------------------------------
-
     /// A blocklist source could not be fetched or parsed.
     #[error("blocklist error: {0}")]
     Blocklist(String),
 
     // --- Resolver -----------------------------------------------------------
-
     /// A generic resolver error.
     #[error("resolver error: {0}")]
     Resolver(String),
@@ -65,7 +61,6 @@ pub enum RustyDnsError {
     },
 
     // --- Policy -------------------------------------------------------------
-
     /// A query was rejected by the per-node policy engine.
     #[error("policy denied query from `{client}` for zone `{zone}`")]
     PolicyDenied {
@@ -76,13 +71,11 @@ pub enum RustyDnsError {
     },
 
     // --- I/O ----------------------------------------------------------------
-
     /// A filesystem I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
     // --- TLS ----------------------------------------------------------------
-
     /// A TLS handshake or certificate error on an upstream connection.
     #[error("TLS error for {upstream}: {reason}")]
     Tls {

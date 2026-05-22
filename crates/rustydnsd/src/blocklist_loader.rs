@@ -9,8 +9,8 @@ use reqwest::Client;
 use tracing::{info, warn};
 
 use rustydns_blocklist::{BlocklistEngine, BlocklistSource};
-use rustydns_core::config::BlocklistConfig;
 use rustydns_core::RustyDnsError;
+use rustydns_core::config::BlocklistConfig;
 
 /// Summary of a blocklist reload attempt.
 #[derive(Debug, Clone, Copy)]
@@ -145,9 +145,8 @@ impl BlocklistLoader {
         let mut body: Vec<u8> = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                RustyDnsError::Blocklist(format!("fetch failed for {url}: {e}"))
-            })?;
+            let chunk = chunk
+                .map_err(|e| RustyDnsError::Blocklist(format!("fetch failed for {url}: {e}")))?;
             if (body.len() + chunk.len()) as u64 > self.config.max_fetch_bytes {
                 return Err(RustyDnsError::Blocklist(format!(
                     "fetch failed for {url}: response exceeds max_fetch_bytes {}",

@@ -103,9 +103,9 @@ pub fn detect_format(content: &str) -> ListFormat {
 /// Parse blocklist content, auto-detecting the format.
 pub fn parse(content: &str) -> Vec<ParsedEntry> {
     match detect_format(content) {
-        ListFormat::Hosts   => parse_hosts(content),
-        ListFormat::Plain   => parse_plain(content),
-        ListFormat::Rpz     => parse_rpz(content),
+        ListFormat::Hosts => parse_hosts(content),
+        ListFormat::Plain => parse_plain(content),
+        ListFormat::Rpz => parse_rpz(content),
         ListFormat::AdGuard => parse_adguard(content),
     }
 }
@@ -210,7 +210,7 @@ pub fn parse_rpz(content: &str) -> Vec<ParsedEntry> {
         if parts.len() < 3 {
             continue;
         }
-        let name  = parts[0];
+        let name = parts[0];
         let rtype = parts[1].to_ascii_uppercase();
         let rdata = parts[2].to_lowercase();
 
@@ -343,7 +343,11 @@ fn validate_and_normalize(s: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 fn strip_comment(line: &str, marker: char) -> &str {
-    if let Some(pos) = line.find(marker) { &line[..pos] } else { line }
+    if let Some(pos) = line.find(marker) {
+        &line[..pos]
+    } else {
+        line
+    }
 }
 
 fn is_ip_address(s: &str) -> bool {
@@ -353,8 +357,15 @@ fn is_ip_address(s: &str) -> bool {
 fn is_always_skipped(domain: &str) -> bool {
     matches!(
         domain,
-        "localhost" | "broadcasthost" | "local" | "ip6-localhost" | "ip6-loopback"
-            | "ip6-localnet" | "ip6-mcastprefix" | "ip6-allnodes" | "ip6-allrouters"
+        "localhost"
+            | "broadcasthost"
+            | "local"
+            | "ip6-localhost"
+            | "ip6-loopback"
+            | "ip6-localnet"
+            | "ip6-mcastprefix"
+            | "ip6-allnodes"
+            | "ip6-allrouters"
             | "ip6-allhosts"
     )
 }
@@ -367,16 +378,37 @@ fn is_always_skipped(domain: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn exact(s: &str) -> ParsedEntry { ParsedEntry::Exact(s.to_string()) }
-    fn wildcard(s: &str) -> ParsedEntry { ParsedEntry::WildcardParent(s.to_string()) }
-    fn allow(s: &str) -> ParsedEntry { ParsedEntry::Allow(s.to_string()) }
+    fn exact(s: &str) -> ParsedEntry {
+        ParsedEntry::Exact(s.to_string())
+    }
+    fn wildcard(s: &str) -> ParsedEntry {
+        ParsedEntry::WildcardParent(s.to_string())
+    }
+    fn allow(s: &str) -> ParsedEntry {
+        ParsedEntry::Allow(s.to_string())
+    }
 
     // --- format detection ---------------------------------------------------
 
-    #[test] fn detect_hosts()   { assert_eq!(detect_format("0.0.0.0 ads.example.com\n"), ListFormat::Hosts); }
-    #[test] fn detect_plain()   { assert_eq!(detect_format("ads.example.com\n"), ListFormat::Plain); }
-    #[test] fn detect_rpz()     { assert_eq!(detect_format("ads.example.com CNAME .\n"), ListFormat::Rpz); }
-    #[test] fn detect_adguard() { assert_eq!(detect_format("||ads.example.com^\n"), ListFormat::AdGuard); }
+    #[test]
+    fn detect_hosts() {
+        assert_eq!(
+            detect_format("0.0.0.0 ads.example.com\n"),
+            ListFormat::Hosts
+        );
+    }
+    #[test]
+    fn detect_plain() {
+        assert_eq!(detect_format("ads.example.com\n"), ListFormat::Plain);
+    }
+    #[test]
+    fn detect_rpz() {
+        assert_eq!(detect_format("ads.example.com CNAME .\n"), ListFormat::Rpz);
+    }
+    #[test]
+    fn detect_adguard() {
+        assert_eq!(detect_format("||ads.example.com^\n"), ListFormat::AdGuard);
+    }
 
     // --- hosts --------------------------------------------------------------
 
@@ -402,13 +434,19 @@ mod tests {
     fn hosts_skips_oversized_label() {
         let long_label = "a".repeat(64);
         let line = format!("0.0.0.0 {long_label}.example.com\n");
-        assert!(parse_hosts(&line).is_empty(), "label > 63 bytes should be skipped");
+        assert!(
+            parse_hosts(&line).is_empty(),
+            "label > 63 bytes should be skipped"
+        );
     }
 
     #[test]
     fn hosts_skips_oversized_domain() {
         let long = format!("0.0.0.0 {}.example.com\n", "a".repeat(250));
-        assert!(parse_hosts(&long).is_empty(), "domain > 253 bytes should be skipped");
+        assert!(
+            parse_hosts(&long).is_empty(),
+            "domain > 253 bytes should be skipped"
+        );
     }
 
     #[test]
@@ -432,7 +470,10 @@ mod tests {
 
     #[test]
     fn rpz_passthru_becomes_allow() {
-        assert!(parse_rpz("safe.example.com CNAME rpz-passthru.\n").contains(&allow("safe.example.com")));
+        assert!(
+            parse_rpz("safe.example.com CNAME rpz-passthru.\n")
+                .contains(&allow("safe.example.com"))
+        );
     }
 
     // --- AdGuard ------------------------------------------------------------

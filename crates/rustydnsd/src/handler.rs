@@ -6,18 +6,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hickory_proto::op::{Header, OpCode, ResponseCode};
-use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, PTR, SRV, TXT};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_server::authority::MessageResponseBuilder;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use tracing::{debug, warn};
 
 use rustydns_authority::Authority;
 use rustydns_blocklist::BlocklistEngine;
+use rustydns_core::RustyDnsError;
 use rustydns_core::client::ClientId;
 use rustydns_core::config::{BlockResponse, NodePolicy};
 use rustydns_core::record::{DnsRecord, RecordData};
-use rustydns_core::RustyDnsError;
 use rustydns_resolver::Resolver;
 
 use crate::metrics::Metrics;
@@ -209,10 +209,22 @@ impl DnsHandler {
         };
 
         match (qtype, ip) {
-            (RecordType::A, IpAddr::V4(v4)) => vec![Record::from_rdata(name, SINKHOLE_TTL_SECS, RData::A(A(v4)))],
-            (RecordType::AAAA, IpAddr::V6(v6)) => vec![Record::from_rdata(name, SINKHOLE_TTL_SECS, RData::AAAA(AAAA(v6)))],
-            (RecordType::ANY, IpAddr::V4(v4)) => vec![Record::from_rdata(name, SINKHOLE_TTL_SECS, RData::A(A(v4)))],
-            (RecordType::ANY, IpAddr::V6(v6)) => vec![Record::from_rdata(name, SINKHOLE_TTL_SECS, RData::AAAA(AAAA(v6)))],
+            (RecordType::A, IpAddr::V4(v4)) => {
+                vec![Record::from_rdata(name, SINKHOLE_TTL_SECS, RData::A(A(v4)))]
+            }
+            (RecordType::AAAA, IpAddr::V6(v6)) => vec![Record::from_rdata(
+                name,
+                SINKHOLE_TTL_SECS,
+                RData::AAAA(AAAA(v6)),
+            )],
+            (RecordType::ANY, IpAddr::V4(v4)) => {
+                vec![Record::from_rdata(name, SINKHOLE_TTL_SECS, RData::A(A(v4)))]
+            }
+            (RecordType::ANY, IpAddr::V6(v6)) => vec![Record::from_rdata(
+                name,
+                SINKHOLE_TTL_SECS,
+                RData::AAAA(AAAA(v6)),
+            )],
             _ => Vec::new(),
         }
     }
@@ -237,17 +249,43 @@ impl RequestHandler for DnsHandler {
 
         if request.op_code() != OpCode::Query {
             let builder = MessageResponseBuilder::from_message_request(request);
-            self.log_query(&client, &qname, &qtype_str, ResponseCode::NotImp, ServedBy::Rejected);
+            self.log_query(
+                &client,
+                &qname,
+                &qtype_str,
+                ResponseCode::NotImp,
+                ServedBy::Rejected,
+            );
             return self
-                .respond(request, response_handle, builder, ResponseCode::NotImp, false, Vec::new())
+                .respond(
+                    request,
+                    response_handle,
+                    builder,
+                    ResponseCode::NotImp,
+                    false,
+                    Vec::new(),
+                )
                 .await;
         }
 
         if qclass != DNSClass::IN {
             let builder = MessageResponseBuilder::from_message_request(request);
-            self.log_query(&client, &qname, &qtype_str, ResponseCode::NotImp, ServedBy::Rejected);
+            self.log_query(
+                &client,
+                &qname,
+                &qtype_str,
+                ResponseCode::NotImp,
+                ServedBy::Rejected,
+            );
             return self
-                .respond(request, response_handle, builder, ResponseCode::NotImp, false, Vec::new())
+                .respond(
+                    request,
+                    response_handle,
+                    builder,
+                    ResponseCode::NotImp,
+                    false,
+                    Vec::new(),
+                )
                 .await;
         }
 
@@ -266,18 +304,44 @@ impl RequestHandler for DnsHandler {
             self.metrics.inc_policy_zone_denied();
             warn!(client = %client.anonymized(), "policy denied: name outside zones_allowed");
             let builder = MessageResponseBuilder::from_message_request(request);
-            self.log_query(&client, &qname, &qtype_str, ResponseCode::Refused, ServedBy::Rejected);
+            self.log_query(
+                &client,
+                &qname,
+                &qtype_str,
+                ResponseCode::Refused,
+                ServedBy::Rejected,
+            );
             return self
-                .respond(request, response_handle, builder, ResponseCode::Refused, false, Vec::new())
+                .respond(
+                    request,
+                    response_handle,
+                    builder,
+                    ResponseCode::Refused,
+                    false,
+                    Vec::new(),
+                )
                 .await;
         }
 
         if let Some(records) = self.authority.lookup(&qname, &qtype_str) {
             self.metrics.inc_authority_hits();
             let answers = Self::dns_records_to_rrs(&records);
-            self.log_query(&client, &qname, &qtype_str, ResponseCode::NoError, ServedBy::Authority);
+            self.log_query(
+                &client,
+                &qname,
+                &qtype_str,
+                ResponseCode::NoError,
+                ServedBy::Authority,
+            );
             return self
-                .respond(request, response_handle, builder, ResponseCode::NoError, true, answers)
+                .respond(
+                    request,
+                    response_handle,
+                    builder,
+                    ResponseCode::NoError,
+                    true,
+                    answers,
+                )
                 .await;
         }
 
@@ -307,16 +371,31 @@ impl RequestHandler for DnsHandler {
             };
 
             self.log_query(&client, &qname, &qtype_str, code, ServedBy::Blocklist);
-            return self.respond(request, response_handle, builder, code, false, answers).await;
+            return self
+                .respond(request, response_handle, builder, code, false, answers)
+                .await;
         }
 
         self.metrics.inc_resolver_queries();
         match self.resolver.resolve(&qname, &qtype_str).await {
             Ok(records) => {
                 let answers = Self::dns_records_to_rrs(&records);
-                self.log_query(&client, &qname, &qtype_str, ResponseCode::NoError, ServedBy::Resolver);
-                self.respond(request, response_handle, builder, ResponseCode::NoError, false, answers)
-                    .await
+                self.log_query(
+                    &client,
+                    &qname,
+                    &qtype_str,
+                    ResponseCode::NoError,
+                    ServedBy::Resolver,
+                );
+                self.respond(
+                    request,
+                    response_handle,
+                    builder,
+                    ResponseCode::NoError,
+                    false,
+                    answers,
+                )
+                .await
             }
             Err(err) => {
                 self.metrics.inc_resolver_failures();
@@ -334,9 +413,22 @@ impl RequestHandler for DnsHandler {
                         warn!(client = %client.anonymized(), "resolver error");
                     }
                 }
-                self.log_query(&client, &qname, &qtype_str, ResponseCode::ServFail, ServedBy::ServerFailure);
-                self.respond(request, response_handle, builder, ResponseCode::ServFail, false, Vec::new())
-                    .await
+                self.log_query(
+                    &client,
+                    &qname,
+                    &qtype_str,
+                    ResponseCode::ServFail,
+                    ServedBy::ServerFailure,
+                );
+                self.respond(
+                    request,
+                    response_handle,
+                    builder,
+                    ResponseCode::ServFail,
+                    false,
+                    Vec::new(),
+                )
+                .await
             }
         }
     }
@@ -403,11 +495,19 @@ fn dns_record_to_rr(rec: &DnsRecord) -> Option<Record> {
             let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
             RData::TXT(TXT::from_bytes(refs))
         }
-        RecordData::Mx { preference, exchange } => {
+        RecordData::Mx {
+            preference,
+            exchange,
+        } => {
             let exchange = Name::from_str(exchange).ok()?;
             RData::MX(MX::new(*preference, exchange))
         }
-        RecordData::Srv { priority, weight, port, target } => {
+        RecordData::Srv {
+            priority,
+            weight,
+            port,
+            target,
+        } => {
             let target = Name::from_str(target).ok()?;
             RData::SRV(SRV::new(*priority, *weight, *port, target))
         }
@@ -728,7 +828,12 @@ mod tests {
         )
         .await;
 
-        let resp = query(harness.port, "definitely-not-cached.example.test.", ProtoRecordType::A).await;
+        let resp = query(
+            harness.port,
+            "definitely-not-cached.example.test.",
+            ProtoRecordType::A,
+        )
+        .await;
         assert_eq!(
             resp.response_code(),
             ResponseCode::ServFail,
@@ -752,7 +857,12 @@ mod tests {
         // 2. blocklist hit
         let _ = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
         // 3. resolver / fail-closed
-        let _ = query(harness.port, "definitely-uncached.example.test.", ProtoRecordType::A).await;
+        let _ = query(
+            harness.port,
+            "definitely-uncached.example.test.",
+            ProtoRecordType::A,
+        )
+        .await;
 
         let snap = harness.query_log.snapshot();
         assert_eq!(snap.len(), 3, "every query should be recorded");
@@ -769,7 +879,9 @@ mod tests {
         // same buffer's salt.
         let h_authority = harness.query_log.hash_qname("router.mesh.");
         let h_block = harness.query_log.hash_qname("ads.example.com.");
-        let h_resolver = harness.query_log.hash_qname("definitely-uncached.example.test.");
+        let h_resolver = harness
+            .query_log
+            .hash_qname("definitely-uncached.example.test.");
         assert_eq!(snap[2].qname_hash, h_authority);
         assert_eq!(snap[1].qname_hash, h_block);
         assert_eq!(snap[0].qname_hash, h_resolver);
@@ -942,7 +1054,10 @@ mod tests {
             q
         });
         client
-            .send_to(&msg.to_bytes().unwrap(), format!("127.0.0.1:{}", harness.port))
+            .send_to(
+                &msg.to_bytes().unwrap(),
+                format!("127.0.0.1:{}", harness.port),
+            )
             .await
             .unwrap();
         let mut buf = vec![0u8; 4096];

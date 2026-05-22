@@ -5,10 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::get;
-use axum::Router;
 use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -264,11 +264,12 @@ pub async fn serve(
         .route("/health", get(health_handler))
         // Operator inspection of the in-memory query ring buffer.
         // Exposes ONLY hashed qnames + anonymised client identifiers.
-        .route("/queries", get(move || queries_handler(query_log_clone.clone())));
+        .route(
+            "/queries",
+            get(move || queries_handler(query_log_clone.clone())),
+        );
 
-    let listener = TcpListener::bind(listen)
-        .await
-        .map_err(RustyDnsError::Io)?;
+    let listener = TcpListener::bind(listen).await.map_err(RustyDnsError::Io)?;
 
     info!(
         listen = %listen,
@@ -376,7 +377,9 @@ mod tests {
         let resp = queries_handler(log.clone()).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
 
@@ -405,7 +408,9 @@ mod tests {
     async fn health_handler_returns_200_ok_json() {
         let resp = health_handler().await;
         assert_eq!(resp.status(), 200);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(&body[..], b"{\"status\":\"ok\"}");
     }
 }
@@ -423,11 +428,7 @@ fn register_counter(
     Ok(counter)
 }
 
-fn register_gauge(
-    registry: &Registry,
-    name: &str,
-    help: &str,
-) -> Result<IntGauge, RustyDnsError> {
+fn register_gauge(registry: &Registry, name: &str, help: &str) -> Result<IntGauge, RustyDnsError> {
     let gauge = IntGauge::new(name, help)
         .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
     registry

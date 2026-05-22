@@ -201,8 +201,14 @@ mod tests {
         let anon = id.anonymized().to_string();
         // Last two octets should be 0
         assert!(anon.contains("192.168.0.0"), "expected /16, got: {anon}");
-        assert!(!anon.contains(".1.100"), "last two octets must be zeroed, got: {anon}");
-        assert!(!anon.contains(".1."), "third octet must be zeroed, got: {anon}");
+        assert!(
+            !anon.contains(".1.100"),
+            "last two octets must be zeroed, got: {anon}"
+        );
+        assert!(
+            !anon.contains(".1."),
+            "third octet must be zeroed, got: {anon}"
+        );
     }
 
     #[test]
@@ -218,25 +224,25 @@ mod tests {
         let anon = id.anonymized().to_string();
         // Segments 4-7 should be zeroed; segments 0-3 preserved
         assert!(anon.contains("2001:db8:0:1::"), "got: {anon}");
-        assert!(!anon.contains("dead"), "interface ID should be zeroed, got: {anon}");
+        assert!(
+            !anon.contains("dead"),
+            "interface ID should be zeroed, got: {anon}"
+        );
     }
 
     #[test]
     fn anonymized_omits_node_id() {
-        let id = ClientId::from_mesh_peer(
-            "10.0.0.1".parse().unwrap(),
-            "ed25519:AbCdEf",
-        );
+        let id = ClientId::from_mesh_peer("10.0.0.1".parse().unwrap(), "ed25519:AbCdEf");
         let anon = id.anonymized().to_string();
-        assert!(!anon.contains("ed25519"), "node ID must be omitted from anonymized output, got: {anon}");
+        assert!(
+            !anon.contains("ed25519"),
+            "node ID must be omitted from anonymized output, got: {anon}"
+        );
     }
 
     #[test]
     fn full_includes_node_id() {
-        let id = ClientId::from_mesh_peer(
-            "10.0.0.1".parse().unwrap(),
-            "ed25519:AbCdEf",
-        );
+        let id = ClientId::from_mesh_peer("10.0.0.1".parse().unwrap(), "ed25519:AbCdEf");
         let full = id.full().to_string();
         assert!(full.contains("ed25519:AbCdEf"), "got: {full}");
         assert!(full.contains("10.0.0.1"), "got: {full}");

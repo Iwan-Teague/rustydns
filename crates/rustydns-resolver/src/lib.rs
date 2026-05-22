@@ -251,7 +251,7 @@ impl Resolver {
                 // who explicitly opt in (RUST_LOG=rustydns_resolver=debug).
                 tracing::warn!(
                     upstreams = self.upstream_urls.len(),
-                    kind      = error_kind_label(&e),
+                    kind = error_kind_label(&e),
                     "upstream resolution failed"
                 );
                 tracing::debug!(
@@ -306,14 +306,12 @@ fn parse_upstream_url(url: &str, protocol: UpstreamProtocol) -> ResolverResult<P
             let port_part = host_port.get(close + 2..).unwrap_or("");
             let port = port_part
                 .parse::<u16>()
-                .map_err(|_| {
-                    RustyDnsError::Config(format!("upstream `{url}` has invalid port"))
-                })?;
+                .map_err(|_| RustyDnsError::Config(format!("upstream `{url}` has invalid port")))?;
             (host, port)
         } else if host_port[idx + 1..].chars().all(|c| c.is_ascii_digit()) {
-            let port = host_port[idx + 1..].parse::<u16>().map_err(|_| {
-                RustyDnsError::Config(format!("upstream `{url}` has invalid port"))
-            })?;
+            let port = host_port[idx + 1..]
+                .parse::<u16>()
+                .map_err(|_| RustyDnsError::Config(format!("upstream `{url}` has invalid port")))?;
             (host_port[..idx].to_string(), port)
         } else {
             (host_port.to_string(), default_port(&scheme, protocol))
@@ -367,10 +365,7 @@ async fn build_name_servers(
         let addrs = tokio::net::lookup_host(format!("{}:{}", parsed.host, parsed.port))
             .await
             .map_err(|e| {
-                RustyDnsError::Resolver(format!(
-                    "bootstrap DNS failed for `{}`: {e}",
-                    parsed.host
-                ))
+                RustyDnsError::Resolver(format!("bootstrap DNS failed for `{}`: {e}", parsed.host))
             })?;
         addrs.map(|sa| sa.ip()).collect()
     };
@@ -483,8 +478,11 @@ mod tests {
 
     #[test]
     fn parse_upstream_url_https_default_port() {
-        let p = parse_upstream_url("https://cloudflare-dns.com/dns-query", UpstreamProtocol::Doh)
-            .unwrap();
+        let p = parse_upstream_url(
+            "https://cloudflare-dns.com/dns-query",
+            UpstreamProtocol::Doh,
+        )
+        .unwrap();
         assert_eq!(p.scheme, "https");
         assert_eq!(p.host, "cloudflare-dns.com");
         assert_eq!(p.port, 443);
@@ -500,9 +498,11 @@ mod tests {
 
     #[test]
     fn parse_upstream_url_ipv6_literal() {
-        let p =
-            parse_upstream_url("https://[2606:4700::1111]:443/dns-query", UpstreamProtocol::Doh)
-                .unwrap();
+        let p = parse_upstream_url(
+            "https://[2606:4700::1111]:443/dns-query",
+            UpstreamProtocol::Doh,
+        )
+        .unwrap();
         assert_eq!(p.host, "2606:4700::1111");
         assert_eq!(p.port, 443);
     }
@@ -564,7 +564,10 @@ mod tests {
     fn rdata_mx_maps() {
         let mx = MX::new(10, Name::from_ascii("mail.example.com.").unwrap());
         match rdata_to_record_data(&RData::MX(mx)).unwrap() {
-            RecordData::Mx { preference, exchange } => {
+            RecordData::Mx {
+                preference,
+                exchange,
+            } => {
                 assert_eq!(preference, 10);
                 assert!(exchange.starts_with("mail.example.com"));
             }
@@ -576,7 +579,12 @@ mod tests {
     fn rdata_srv_maps() {
         let srv = SRV::new(10, 20, 5060, Name::from_ascii("sip.example.com.").unwrap());
         match rdata_to_record_data(&RData::SRV(srv)).unwrap() {
-            RecordData::Srv { priority, weight, port, target } => {
+            RecordData::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => {
                 assert_eq!(priority, 10);
                 assert_eq!(weight, 20);
                 assert_eq!(port, 5060);

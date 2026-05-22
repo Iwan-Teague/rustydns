@@ -36,12 +36,12 @@
 //! metrics, and blocklist reload are implemented; capability dropping remains TODO.
 
 mod blocklist_loader;
-mod handler;
 mod doh;
+mod handler;
 mod metrics;
 mod query_log;
 
-use anyhow::{Context, Result, bail, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -55,15 +55,15 @@ use tracing::{info, warn};
 use hickory_server::server::ServerFuture;
 
 use blocklist_loader::BlocklistLoader;
-use handler::DnsHandler;
 use doh as doh_server;
+use handler::DnsHandler;
 use metrics::Metrics;
-use rustydns_authority::Authority;
-use rustydns_blocklist::BlocklistEngine;
-use rustydns_resolver::Resolver;
-use rustydns_core::config::{MetricsConfig, ServerConfig};
 use rustls::ServerConfig as TlsServerConfig;
 use rustls_pemfile as pemfile;
+use rustydns_authority::Authority;
+use rustydns_blocklist::BlocklistEngine;
+use rustydns_core::config::{MetricsConfig, ServerConfig};
+use rustydns_resolver::Resolver;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -93,8 +93,8 @@ async fn main() -> Result<()> {
     check_config_permissions(&config_path)?;
 
     // Load and validate configuration.
-    let config = rustydns_core::config::load_config(&config_path)
-        .context("failed to load configuration")?;
+    let config =
+        rustydns_core::config::load_config(&config_path).context("failed to load configuration")?;
 
     // `--validate-config`: stop here. We've already parsed the file and
     // run `validate_config` (inside `load_config`). Exit 0 to signal
@@ -142,7 +142,10 @@ async fn main() -> Result<()> {
             } else {
                 metrics.mark_blocklist_reload_success();
             }
-            metrics.set_blocklist_state(blocklist_engine.entry_count(), blocklist_engine.heap_bytes());
+            metrics.set_blocklist_state(
+                blocklist_engine.entry_count(),
+                blocklist_engine.heap_bytes(),
+            );
         }
         Err(e) => {
             metrics.mark_blocklist_reload_failure();
@@ -227,7 +230,10 @@ async fn main() -> Result<()> {
             }
             spawn_doh_server(doh_handler, addr, shutdown.clone());
         } else {
-            bail!("server.doh_listen `{}` is not a valid socket address", doh_listen);
+            bail!(
+                "server.doh_listen `{}` is not a valid socket address",
+                doh_listen
+            );
         }
     }
     spawn_blocklist_reload_loop(
@@ -508,7 +514,7 @@ fn spawn_sighup_reload(
 ) {
     #[cfg(unix)]
     tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut hup = match signal(SignalKind::hangup()) {
             Ok(sig) => sig,
@@ -617,11 +623,7 @@ fn spawn_metrics_server(
     });
 }
 
-fn spawn_doh_server(
-    handler: Arc<DnsHandler>,
-    listen: SocketAddr,
-    shutdown: CancellationToken,
-) {
+fn spawn_doh_server(handler: Arc<DnsHandler>, listen: SocketAddr, shutdown: CancellationToken) {
     tokio::spawn(async move {
         if let Err(e) = doh_server::serve(handler, listen, shutdown).await {
             warn!(error = %e, "DoH server failed");
@@ -649,10 +651,10 @@ fn shutdown_timeout_from_env() -> Duration {
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
-        let mut sigterm = signal(SignalKind::terminate())
-            .context("failed to register SIGTERM handler")?;
+        let mut sigterm =
+            signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
@@ -672,7 +674,10 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 
 fn metrics_listen_addr(metrics: &MetricsConfig) -> Result<SocketAddr> {
     let addr: SocketAddr = metrics.listen.parse().map_err(|_| {
-        anyhow!("metrics.listen `{}` is not a valid socket address", metrics.listen)
+        anyhow!(
+            "metrics.listen `{}` is not a valid socket address",
+            metrics.listen
+        )
     })?;
 
     if addr.ip().is_loopback() {

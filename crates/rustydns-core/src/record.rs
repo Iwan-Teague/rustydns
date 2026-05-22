@@ -138,10 +138,16 @@ impl std::fmt::Display for DnsRecord {
                 RecordData::Aaaa(ip) => ip.to_string(),
                 RecordData::Cname(n) | RecordData::Ptr(n) | RecordData::Ns(n) => n.clone(),
                 RecordData::Txt(parts) => format!("{} TXT parts", parts.len()),
-                RecordData::Mx { preference, exchange } =>
-                    format!("{preference} {exchange}"),
-                RecordData::Srv { priority, weight, port, target } =>
-                    format!("{priority} {weight} {port} {target}"),
+                RecordData::Mx {
+                    preference,
+                    exchange,
+                } => format!("{preference} {exchange}"),
+                RecordData::Srv {
+                    priority,
+                    weight,
+                    port,
+                    target,
+                } => format!("{priority} {weight} {port} {target}"),
             },
             self.ttl.as_secs()
         )

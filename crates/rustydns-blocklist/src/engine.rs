@@ -147,24 +147,26 @@ impl BlocklistEngine {
         for (content, trust) in sources {
             for entry in parse(content) {
                 match entry {
-                    ParsedEntry::Exact(d) => { state.domains.insert(d); }
-                    ParsedEntry::WildcardParent(p) => { state.wildcard_parents.insert(p); }
-                    ParsedEntry::Allow(d) => {
-                        match trust {
-                            BlocklistSource::Trusted => {
-                                trusted_allows.push(d);
-                            }
-                            BlocklistSource::Untrusted => {
-                                state.untrusted_allows_discarded += 1;
-                                warn!(
-                                    domain = %d,
-                                    "discarded allowlist/passthru entry from untrusted blocklist \
-                                     source — add the source URL to `blocklist.trusted_rpz_sources` \
-                                     if this is intentional"
-                                );
-                            }
-                        }
+                    ParsedEntry::Exact(d) => {
+                        state.domains.insert(d);
                     }
+                    ParsedEntry::WildcardParent(p) => {
+                        state.wildcard_parents.insert(p);
+                    }
+                    ParsedEntry::Allow(d) => match trust {
+                        BlocklistSource::Trusted => {
+                            trusted_allows.push(d);
+                        }
+                        BlocklistSource::Untrusted => {
+                            state.untrusted_allows_discarded += 1;
+                            warn!(
+                                domain = %d,
+                                "discarded allowlist/passthru entry from untrusted blocklist \
+                                 source — add the source URL to `blocklist.trusted_rpz_sources` \
+                                 if this is intentional"
+                            );
+                        }
+                    },
                 }
             }
         }
@@ -178,10 +180,10 @@ impl BlocklistEngine {
         state.heap_bytes = state.entry_count * 80;
 
         info!(
-            exact     = state.domains.len(),
+            exact = state.domains.len(),
             wildcards = state.wildcard_parents.len(),
-            total     = state.entry_count,
-            heap_kib  = state.heap_bytes / 1024,
+            total = state.entry_count,
+            heap_kib = state.heap_bytes / 1024,
             allowlist = state.allowlist.len(),
             untrusted_allows_discarded = state.untrusted_allows_discarded,
             "blocklist loaded"
@@ -225,18 +227,26 @@ impl BlocklistEngine {
     }
 
     /// Number of blocking entries currently loaded (exact + wildcard).
-    pub fn entry_count(&self) -> usize  { self.state.load().entry_count }
+    pub fn entry_count(&self) -> usize {
+        self.state.load().entry_count
+    }
     /// Approximate heap usage of the blocklist state, in bytes.
-    pub fn heap_bytes(&self) -> usize   { self.state.load().heap_bytes }
+    pub fn heap_bytes(&self) -> usize {
+        self.state.load().heap_bytes
+    }
     /// Wall-clock time at which the current state was loaded.
-    pub fn loaded_at(&self) -> SystemTime { self.state.load().loaded_at }
+    pub fn loaded_at(&self) -> SystemTime {
+        self.state.load().loaded_at
+    }
 
     /// Configured response code for a blocked query.
     pub fn block_response(&self) -> rustydns_core::config::BlockResponse {
         self.config.block_response
     }
     /// Configured sinkhole IP (only used when `block_response = "sinkhole"`).
-    pub fn sinkhole_ip(&self) -> &str { &self.config.sinkhole_ip }
+    pub fn sinkhole_ip(&self) -> &str {
+        &self.config.sinkhole_ip
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +284,10 @@ mod tests {
         let e = load("*.example-ads.com CNAME .\n");
         assert!(e.is_blocked("foo.example-ads.com"));
         assert!(e.is_blocked("deep.foo.example-ads.com"));
-        assert!(!e.is_blocked("example-ads.com"), "apex not blocked by wildcard-only entry");
+        assert!(
+            !e.is_blocked("example-ads.com"),
+            "apex not blocked by wildcard-only entry"
+        );
     }
 
     #[test]
@@ -319,9 +332,15 @@ mod tests {
         let e2 = engine();
         e2.load_many_with_trust(&[
             ("0.0.0.0 safe.example.com\n", BlocklistSource::Untrusted),
-            ("safe.example.com CNAME rpz-passthru.\n", BlocklistSource::Untrusted),
+            (
+                "safe.example.com CNAME rpz-passthru.\n",
+                BlocklistSource::Untrusted,
+            ),
         ]);
-        assert!(e2.is_blocked("safe.example.com"), "untrusted passthru should NOT allowlist");
+        assert!(
+            e2.is_blocked("safe.example.com"),
+            "untrusted passthru should NOT allowlist"
+        );
     }
 
     #[test]
@@ -329,9 +348,15 @@ mod tests {
         let e = engine();
         e.load_many_with_trust(&[
             ("0.0.0.0 safe.example.com\n", BlocklistSource::Untrusted),
-            ("safe.example.com CNAME rpz-passthru.\n", BlocklistSource::Trusted),
+            (
+                "safe.example.com CNAME rpz-passthru.\n",
+                BlocklistSource::Trusted,
+            ),
         ]);
-        assert!(!e.is_blocked("safe.example.com"), "trusted passthru SHOULD allowlist");
+        assert!(
+            !e.is_blocked("safe.example.com"),
+            "trusted passthru SHOULD allowlist"
+        );
     }
 
     #[test]
@@ -339,7 +364,7 @@ mod tests {
         let e = engine();
         e.load_many_with_trust(&[
             ("0.0.0.0 ads.example.com\n", BlocklistSource::Untrusted),
-            ("tracker.example.net\n",     BlocklistSource::Untrusted),
+            ("tracker.example.net\n", BlocklistSource::Untrusted),
         ]);
         assert!(e.is_blocked("ads.example.com"));
         assert!(e.is_blocked("tracker.example.net"));

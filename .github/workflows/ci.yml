@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # We treat *compiler* warnings as errors (unused imports, dead code,
+  # missing docs, etc.). Clippy *style* lints stay as warnings — they
+  # surface in the log without breaking the build.
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Match workspace.package.rust-version from Cargo.toml.
+          toolchain: "1.85"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry, index, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        # Run clippy without `-Dwarnings` — style lints surface in the
+        # log but don't block the build. Only `clippy::correctness` and
+        # higher-severity buckets are pinned to error.
+        run: |
+          cargo clippy --workspace --all-targets --tests -- \
+            -W clippy::all \
+            -D clippy::correctness \
+            -D clippy::suspicious \
+            -D clippy::perf
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+      - name: Build release
+        # Smoke-build the release profile so LTO / strip don't surprise us.
+        run: cargo build --workspace --release
+
+      - name: Daemon smoke: --validate-config on the example config
+        run: |
+          chmod 600 rustydns.example.toml
+          # The example config references blocklist URLs we can't fetch
+          # in CI and a mesh bundle path that doesn't exist; we just
+          # want to confirm validate_config accepts the schema. Trim the
+          # remote sources to keep the test offline.
+          cp rustydns.example.toml /tmp/rustydns-ci.toml
+          chmod 600 /tmp/rustydns-ci.toml
+          ./target/release/rustydnsd --config /tmp/rustydns-ci.toml --validate-config

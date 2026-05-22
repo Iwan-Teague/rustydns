@@ -28,32 +28,66 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 // Serde helper defaults (keep alphabetical)
 // ---------------------------------------------------------------------------
 
-fn default_block_response() -> BlockResponse { BlockResponse::Nxdomain }
-fn default_doh_listen() -> Option<String> { Some("127.0.0.1:8053".to_string()) }
-fn default_false() -> bool { false }
-fn default_fetch_timeout_ms() -> u64 { 30_000 }
-fn default_listen() -> Vec<String> { vec!["127.0.0.53:53".to_string()] }
-fn default_max_cache_entries() -> usize { 10_000 }
-fn default_max_fetch_bytes() -> u64 { 50 * 1024 * 1024 } // 50 MiB
-fn default_mesh_zone() -> String { "mesh.".to_string() }
-fn default_metrics_listen() -> String { "127.0.0.1:9153".to_string() }
-fn default_metrics_path() -> String { "/metrics".to_string() }
-fn default_poll_interval() -> u64 { 30 }
-fn default_reload_interval() -> u64 { 86_400 }
+fn default_block_response() -> BlockResponse {
+    BlockResponse::Nxdomain
+}
+fn default_doh_listen() -> Option<String> {
+    Some("127.0.0.1:8053".to_string())
+}
+fn default_false() -> bool {
+    false
+}
+fn default_fetch_timeout_ms() -> u64 {
+    30_000
+}
+fn default_listen() -> Vec<String> {
+    vec!["127.0.0.53:53".to_string()]
+}
+fn default_max_cache_entries() -> usize {
+    10_000
+}
+fn default_max_fetch_bytes() -> u64 {
+    50 * 1024 * 1024
+} // 50 MiB
+fn default_mesh_zone() -> String {
+    "mesh.".to_string()
+}
+fn default_metrics_listen() -> String {
+    "127.0.0.1:9153".to_string()
+}
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
+fn default_poll_interval() -> u64 {
+    30
+}
+fn default_reload_interval() -> u64 {
+    86_400
+}
 fn default_resolvers() -> Vec<String> {
     vec![
         "https://cloudflare-dns.com/dns-query".to_string(),
         "https://dns.quad9.net/dns-query".to_string(),
     ]
 }
-fn default_ring_size() -> usize { 1_000 }
-fn default_mesh_zone_max_age_secs() -> u64 { 600 }
-fn default_sinkhole_ip() -> String { "0.0.0.0".to_string() }
+fn default_ring_size() -> usize {
+    1_000
+}
+fn default_mesh_zone_max_age_secs() -> u64 {
+    600
+}
+fn default_sinkhole_ip() -> String {
+    "0.0.0.0".to_string()
+}
 fn default_sources() -> Vec<String> {
     vec!["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts".to_string()]
 }
-fn default_timeout_ms() -> u64 { 5_000 }
-fn default_true() -> bool { true }
+fn default_timeout_ms() -> u64 {
+    5_000
+}
+fn default_true() -> bool {
+    true
+}
 
 // ---------------------------------------------------------------------------
 // Top-level config
@@ -704,15 +738,15 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     }
 
     // DoT requires cert + key
-    if cfg.server.dot_listen.is_some() {
-        if cfg.server.tls_cert_path.is_none() || cfg.server.tls_key_path.is_none() {
-            return Err(crate::RustyDnsError::Config(
-                "server.dot_listen is set but server.tls_cert_path and/or \
-                 server.tls_key_path are missing. DNS-over-TLS requires a TLS certificate. \
-                 Set both fields to the PEM files, or remove dot_listen."
-                    .to_string(),
-            ));
-        }
+    if cfg.server.dot_listen.is_some()
+        && (cfg.server.tls_cert_path.is_none() || cfg.server.tls_key_path.is_none())
+    {
+        return Err(crate::RustyDnsError::Config(
+            "server.dot_listen is set but server.tls_cert_path and/or \
+             server.tls_key_path are missing. DNS-over-TLS requires a TLS certificate. \
+             Set both fields to the PEM files, or remove dot_listen."
+                .to_string(),
+        ));
     }
 
     // Warn if listen contains 0.0.0.0 (public exposure)
@@ -732,7 +766,8 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     // Must have at least one resolver
     if cfg.upstream.resolvers.is_empty() {
         return Err(crate::RustyDnsError::Config(
-            "upstream.resolvers is empty — at least one DoH/DoQ resolver URL is required".to_string(),
+            "upstream.resolvers is empty — at least one DoH/DoQ resolver URL is required"
+                .to_string(),
         ));
     }
 
@@ -754,7 +789,8 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     // timeout_ms must be non-zero
     if cfg.upstream.timeout_ms == 0 {
         return Err(crate::RustyDnsError::Config(
-            "upstream.timeout_ms = 0 is invalid — use a positive timeout in milliseconds".to_string(),
+            "upstream.timeout_ms = 0 is invalid — use a positive timeout in milliseconds"
+                .to_string(),
         ));
     }
 
@@ -820,7 +856,8 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     // Fetch timeout must be non-zero
     if cfg.blocklist.fetch_timeout_ms == 0 {
         return Err(crate::RustyDnsError::Config(
-            "blocklist.fetch_timeout_ms = 0 is invalid — use a positive timeout in milliseconds".to_string(),
+            "blocklist.fetch_timeout_ms = 0 is invalid — use a positive timeout in milliseconds"
+                .to_string(),
         ));
     }
 
@@ -847,20 +884,25 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     }
 
     // Validate sinkhole_ip (only relevant when block_response = sinkhole)
-    if cfg.blocklist.block_response == BlockResponse::Sinkhole {
-        if cfg.blocklist.sinkhole_ip.parse::<std::net::Ipv4Addr>().is_err()
-            && cfg.blocklist.sinkhole_ip.parse::<std::net::Ipv6Addr>().is_err()
-        {
-            return Err(crate::RustyDnsError::Config(format!(
-                "blocklist.sinkhole_ip `{}` is not a valid IPv4 or IPv6 address",
-                cfg.blocklist.sinkhole_ip
-            )));
-        }
+    if cfg.blocklist.block_response == BlockResponse::Sinkhole
+        && cfg
+            .blocklist
+            .sinkhole_ip
+            .parse::<std::net::IpAddr>()
+            .is_err()
+    {
+        return Err(crate::RustyDnsError::Config(format!(
+            "blocklist.sinkhole_ip `{}` is not a valid IPv4 or IPv6 address",
+            cfg.blocklist.sinkhole_ip
+        )));
     }
 
     // Warn on overbroad allowlist entries
     for entry in &cfg.blocklist.allowlist {
-        let entry = entry.trim().trim_start_matches("*.").trim_start_matches('.');
+        let entry = entry
+            .trim()
+            .trim_start_matches("*.")
+            .trim_start_matches('.');
         let label_count = entry.split('.').filter(|l| !l.is_empty()).count();
         if label_count <= 1 {
             return Err(crate::RustyDnsError::Config(format!(
@@ -1081,10 +1123,7 @@ mod tests {
     #[test]
     fn multi_label_allowlist_passes() {
         let mut cfg = baseline();
-        cfg.blocklist.allowlist = vec![
-            "safe.example.com".to_string(),
-            "*.example.org".to_string(),
-        ];
+        cfg.blocklist.allowlist = vec!["safe.example.com".to_string(), "*.example.org".to_string()];
         validate_config(&cfg).expect("legitimate allowlist entries must pass");
     }
 
@@ -1122,7 +1161,10 @@ mod tests {
     fn policy_without_any_identifier_rejected() {
         let mut cfg = baseline();
         cfg.policy = vec![empty_policy()];
-        assert_config_err(validate_config(&cfg), "at least one of `node_id` or `client_ip`");
+        assert_config_err(
+            validate_config(&cfg),
+            "at least one of `node_id` or `client_ip`",
+        );
     }
 
     #[test]

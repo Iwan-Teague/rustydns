@@ -272,7 +272,10 @@ fn build_snapshot(
 
     if let Some(loaded) = mesh {
         for rec in &loaded.records {
-            records.entry(rec.name.clone()).or_default().push(rec.clone());
+            records
+                .entry(rec.name.clone())
+                .or_default()
+                .push(rec.clone());
             if !zones.iter().any(|z| z == &rec.name) {
                 zones.push(rec.name.clone());
             }
@@ -284,10 +287,7 @@ fn build_snapshot(
 
 /// Attempt the initial mesh-zone bundle load. Failures are logged and
 /// returned as `None` so the daemon can still start in static-only mode.
-fn load_mesh_if_configured(
-    config: &AuthorityConfig,
-    mesh_zone: &str,
-) -> Option<LoadedBundle> {
+fn load_mesh_if_configured(config: &AuthorityConfig, mesh_zone: &str) -> Option<LoadedBundle> {
     let (bundle, key) = match (
         config.mesh_zone_bundle_path.as_ref(),
         config.mesh_zone_verifier_key_path.as_ref(),
@@ -390,12 +390,16 @@ fn static_record_to_dns_record(sr: &StaticRecord) -> AuthorityResult<DnsRecord> 
                         sr.name, target
                     ))
                 })?;
-            let exchange = parts.next().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
-                RustyDnsError::Zone(format!(
-                    "static record `{}` MX target `{}` missing exchange hostname",
-                    sr.name, target
-                ))
-            })?;
+            let exchange = parts
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RustyDnsError::Zone(format!(
+                        "static record `{}` MX target `{}` missing exchange hostname",
+                        sr.name, target
+                    ))
+                })?;
             if parts.next().is_some() {
                 return Err(RustyDnsError::Zone(format!(
                     "static record `{}` MX target `{}` has trailing junk after \"<preference> <hostname>\"",
@@ -439,21 +443,27 @@ fn static_record_to_dns_record(sr: &StaticRecord) -> AuthorityResult<DnsRecord> 
 }
 
 fn require_address<'a>(sr: &'a StaticRecord, type_label: &str) -> AuthorityResult<&'a str> {
-    sr.address.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
-        RustyDnsError::Zone(format!(
-            "static record `{}` of type {} is missing required `address` field",
-            sr.name, type_label
-        ))
-    })
+    sr.address
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            RustyDnsError::Zone(format!(
+                "static record `{}` of type {} is missing required `address` field",
+                sr.name, type_label
+            ))
+        })
 }
 
 fn require_target<'a>(sr: &'a StaticRecord, type_label: &str) -> AuthorityResult<&'a str> {
-    sr.target.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
-        RustyDnsError::Zone(format!(
-            "static record `{}` of type {} is missing required `target` field",
-            sr.name, type_label
-        ))
-    })
+    sr.target
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            RustyDnsError::Zone(format!(
+                "static record `{}` of type {} is missing required `target` field",
+                sr.name, type_label
+            ))
+        })
 }
 
 fn parse_u16(sr: &StaticRecord, label: &str, value: &str) -> AuthorityResult<u16> {
@@ -512,8 +522,13 @@ mod tests {
     fn wrong_type_returns_authoritative_nxdomain() {
         let auth = Authority::new(cfg(vec![a("host.lab.example.com", "10.0.0.5")])).unwrap();
 
-        let result = auth.lookup("host.lab.example.com", "AAAA").expect("in zone");
-        assert!(result.is_empty(), "expected authoritative NXDOMAIN (empty Some)");
+        let result = auth
+            .lookup("host.lab.example.com", "AAAA")
+            .expect("in zone");
+        assert!(
+            result.is_empty(),
+            "expected authoritative NXDOMAIN (empty Some)"
+        );
     }
 
     #[test]
@@ -537,7 +552,9 @@ mod tests {
             "Host.Lab.Example.Com.",
         ];
         for q in cases {
-            let result = auth.lookup(q, "a").unwrap_or_else(|| panic!("`{q}` should resolve"));
+            let result = auth
+                .lookup(q, "a")
+                .unwrap_or_else(|| panic!("`{q}` should resolve"));
             assert_eq!(result.len(), 1, "lookup of `{q}` should return one record");
             match &result[0].data {
                 RecordData::A(ip) => assert_eq!(ip.to_string(), "10.0.0.5"),
@@ -650,7 +667,10 @@ mod tests {
         let result = auth.lookup("example.com", "MX").unwrap();
         assert_eq!(result.len(), 1);
         match &result[0].data {
-            RecordData::Mx { preference, exchange } => {
+            RecordData::Mx {
+                preference,
+                exchange,
+            } => {
                 assert_eq!(*preference, 10);
                 assert_eq!(exchange, "mail.example.com.");
             }
@@ -672,7 +692,12 @@ mod tests {
         let result = auth.lookup("_sip._tcp.example.com", "SRV").unwrap();
         assert_eq!(result.len(), 1);
         match &result[0].data {
-            RecordData::Srv { priority, weight, port, target } => {
+            RecordData::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => {
                 assert_eq!(*priority, 10);
                 assert_eq!(*weight, 20);
                 assert_eq!(*port, 5060);
@@ -718,7 +743,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now_secs() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     fn write_temp(name: &str, contents: &[u8]) -> PathBuf {
@@ -817,10 +845,8 @@ mod tests {
         assert!(auth.lookup("nas.mesh", "A").unwrap().is_empty());
 
         // Rewrite the bundle file with two records, same key.
-        let (new_bundle, _) = make_bundle(
-            &[("router", "100.64.0.1"), ("nas", "100.64.0.2")],
-            "mesh",
-        );
+        let (new_bundle, _) =
+            make_bundle(&[("router", "100.64.0.1"), ("nas", "100.64.0.2")], "mesh");
         std::fs::copy(&new_bundle, &bundle_path).unwrap();
 
         let count = auth.reload_mesh().unwrap().expect("Some");
@@ -866,10 +892,8 @@ mod tests {
 
     #[test]
     fn mesh_record_count_excludes_static_records() {
-        let (bundle_path, key_path) = make_bundle(
-            &[("router", "100.64.0.1"), ("nas", "100.64.0.2")],
-            "mesh",
-        );
+        let (bundle_path, key_path) =
+            make_bundle(&[("router", "100.64.0.1"), ("nas", "100.64.0.2")], "mesh");
         let cfg = AuthorityConfig {
             mesh_zone_bundle_path: Some(bundle_path),
             mesh_zone_verifier_key_path: Some(key_path),

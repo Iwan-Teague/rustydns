@@ -99,11 +99,7 @@ async fn handle_post(
     handle_dns_message(state.handler.clone(), src, body.to_vec()).await
 }
 
-async fn handle_dns_message(
-    handler: Arc<DnsHandler>,
-    src: SocketAddr,
-    bytes: Vec<u8>,
-) -> Response {
+async fn handle_dns_message(handler: Arc<DnsHandler>, src: SocketAddr, bytes: Vec<u8>) -> Response {
     if bytes.is_empty() {
         return bad_request("empty DNS message");
     }
@@ -283,17 +279,7 @@ mod tests {
 
         let resolver = Arc::new(Resolver::new(dns_config).await.unwrap());
         let query_log = Arc::new(crate::query_log::QueryLog::new(64));
-        Arc::new(
-            DnsHandler::new(
-                authority,
-                blocklist,
-                resolver,
-                metrics,
-                query_log,
-                &[],
-            )
-            .unwrap(),
-        )
+        Arc::new(DnsHandler::new(authority, blocklist, resolver, metrics, query_log, &[]).unwrap())
     }
 
     /// Boot a DoH listener on a random port. Returns `(base_url, shutdown_token)`.
@@ -359,7 +345,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/dns-message"),
         );
         let body = resp.bytes().await.unwrap();
