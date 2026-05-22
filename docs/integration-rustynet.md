@@ -92,21 +92,37 @@ allowed_capabilities = ["dns"]
 
 ### Per-client DNS policy
 
-`rustydns` resolves the source IP of each query to a Rustynet `NodeId` (via the peer table in the control DB). This enables per-node DNS rules. **Policy grants are configured in `rustydns.toml` only — they cannot be requested by a node itself.** An operator must explicitly add a `[[policy]]` entry:
+`rustydns` supports per-client DNS rules keyed either by `client_ip` or
+`node_id`. **Policy grants are configured in `rustydns.toml` only — they
+cannot be requested by a node itself.** An operator must explicitly add
+a `[[policy]]` entry:
 
 ```toml
-# rustydns.toml
+# rustydns.toml — IP-keyed policy (live today)
 [[policy]]
-node_id = "ed25519:AbCdEf..."
+client_ip       = "100.64.0.42"
 blocklist_bypass = true
 
 [[policy]]
-node_id = "ed25519:GhIjKl..."
-zones_allowed = ["mesh."]
+client_ip       = "100.64.0.99"
+zones_allowed   = ["mesh."]
 log_all_queries = true
+
+# NodeId-keyed policy (parsed but not yet matched — see note below)
+[[policy]]
+node_id          = "ed25519:AbCdEf..."
+blocklist_bypass = true
 ```
 
 **Note on TOML syntax:** Use `[[policy]]` (double brackets) for each node — this is TOML array-of-tables syntax. The field name in the config struct is `policy` (not `policy.node`).
+
+**Current state of `node_id` matching:** entries with only a `node_id`
+key are accepted by `validate_config` and emit a startup `tracing::warn!`
+explaining that they are inert — Rustynet's peer-table integration that
+maps `SocketAddr → NodeId` at query time is not yet wired. Until that
+lands, only `client_ip`-keyed policy is enforced. The `node_id` field
+stays in the schema so configs written today keep working unchanged the
+moment the peer-table integration ships.
 
 | Rule | Use case | Risk |
 |------|----------|------|
