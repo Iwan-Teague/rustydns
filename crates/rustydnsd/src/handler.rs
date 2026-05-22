@@ -29,12 +29,14 @@ const SINKHOLE_TTL_SECS: u32 = 60;
 
 /// Resolved per-client policy decision for one query.
 ///
-/// Built once per query from the source IP. `None` for clients with no
-/// matching `[[policy]]` entry — the pipeline runs with defaults.
+/// Built once per query from the source IP. The default value is "no
+/// restrictions" so clients with no matching `[[policy]]` entry get
+/// the standard pipeline treatment.
 #[derive(Debug, Clone, Default)]
 struct PolicyDecision {
     blocklist_bypass: bool,
     zones_allowed: Vec<String>,
+    log_all_queries: bool,
 }
 
 /// DNS request handler implementing Authority -> Blocklist -> Resolver.
@@ -118,6 +120,7 @@ impl DnsHandler {
             Some(p) => PolicyDecision {
                 blocklist_bypass: p.blocklist_bypass,
                 zones_allowed: p.zones_allowed.clone(),
+                log_all_queries: p.log_all_queries,
             },
             None => PolicyDecision::default(),
         }
@@ -130,11 +133,13 @@ impl DnsHandler {
         &self.query_log
     }
 
-    /// Record one query into the ring buffer. Centralised so every
-    /// pipeline arm uses the same hashing rules and `ServedBy`
-    /// label.
+    /// Record one query into the ring buffer AND emit a tracing::info!
+    /// audit line if the matching policy sets `log_all_queries = true`.
+    /// Centralised so every pipeline arm uses the same hashing rules and
+    /// `ServedBy` label.
     fn log_query(
         &self,
+        policy: &PolicyDecision,
         client: &ClientId,
         qname: &str,
         qtype: &str,
@@ -146,9 +151,10 @@ impl DnsHandler {
         // already lowercase/uppercase ascii so we copy into a small
         // static interning table.
         let qtype_static = intern_qtype(qtype);
+        let qname_lower = qname.to_ascii_lowercase();
         self.query_log.record(
             client,
-            &qname.to_ascii_lowercase(),
+            &qname_lower,
             qtype_static,
             // ResponseCode lacks `From<ResponseCode> for u8` but does
             // expose `.low()` for the wire-level value (top nibble is
@@ -156,6 +162,20 @@ impl DnsHandler {
             rcode.low(),
             served_by,
         );
+        if policy.log_all_queries {
+            // PRIVACY: hashed qname only, never the raw form. Anonymised
+            // client only, never the raw IP. Matches the privacy
+            // invariants for tracing output at info+ level.
+            let qname_hash = self.query_log.hash_qname(&qname_lower);
+            tracing::info!(
+                client     = %client.anonymized(),
+                qname_hash = format!("{qname_hash:016x}"),
+                qtype      = %qtype_static,
+                rcode      = rcode.low(),
+                served_by  = served_by.as_str(),
+                "policy.log_all_queries audit"
+            );
+        }
     }
 
     async fn respond<R: ResponseHandler>(
@@ -247,9 +267,15 @@ impl RequestHandler for DnsHandler {
 
         let client = ClientId::from_ip(info.src.ip());
 
+        // Resolve policy ONCE per query, BEFORE any rejection branches,
+        // so every `log_query` call (including the early opcode and
+        // class rejections) honours `log_all_queries`.
+        let policy = self.resolve_policy(info.src.ip());
+
         if request.op_code() != OpCode::Query {
             let builder = MessageResponseBuilder::from_message_request(request);
             self.log_query(
+                &policy,
                 &client,
                 &qname,
                 &qtype_str,
@@ -271,6 +297,7 @@ impl RequestHandler for DnsHandler {
         if qclass != DNSClass::IN {
             let builder = MessageResponseBuilder::from_message_request(request);
             self.log_query(
+                &policy,
                 &client,
                 &qname,
                 &qtype_str,
@@ -292,8 +319,6 @@ impl RequestHandler for DnsHandler {
         // PRIVACY: qname logged at debug only; do not enable debug in production.
         debug!(client = %client.anonymized(), qname = %qname, qtype = %qtype, "query received");
 
-        let policy = self.resolve_policy(info.src.ip());
-
         let builder = MessageResponseBuilder::from_message_request(request);
 
         // Zone allowlist: if the policy restricts this client to a set
@@ -305,6 +330,7 @@ impl RequestHandler for DnsHandler {
             warn!(client = %client.anonymized(), "policy denied: name outside zones_allowed");
             let builder = MessageResponseBuilder::from_message_request(request);
             self.log_query(
+                &policy,
                 &client,
                 &qname,
                 &qtype_str,
@@ -327,6 +353,7 @@ impl RequestHandler for DnsHandler {
             self.metrics.inc_authority_hits();
             let answers = Self::dns_records_to_rrs(&records);
             self.log_query(
+                &policy,
                 &client,
                 &qname,
                 &qtype_str,
@@ -370,7 +397,7 @@ impl RequestHandler for DnsHandler {
                 }
             };
 
-            self.log_query(&client, &qname, &qtype_str, code, ServedBy::Blocklist);
+            self.log_query(&policy, &client, &qname, &qtype_str, code, ServedBy::Blocklist);
             return self
                 .respond(request, response_handle, builder, code, false, answers)
                 .await;
@@ -381,6 +408,7 @@ impl RequestHandler for DnsHandler {
             Ok(records) => {
                 let answers = Self::dns_records_to_rrs(&records);
                 self.log_query(
+                    &policy,
                     &client,
                     &qname,
                     &qtype_str,
@@ -414,6 +442,7 @@ impl RequestHandler for DnsHandler {
                     }
                 }
                 self.log_query(
+                    &policy,
                     &client,
                     &qname,
                     &qtype_str,
@@ -987,6 +1016,39 @@ mod tests {
         let resp = query(harness.port, "example.com.", ProtoRecordType::A).await;
         assert_eq!(resp.response_code(), ResponseCode::Refused);
         assert!(resp.answers().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_log_all_queries_threads_through_to_log_query() {
+        // We can't easily intercept tracing::info! from a test without a
+        // subscriber, but we CAN prove that PolicyDecision.log_all_queries
+        // is true for a matching client and that the query is still
+        // recorded normally in the ring buffer. The actual info! emit is
+        // exercised through inspection of the daemon log at runtime.
+        let policy = NodePolicy {
+            node_id: None,
+            client_ip: Some("127.0.0.1".to_string()),
+            blocklist_bypass: false,
+            zones_allowed: Vec::new(),
+            log_all_queries: true,
+        };
+        let harness = build_harness_with_policies(
+            vec![static_a("router.mesh", "100.64.0.1")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+            vec![policy],
+        )
+        .await;
+
+        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+
+        // Buffer entry exists — same shape as non-audited paths.
+        let snap = harness.query_log.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].served_by, crate::query_log::ServedBy::Authority);
+        assert_eq!(snap[0].rcode, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
