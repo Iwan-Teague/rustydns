@@ -16,6 +16,8 @@ use tracing::{info, warn};
 
 use rustydns_core::RustyDnsError;
 
+use crate::query_log::QueryLog;
+
 /// Prometheus metrics registry and counters for rustydnsd.
 pub struct Metrics {
     registry: Registry,
@@ -203,14 +205,26 @@ fn now_unix_secs() -> i64 {
         .as_secs() as i64
 }
 
-/// Serve the Prometheus metrics endpoint until shutdown.
+/// Serve the Prometheus metrics, health, and (loopback-only) query
+/// inspection endpoints until shutdown.
+///
+/// # Privacy
+///
+/// All three routes are bound to the same loopback listener (caller
+/// enforces this in `metrics_listen_addr`). The `/queries` endpoint
+/// exposes the in-memory query ring buffer but only with
+/// **hashed** qnames and **anonymised** client identifiers — no raw
+/// QNAMEs or full IPs ever cross this boundary. See `query_log.rs`
+/// for the rationale.
 pub async fn serve(
     metrics: Arc<Metrics>,
+    query_log: Arc<QueryLog>,
     listen: SocketAddr,
     path: String,
     shutdown: CancellationToken,
 ) -> Result<(), RustyDnsError> {
     let metrics_clone = metrics.clone();
+    let query_log_clone = query_log.clone();
     let app = Router::new()
         .route(&path, get(move || metrics_handler(metrics_clone.clone())))
         // Liveness endpoint for orchestrators (k8s, runit, systemd's
@@ -218,13 +232,22 @@ pub async fn serve(
         // process is up and its loopback listener is serving — it
         // doesn't claim anything about upstream resolver reachability
         // or blocklist freshness (those are visible on /metrics).
-        .route("/health", get(health_handler));
+        .route("/health", get(health_handler))
+        // Operator inspection of the in-memory query ring buffer.
+        // Exposes ONLY hashed qnames + anonymised client identifiers.
+        .route("/queries", get(move || queries_handler(query_log_clone.clone())));
 
     let listener = TcpListener::bind(listen)
         .await
         .map_err(RustyDnsError::Io)?;
 
-    info!(listen = %listen, metrics_path = %path, health_path = "/health", "metrics listener started");
+    info!(
+        listen = %listen,
+        metrics_path = %path,
+        health_path = "/health",
+        queries_path = "/queries",
+        "metrics listener started"
+    );
 
     // `with_graceful_shutdown` requires a 'static future. Move the
     // cancellation token into an owned async block so it outlives the
@@ -262,6 +285,100 @@ async fn health_handler() -> Response {
         .header("Content-Type", "application/json")
         .body(Body::from("{\"status\":\"ok\"}"))
         .unwrap()
+}
+
+/// Render the query ring buffer as JSON. Newest entry first. Hand-rolls
+/// the JSON so we don't pull `serde_json` in just for this endpoint —
+/// every field is a primitive or a known-ASCII string.
+async fn queries_handler(query_log: Arc<QueryLog>) -> Response {
+    let entries = query_log.snapshot();
+    let mut out = String::with_capacity(64 + entries.len() * 128);
+    out.push_str(&format!(
+        "{{\"capacity\":{},\"count\":{},\"entries\":[",
+        query_log.capacity(),
+        entries.len()
+    ));
+    for (idx, e) in entries.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"ts\":{},\"client\":\"{}\",\"qname_hash\":\"{:016x}\",\"qtype\":\"{}\",\"rcode\":{},\"served_by\":\"{}\"}}",
+            e.timestamp_unix,
+            json_escape(e.client_anonymised.as_str()),
+            e.qname_hash,
+            e.qtype,
+            e.rcode,
+            e.served_by.as_str()
+        ));
+    }
+    out.push_str("]}");
+
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "application/json")
+        .body(Body::from(out))
+        .unwrap()
+}
+
+/// Escape the small set of JSON-significant characters that
+/// `ClientId::anonymized` could theoretically produce. In practice
+/// the output is `<ip>/<prefix>/anon` which never contains any of
+/// these — this is belt-and-braces for the case where the underlying
+/// formatter changes.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query_log::{QueryLog, ServedBy};
+    use rustydns_core::client::ClientId;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queries_handler_emits_well_formed_json() {
+        let log = Arc::new(QueryLog::new(4));
+        let client = ClientId::from_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)));
+        log.record(&client, "router.mesh.", "A", 0, ServedBy::Authority);
+        log.record(&client, "ads.example.com.", "A", 3, ServedBy::Blocklist);
+
+        let resp = queries_handler(log.clone()).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+
+        // Extract the body. Axum 0.7 wraps Body as a stream; collect()
+        // returns Bytes for known-bounded bodies like ours.
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body collect");
+        let body = std::str::from_utf8(&body).expect("utf-8 body");
+
+        // Capacity + count are present and correct.
+        assert!(body.contains("\"capacity\":4"));
+        assert!(body.contains("\"count\":2"));
+        // Newest-first ordering: blocklist entry comes before authority entry.
+        let pos_block = body.find("\"served_by\":\"blocklist\"").expect("blocklist");
+        let pos_auth = body.find("\"served_by\":\"authority\"").expect("authority");
+        assert!(pos_block < pos_auth, "newest-first ordering violated");
+        // Anonymised client is present and NOT the raw IP.
+        assert!(body.contains("10.0.0.0/16/anon"));
+        assert!(!body.contains("10.0.0.7"), "raw IP leaked into /queries");
+        // qname_hash field is a 16-char hex string.
+        assert!(body.contains("\"qname_hash\":\""));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_handler_returns_200_ok_json() {
+        let resp = health_handler().await;
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"{\"status\":\"ok\"}");
+    }
 }
 
 fn register_counter(

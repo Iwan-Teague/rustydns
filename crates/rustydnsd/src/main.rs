@@ -253,7 +253,13 @@ async fn main() -> Result<()> {
 
     let metrics_addr = metrics_listen_addr(&config.metrics)?;
     let metrics_path = normalize_metrics_path(&config.metrics.path);
-    spawn_metrics_server(metrics.clone(), metrics_addr, metrics_path, shutdown.clone());
+    spawn_metrics_server(
+        metrics.clone(),
+        query_log.clone(),
+        metrics_addr,
+        metrics_path,
+        shutdown.clone(),
+    );
 
     wait_for_shutdown_signal().await?;
     info!("shutdown signal received");
@@ -599,12 +605,13 @@ fn spawn_mesh_reload_loop(
 
 fn spawn_metrics_server(
     metrics: Arc<Metrics>,
+    query_log: Arc<query_log::QueryLog>,
     listen: SocketAddr,
     path: String,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = metrics::serve(metrics, listen, path, shutdown).await {
+        if let Err(e) = metrics::serve(metrics, query_log, listen, path, shutdown).await {
             warn!(error = %e, "metrics server failed");
         }
     });
