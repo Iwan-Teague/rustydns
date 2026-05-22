@@ -290,12 +290,19 @@ struct ParsedUpstream {
 
 fn parse_upstream_url(url: &str, protocol: UpstreamProtocol) -> ResolverResult<ParsedUpstream> {
     let url = url.trim();
-    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
-        RustyDnsError::Config(format!(
+    // Plain mode accepts bare `host:port` (no scheme) — validate_config
+    // already enforced that "plain" + scheme is rejected, and that the
+    // other two protocols require their scheme. Here we synthesise a
+    // "plain" scheme so the rest of the parser handles a single shape.
+    let (scheme, rest) = if let Some(pair) = url.split_once("://") {
+        (pair.0.to_ascii_lowercase(), pair.1)
+    } else if protocol == UpstreamProtocol::Plain {
+        ("plain".to_string(), url)
+    } else {
+        return Err(RustyDnsError::Config(format!(
             "upstream `{url}` is not a URL (expected `scheme://host[:port][/path]`)"
-        ))
-    })?;
-    let scheme = scheme.to_ascii_lowercase();
+        )));
+    };
 
     let host_port = rest.split('/').next().unwrap_or("");
     if host_port.is_empty() {
@@ -340,6 +347,7 @@ fn default_port(scheme: &str, protocol: UpstreamProtocol) -> u16 {
     match scheme {
         "https" => 443,
         "quic" => 853,
+        "plain" => 53,
         _ => match protocol {
             UpstreamProtocol::Doh => 443,
             UpstreamProtocol::Doq => 853,
@@ -578,12 +586,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_upstream_url_no_scheme_fails() {
+    fn parse_upstream_url_no_scheme_fails_for_doh() {
+        // DoH demands an https:// URL — a bare host without scheme is
+        // rejected so the operator doesn't silently get a different
+        // transport.
         let err = parse_upstream_url("cloudflare-dns.com", UpstreamProtocol::Doh).unwrap_err();
         match err {
             RustyDnsError::Config(msg) => assert!(msg.contains("not a URL"), "msg={msg}"),
             other => panic!("expected Config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_upstream_url_plain_accepts_bare_host_port() {
+        // Plain mode is the one place a bare `host:port` is allowed —
+        // there's no transport ambiguity since `protocol = "plain"`
+        // already pins UDP/TCP port 53 semantics.
+        let p = parse_upstream_url("8.8.8.8:53", UpstreamProtocol::Plain).unwrap();
+        assert_eq!(p.host, "8.8.8.8");
+        assert_eq!(p.port, 53);
+        assert_eq!(p.scheme, "plain");
+    }
+
+    #[test]
+    fn parse_upstream_url_plain_defaults_port_to_53() {
+        let p = parse_upstream_url("1.1.1.1", UpstreamProtocol::Plain).unwrap();
+        assert_eq!(p.host, "1.1.1.1");
+        assert_eq!(p.port, 53);
     }
 
     #[test]
