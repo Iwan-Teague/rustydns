@@ -186,16 +186,30 @@ Read the full threat model and deployment checklist in [`docs/security.md`](docs
 
 ```
 rustydns/
-├── Cargo.toml                    # Workspace root
+├── Cargo.toml                    # Workspace root (MSRV 1.88)
+├── Cargo.lock                    # Reproducible builds
 ├── rustydns.example.toml         # Annotated example configuration
 ├── AGENTS.md                     # Coding-agent invariants
+├── deny.toml                     # cargo-deny: advisories + bans + licenses + sources
+├── Dockerfile                    # Multi-stage production image
+├── docker-compose.yml            # Hardened example deployment
+├── .dockerignore
 ├── crates/
 │   ├── rustydns-core/            # Shared types: config, errors, DNS records, client identity
-│   ├── rustydns-blocklist/       # Blocklist engine, parser, hot-reload
-│   ├── rustydns-authority/       # Local zone authority (Rusty Suite mesh records)
-│   ├── rustydns-resolver/        # Upstream DoH/DoQ resolver (stub)
-│   └── rustydnsd/                # Daemon entry point
+│   ├── rustydns-blocklist/       # Blocklist engine, parser, hot-reload, allowlist
+│   ├── rustydns-authority/       # Authoritative zones (static + signed Rustynet mesh bundle, CNAME chasing)
+│   ├── rustydns-resolver/        # DoH/DoQ upstream resolver (TLS 1.3 floor, fail-closed, DNSSEC, randomised selection)
+│   └── rustydnsd/                # Daemon: UDP/TCP/DoT/DoH listeners + /metrics, /health, /queries
 ├── docs/
+│   ├── architecture.md
+│   ├── security.md
+│   ├── blocklist-format.md
+│   ├── integration-rustynet.md
+│   ├── operator-endpoints.md
+│   └── deployment-docker.md
+├── .github/
+│   ├── workflows/ci.yml          # fmt + clippy + test + release-build + cargo-deny + docker smoke
+│   └── dependabot.yml            # Weekly cargo + actions updates
 ├── install/
 │   └── rustydns.service          # Systemd unit with kernel hardening
 └── scripts/

@@ -81,12 +81,14 @@ return geographically relevant answers. RustyDNS strips ECS options from all out
 queries and never adds them. The upstream resolver sees only the RustyDNS server's IP,
 not the originating client's subnet.
 
-### Query Padding (RFC 8467)
+### Query Padding (RFC 8467) — pending
 
 Even over an encrypted transport, an observer who can see packet sizes may infer the
-queried domain from the packet length. RustyDNS pads outgoing DoH queries to fixed-size
-blocks (planned: 128-byte blocks per RFC 8467 recommendation). An observer sees only
-that a block of N×128 bytes was sent, not the domain name length.
+queried domain from the packet length. RFC 8467 padding to fixed-size blocks (128 bytes
+recommended) defeats this — but hickory 0.26's stub resolver does not yet expose the
+knob. `privacy.upstream_padding = true` is honoured the moment hickory ships support;
+until then, the daemon emits a `tracing::warn!` at startup so operators do not silently
+believe padding is active. Encrypted query sizes still leak the queried domain.
 
 ### Randomised Upstream Selection
 
@@ -125,11 +127,13 @@ TLS certificate validation is always enabled and is not configurable. There is n
 `verify_tls_certs = false` option and no plan to add one. Operators who need to trust
 a private CA should add it to the system trust store.
 
-### DNS-over-TLS Listener (Planned)
+### DNS-over-TLS Listener
 
-For clients on the local network, RustyDNS will support a DoT listener (port 853).
-This requires `tls_cert_path` and `tls_key_path` to be set in `[server]`. If
-`dot_listen` is configured without both paths, the daemon refuses to start.
+For clients on the local network, RustyDNS supports a DoT listener (port 853),
+wired end-to-end against hickory-server 0.26's
+`register_tls_listener_with_tls_config`. This requires `tls_cert_path` and
+`tls_key_path` to be set in `[server]`. If `dot_listen` is configured without
+both paths, `validate_config` refuses to start the daemon.
 
 Certificate and key files must be readable only by the `rustydns` user:
 

@@ -10,26 +10,43 @@ This file is the entry point for any AI agent or automated tool working in this 
 
 ## Repository status
 
-**Milestones 1–3 complete, M4 in progress.** Workspace, core, blocklist, authority (with signed Rustynet mesh bundle integration), and the DoH/plain resolver are implemented and tested. `rustydnsd` runs end-to-end on UDP/TCP/DoH with metrics, signal handling, and atomic mesh-zone reload via `ArcSwap`. Remaining M4 work: in-process capability dropping and DoT listener (blocked on hickory-server upgrading from rustls 0.21 to 0.23). The current content is:
+**Milestones 1–4 feature-complete.** All five crates ship; `rustydnsd` runs
+end-to-end on UDP, TCP, DoT, and DoH with the full privacy posture (TLS 1.3 floor,
+DNSSEC, ECS strip, randomised upstream selection, fail-closed). The mesh-zone
+bundle is hot-reloaded via `ArcSwap`, the authority chases intra-zone CNAME
+chains (RFC 1034 §3.6.2), the daemon drops Linux capabilities in-process and
+sets `umask(0o077)`, and three independent deployment paths are documented
+(systemd, bare binary, Docker).
 
-- `README.md` — project overview and quick-start sketch
-- `docs/architecture.md` — intended design (authoritative, canonical)
-- `docs/blocklist-format.md` — blocklist source formats and fetch security
-- `docs/integration-rustynet.md` — how rustydns fits into the Rustynet mesh
+| Surface | Status |
+|---------|--------|
+| `crates/rustydns-core`      | ✅ config (`validate_config` with ~30 rejection branches), error, record, client types |
+| `crates/rustydns-blocklist` | ✅ engine, parser (hosts/plain/RPZ/AdGuard auto-detect), allowlist with TLD-guard |
+| `crates/rustydns-authority` | ✅ static zones + signed Rustynet mesh bundle + intra-zone CNAME chasing |
+| `crates/rustydns-resolver`  | ✅ DoH/DoQ/plain upstream, TLS 1.3 floor, DNSSEC, fail-closed, randomised selection |
+| `crates/rustydnsd`          | ✅ UDP/TCP/DoT/DoH listeners, `/metrics` `/health` `/queries`, query-log ring buffer, per-client policy, bounded graceful shutdown, capability drop, umask |
+
+Doc surfaces:
+
+- `README.md` — overview, quick-starts (Docker + systemd + bare)
+- `docs/architecture.md` — pipeline and crate responsibilities (authoritative)
+- `docs/security.md` — threat model + privacy/security decisions
+- `docs/blocklist-format.md` — supported formats and source security
+- `docs/integration-rustynet.md` — signed dns-zone bundle integration
 - `docs/operator-endpoints.md` — `/metrics`, `/health`, `/queries` reference
-- `docs/security.md` — threat model and all privacy/security decisions
+- `docs/deployment-docker.md` — image layout, capability model, compose template
 - `AGENTS.md` — this file
 - `CLAUDE.md` — Claude-specific guidance
-- `crates/rustydns-core` — ✅ config, error, record, client types
-- `crates/rustydns-blocklist` — ✅ engine, parser, allowlist
-- `crates/rustydns-authority` — ✅ static zones + signed Rustynet mesh bundle (M2)
-- `crates/rustydns-resolver` — ✅ DoH/plain upstream with fail-closed (M3)
-- `crates/rustydnsd` — daemon binary, UDP/TCP/DoH listeners + e2e tests (M4, partial)
 
-The next milestone is a working `rustydnsd` binary that can:
-1. Serve a static mesh zone from a TOML file (no Rustynet DB yet)
-2. Forward everything else to a DoH upstream (with full privacy feature set)
-3. Apply a hosts-format blocklist
+Known deferrals (not blockers):
+- RFC 7816 query name minimisation + RFC 8467 padding — hickory 0.26's stub
+  resolver doesn't expose either; daemon emits a startup `warn!` whenever the
+  matching `privacy.*` knob is enabled so operators aren't misled.
+- NodeId-keyed `[[policy]]` entries — parsed but inert pending Rustynet
+  peer-table integration; IP-keyed policy is fully wired.
+- `privacy.query_log_to_disk` — opt-in but unimplemented; emits a startup warning.
+- SIGHUP today reloads only blocklists + mesh bundle; full config reload
+  (listeners, TLS, upstreams) requires a process restart.
 
 ## Conventions inherited from the suite
 

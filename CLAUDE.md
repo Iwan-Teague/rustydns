@@ -1,28 +1,36 @@
 # CLAUDE.md — rustydns
 
-Read `AGENTS.md` first. This file adds Claude-specific context on top of it.
+Read `AGENTS.md` first. This file adds Claude-specific context on top of it
+— things that have bitten us before, conventions for working in the repo, and
+historical footguns worth remembering even though they no longer fire.
 
 ## Project phase
 
-Scaffolding. No Rust code exists. Your most likely tasks right now are:
+**Production-ready. Milestones 1–4 feature-complete.** All five crates ship,
+the daemon runs end-to-end on UDP/TCP/DoT/DoH with the full privacy posture,
+~150 tests pass in CI, and three deployment paths (systemd / bare binary /
+Docker) are documented and verified. Your tasks now are typically:
 
-- Initialising the Cargo workspace and crate skeletons
-- Implementing `rustydns-core` types and config parsing
-- Writing the `rustydns-blocklist` engine (good starting point — pure logic, no network)
+- Operator-visible improvements (validation tightening, startup warnings,
+  defence-in-depth on existing surfaces)
+- Test coverage for under-tested branches
+- Doc accuracy passes when behaviour shifts
+- New features that fit the AGENTS.md invariants without expanding the
+  attack surface
 
 ## Starting a coding session
 
-1. Read `AGENTS.md` (invariants, crate order, conventions)
-2. Read `docs/architecture.md` (pipeline design and crate responsibilities)
-3. Check `docs/integration-rustynet.md` if the task involves Rustynet (signed dns-zone bundle file — no SQLite, despite older drafts)
-4. Look at the Rustynet workspace for established patterns — particularly how `rustynetd` wires its crates together and how `rustynet-crypto` handles config types
+1. Read `AGENTS.md` (invariants — non-negotiable)
+2. Read `docs/architecture.md` if the task touches the pipeline shape
+3. Check `docs/integration-rustynet.md` for Rustynet integration questions
+   (signed dns-zone bundle file — there is **no** SQLite, despite older
+   drafts that mentioned one)
+4. Check `docs/deployment-docker.md` if the task touches packaging
+5. Look at the Rustynet workspace for established patterns
 
-## Workspace initialisation (first coding task)
-
-When initialising the Cargo workspace:
+## Workspace shape (for reference)
 
 ```toml
-# Cargo.toml (workspace root)
 [workspace]
 members = [
     "crates/rustydns-core",
@@ -34,82 +42,134 @@ members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2024"
-rust-version = "1.85"
-license = "MIT OR Apache-2.0"
-
-[workspace.dependencies]
-tokio       = { version = "1", features = ["full"] }
-tracing     = "0.1"
-thiserror   = "2"
-anyhow      = "1"
-serde       = { version = "1", features = ["derive"] }
-toml        = "0.8"
-hickory-server   = "0.24"
-hickory-proto    = "0.24"
-hickory-resolver = "0.24"
+edition      = "2024"
+rust-version = "1.88"            # bumped in lockstep with hickory 0.26 → 1.88 floor
 ```
 
-Set `#![forbid(unsafe_code)]` in every crate's `lib.rs` or `main.rs`.
+Workspace deps live in `Cargo.toml` `[workspace.dependencies]`. Pin everything
+there, not per-crate. Current major-version pins:
 
-## Blocklist implementation notes
+- `hickory-{server,proto,resolver} = "0.26"` (with `https-ring`, `quic-ring`,
+  `dnssec-ring`, `webpki-roots` features on the resolver)
+- `rustls = "0.23"` with the `ring` provider
+- `tokio = "1"` with `["full"]`
+- `axum = "0.7"` with `["http2"]`
+- `prometheus = "0.14"`
 
-The blocklist engine is the best first Rust target because it has no external dependencies and is fully unit-testable:
+Set `#![forbid(unsafe_code)]` in every crate's `lib.rs` or `main.rs` —
+already done across the workspace; do not regress.
 
-- Use an `AHashSet<String>` (or `AHashSet<Name>` after hickory-proto Name parsing) for O(1) lookups
-- For RPZ wildcard rules (`*.ads.example.com`), store parent domains in a separate set and check suffix matches
-- Hot reload: use `arc-swap` crate (`ArcSwap<BlocklistState>`) so reader threads never block during a reload
-- Parse hosts-format lines: skip `#` comments, skip `localhost`, split on whitespace, take the second field
+## Blocklist implementation notes (historical, still valid)
+
+- `AHashSet<String>` for O(1) lookups, randomised seed per process.
+- RPZ wildcards (`*.ads.example.com`): parent domains in a separate set,
+  suffix-matched at lookup time.
+- Hot reload via `arc_swap::ArcSwap<BlocklistState>` so readers never block.
+- Hosts/plain/RPZ/AdGuard formats auto-detected per source.
+- `validate_config` and the parser jointly enforce: HTTPS-only sources,
+  trusted/untrusted RPZ passthru, allowlist entries must have ≥2 labels.
 
 ## Config parsing notes
 
-- Use `serde` + `toml` for all config
-- Validate at startup — don't let bad config cause a panic at query time
-- Provide `Default` implementations for all optional config sections
-- Log the resolved config at `tracing::debug!` level on startup (but redact any token-like fields)
+- `serde` + `toml`, `#[serde(deny_unknown_fields)]` on every config struct.
+- `validate_config` runs at startup AND at `--validate-config`. Every
+  rejection branch has a unit test in `rustydns-core::config::tests`.
+- `Default` for every optional section so partial configs work.
+- Resolved config is logged at `tracing::debug!`; secrets (`Secret<String>`)
+  redact themselves via a manual `Serialize` impl emitting `"<redacted>"`.
 
-## hickory-dns version note
+## hickory-dns notes
 
-Use `hickory-*` crates (the renamed fork of `trust-dns`). Do not use `trust-dns-*` crates — they are the old unmaintained names. The `hickory` crates are the actively maintained continuation.
+Use `hickory-*` crates. Do not use `trust-dns-*` — those are the old
+unmaintained names and `deny.toml` bans them.
 
-### DoH upstream needs an explicit root-CA feature
+### DoH upstream root-CA setup (history — already fixed, but useful to know)
 
-`hickory-resolver = { features = ["dns-over-https-rustls", ...] }` does **not** pull in any root certificate source. With `tls_config: None` (the default we pass in `build_name_servers`), hickory builds a `rustls::ClientConfig` with an empty `RootCertStore`, and every upstream cert validates as `UnknownIssuer`.
+Earlier in the project, `hickory-resolver = { features = ["dns-over-https-rustls", ...] }`
+did **not** pull in any root certificate source. With `tls_config: None`
+(the old default we passed in `build_name_servers`), hickory built a
+`rustls::ClientConfig` with an empty `RootCertStore`, and every upstream cert
+validated as `UnknownIssuer`.
 
-Symptom: every DoH query → `SERVFAIL` after ~350 ms. At our log level (warn/debug) the error reads `proto error: io error: invalid data` — opaque. The real error only shows with `RUST_LOG=hickory_proto=trace`:
+Symptom: every DoH query → `SERVFAIL` after ~350 ms. At our log level the
+error read `proto error: io error: invalid data` — opaque. The real error
+only showed with `RUST_LOG=hickory_proto=trace`:
 
 ```
 hickory_proto::xfer::dns_exchange: stream errored while connecting,
   error: io error: invalid peer certificate: UnknownIssuer
 ```
 
-The double-wrap (`io error: invalid data`) is hickory's `Display` impl flattening the source chain. If you need the real reason at debug without `hickory_proto=trace`, walk `std::error::Error::source()` and log the chain.
+The double-wrap (`io error: invalid data`) was hickory's `Display` impl
+flattening the source chain. To debug similar wraps in future, walk
+`std::error::Error::source()` and log the chain.
 
-Fix: add one of these features to the `hickory-resolver` line in workspace `Cargo.toml`:
+**Current state:** the workspace pulls `hickory-resolver` with the
+`webpki-roots` feature so the Mozilla CA bundle is compiled in. On top of
+that, the resolver explicitly builds a `rustls::ClientConfig` with
+`with_protocol_versions(&[&TLS13])` (or `[TLS13, TLS12]`) and passes it via
+`HickoryResolver::builder_with_config(...).with_tls_config(...)`, so
+`upstream.min_tls_version` actually pins the floor. The legacy
+`rustls-native-certs` / `hickory 0.24 + rustls 0.21` mismatch is gone.
 
-- `webpki-roots` — Mozilla CA bundle compiled in. Deterministic, no host-trust-store surprises. **Preferred for this project.**
-- `native-certs` — reads system trust store via `rustls-native-certs 0.6` at startup. Respects user-added CAs.
+### MSRV is 1.88
 
-Do **not** assume the workspace-level `rustls-native-certs 0.7` covers this — hickory 0.24 is pinned to rustls 0.21 internally and needs its own feature-gated copy of `rustls-native-certs 0.6`. When hickory upgrades to rustls 0.23 we can switch to passing an explicit `TlsClientConfig` (see the TLS 1.3 floor TODO in `rustydns-resolver`).
+`hickory-{net,proto,resolver,server} 0.26.1` all carry `rust-version = 1.88`
+in their manifests. Bumping the workspace below 1.88 will break CI.
+The Dockerfile builder image and the CI toolchain pin match.
 
 ## Performance-sensitive paths
 
-The query hot path (Authority lookup → Blocklist check → cache lookup) must not allocate on the heap for cache hits. Use `Cow<'_, str>` or pre-intern domain names where possible.
+The query hot path (Authority lookup → Blocklist check → cache lookup) must
+not allocate on the heap for cache hits. Use `Cow<'_, str>` or pre-intern
+domain names where possible. Today the heaviest hot-path allocation is
+`normalise_name()` which lowercases and adds a trailing dot — acceptable
+because authority lookups are a small fraction of total queries.
 
 ## Logging conventions
 
+**Read the AGENTS.md privacy invariants before touching tracing calls.**
+Summary:
+
+- **Never log raw `qname` at `info!`, `warn!`, or `error!`.** Use the hashed
+  form from `QueryLog::hash_qname` (per-process-salted u64) or a redacted
+  marker.
+- **Never log a full client IP at `info+`.** Use `client.anonymized()`.
+  `ClientId` deliberately has no `Display` impl to make this hard to forget.
+- `tracing::trace!` and `debug!` may carry raw qname or full client IP,
+  but every such call should be visibly marked as debug-only.
+
+Worked examples that match the invariants:
+
 ```rust
-// At query receipt
-tracing::debug!(client = %client_id, qname = %name, qtype = %record_type, "query received");
+// Query receipt (debug-only; never enable in production)
+tracing::debug!(client = %client_id, qname = %name, qtype = %qtype, "query received");
 
-// At authority hit
-tracing::trace!(qname = %name, "authority hit");
+// Authority hit (trace-only — info would log every mesh query)
+tracing::trace!(qtype = %rtype, count = matching.len(), "authority lookup");
 
-// At blocklist hit
-tracing::info!(client = %client_id, qname = %name, "query blocked");
+// Blocklist hit (info-safe ONLY because we anonymise both halves)
+tracing::info!(
+    client    = %client.anonymized(),
+    qname_hash = format!("{:016x}", query_log.hash_qname(&name)),
+    "query blocked",
+);
 
-// At upstream error
+// Upstream error (info-safe — URL is operator-controlled, error is from rustls/hickory)
 tracing::warn!(upstream = %url, error = %e, "upstream resolver failed");
-
-// Never log raw query content at info+ level in production (privacy)
 ```
+
+The old version of this file had an example logging `qname` at `info!` for
+blocklist hits — that violated the privacy invariants. Do not regress.
+
+## Things to avoid
+
+- Don't add a web UI (Rustyfin's job).
+- Don't add a database (mesh state comes from a signed bundle file).
+- Don't add `verify_tls_certs = false`, `allow_http_sources`, `disable_dnssec`,
+  or any other "escape hatch" — operators who want insecure should do it at
+  the infrastructure layer, not in the daemon.
+- Don't introduce a competing DNS library — hickory only.
+- Don't bump RUSTFLAGS to suppress lints; fix the lints. The CI YAML used
+  to silently skip jobs because of unquoted colons in step names; we now
+  quote them. Don't write `name: foo: bar` in a workflow file.
