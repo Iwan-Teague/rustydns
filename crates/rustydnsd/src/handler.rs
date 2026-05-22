@@ -819,6 +819,17 @@ mod tests {
         }
     }
 
+    fn static_cname(name: &str, target: &str) -> StaticRecord {
+        StaticRecord {
+            name: name.to_string(),
+            record_type: "CNAME".to_string(),
+            address: None,
+            target: Some(target.to_string()),
+            ttl: 300,
+            client_filter: None,
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn authority_hit_serves_static_record_with_aa_flag() {
         let harness = build_harness(
@@ -974,6 +985,59 @@ mod tests {
         assert_eq!(snap[2].qname_hash, h_authority);
         assert_eq!(snap[1].qname_hash, h_block);
         assert_eq!(snap[0].qname_hash, h_resolver);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authority_hit_follows_cname_chain_over_udp() {
+        // alias.lab.example.com → host.lab.example.com (A=10.0.0.5).
+        // The wire response must carry BOTH the CNAME and the terminal
+        // A in the answer section, with aa=1 — exercises the full
+        // authority chain follower + handler RR conversion + UDP
+        // encode round-trip.
+        let harness = build_harness(
+            vec![
+                static_cname("alias.lab.example.com", "host.lab.example.com"),
+                static_a("host.lab.example.com", "10.0.0.5"),
+            ],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        let resp = query(
+            harness.port,
+            "alias.lab.example.com.",
+            ProtoRecordType::A,
+        )
+        .await;
+
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            resp.metadata.authoritative,
+            "authority chain follow must keep aa=1",
+        );
+        assert_eq!(
+            resp.answers.len(),
+            2,
+            "expected CNAME + A in answer section, got: {:?}",
+            resp.answers,
+        );
+
+        // Order matters for a well-formed answer: CNAME first, then
+        // the terminal A.
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::CNAME(target) => {
+                assert_eq!(target.to_string(), "host.lab.example.com.");
+            }
+            other => panic!("expected CNAME first, got {other:?}"),
+        }
+        match &resp.answers[1].data {
+            hickory_proto::rr::RData::A(a) => {
+                assert_eq!(a.0.to_string(), "10.0.0.5");
+            }
+            other => panic!("expected terminal A, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
