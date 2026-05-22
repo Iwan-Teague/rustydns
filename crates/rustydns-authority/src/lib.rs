@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         match &result[0].data {
             RecordData::A(ip) => assert_eq!(ip.to_string(), "10.0.0.5"),
-            other => panic!("expected A record, got {:?}", other),
+            other => panic!("expected A record, got {other:?}"),
         }
         assert_eq!(result[0].name, "host.lab.example.com.");
     }

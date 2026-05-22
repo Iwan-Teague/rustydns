@@ -958,10 +958,9 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         let label_count = entry.split('.').filter(|l| !l.is_empty()).count();
         if label_count <= 1 {
             return Err(crate::RustyDnsError::Config(format!(
-                "blocklist.allowlist entry `{}` is a single-label or TLD-level wildcard. \
+                "blocklist.allowlist entry `{entry}` is a single-label or TLD-level wildcard. \
                  This would allowlist an entire TLD (e.g. all .com domains). \
                  Allowlist entries must have at least two labels (e.g. `example.com`).",
-                entry
             )));
         }
     }

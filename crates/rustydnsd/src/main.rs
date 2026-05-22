@@ -250,10 +250,7 @@ async fn main() -> Result<()> {
             }
             spawn_doh_server(doh_handler, addr, shutdown.clone());
         } else {
-            bail!(
-                "server.doh_listen `{}` is not a valid socket address",
-                doh_listen
-            );
+            bail!("server.doh_listen `{doh_listen}` is not a valid socket address");
         }
     }
     spawn_blocklist_reload_loop(
