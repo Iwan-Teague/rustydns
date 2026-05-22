@@ -1022,4 +1022,82 @@ mod tests {
         assert_eq!(normalize_metrics_path("/foo"), "/foo");
         assert_eq!(normalize_metrics_path("  /foo  "), "/foo");
     }
+
+    // ---- check_config_permissions ------------------------------------------
+
+    #[cfg(unix)]
+    fn set_mode(path: &PathBuf, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_config_permissions_accepts_owner_only() {
+        let p = tmp_path("config-600.toml");
+        write_file(&p, b"");
+        set_mode(&p, 0o600);
+        check_config_permissions(&p).expect("0o600 must pass");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_config_permissions_accepts_owner_and_group() {
+        let p = tmp_path("config-640.toml");
+        write_file(&p, b"");
+        // 0o640 keeps other-read clear; the function logs a warning
+        // about the group-read bit but does NOT reject.
+        set_mode(&p, 0o640);
+        check_config_permissions(&p).expect("0o640 must pass (group-read warned, not rejected)");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_config_permissions_rejects_world_readable() {
+        let p = tmp_path("config-644.toml");
+        write_file(&p, b"");
+        // 0o644 has the other-read bit set — a hard failure.
+        set_mode(&p, 0o644);
+        let err = check_config_permissions(&p).expect_err("0o644 must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("world-readable"),
+            "error must call out world-readability: {msg}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_config_permissions_rejects_world_writable() {
+        let p = tmp_path("config-622.toml");
+        write_file(&p, b"");
+        // 0o622: other-write but not other-read. Still rejects because
+        // the path "world-readable" bit catches *any* other-read bit.
+        // Use 0o604 to exercise read-without-write.
+        set_mode(&p, 0o604);
+        let err = check_config_permissions(&p).expect_err("0o604 must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("world-readable"),
+            "error must call out world-readability: {msg}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_config_permissions_errors_on_missing_file() {
+        let p = tmp_path("config-missing.toml");
+        // file never created
+        let err = check_config_permissions(&p).expect_err("missing file must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cannot stat"),
+            "error must surface the stat failure: {msg}"
+        );
+    }
 }
