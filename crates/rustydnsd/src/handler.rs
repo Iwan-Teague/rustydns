@@ -397,7 +397,14 @@ impl RequestHandler for DnsHandler {
                 }
             };
 
-            self.log_query(&policy, &client, &qname, &qtype_str, code, ServedBy::Blocklist);
+            self.log_query(
+                &policy,
+                &client,
+                &qname,
+                &qtype_str,
+                code,
+                ServedBy::Blocklist,
+            );
             return self
                 .respond(request, response_handle, builder, code, false, answers)
                 .await;

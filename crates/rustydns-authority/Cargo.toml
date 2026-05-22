@@ -9,7 +9,7 @@ authors.workspace    = true
 repository.workspace = true
 
 [dependencies]
-rustydns-core = { path = "../rustydns-core" }
+rustydns-core = { path = "../rustydns-core", version = "0.1.0" }
 hickory-server = { workspace = true }
 hickory-proto  = { workspace = true }
 tokio          = { workspace = true }

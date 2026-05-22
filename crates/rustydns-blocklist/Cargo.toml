@@ -9,7 +9,7 @@ authors.workspace    = true
 repository.workspace = true
 
 [dependencies]
-rustydns-core = { path = "../rustydns-core" }
+rustydns-core = { path = "../rustydns-core", version = "0.1.0" }
 ahash         = { workspace = true }
 arc-swap      = { workspace = true }
 tracing       = { workspace = true }

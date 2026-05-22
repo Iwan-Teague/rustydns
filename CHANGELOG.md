@@ -74,8 +74,14 @@ See `docs/operator-endpoints.md` for the full reference.
   e2e via UDP/TCP, DoH GET/POST, query log, policy enforcement,
   policy metrics, `/queries` JSON shape, `/health`.
 - GitHub Actions CI: `cargo fmt --check`, clippy (correctness +
-  suspicious + perf), full test, release build, and a
+  suspicious + perf), full test, release build, `cargo deny check`
+  (advisories + bans + licenses + sources), and a
   `--validate-config` smoke on the example config.
+- `deny.toml` policy: SPDX license allowlist, banned-crate list
+  (`openssl-sys`, `openssl`, `native-tls`, the trust-dns-* family),
+  HTTPS-only crates.io as the single approved source. Active
+  RUSTSEC ignores are individually annotated with rationale + the
+  upgrade that resolves them.
 
 ### Documentation
 

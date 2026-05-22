@@ -59,6 +59,14 @@ jobs:
         # Smoke-build the release profile so LTO / strip don't surprise us.
         run: cargo build --workspace --release
 
+      - name: cargo-deny (advisories + bans + licenses + sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Pin to the version of cargo-deny that ships the `version = 2`
+          # advisories/licenses schema we use in deny.toml.
+          command: check
+          arguments: --all-features
+
       - name: Daemon smoke: --validate-config on the example config
         run: |
           chmod 600 rustydns.example.toml

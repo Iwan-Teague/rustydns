@@ -13,10 +13,10 @@ name = "rustydnsd"
 path = "src/main.rs"
 
 [dependencies]
-rustydns-core      = { path = "../rustydns-core" }
-rustydns-blocklist = { path = "../rustydns-blocklist" }
-rustydns-authority = { path = "../rustydns-authority" }
-rustydns-resolver  = { path = "../rustydns-resolver" }
+rustydns-core      = { path = "../rustydns-core", version = "0.1.0" }
+rustydns-blocklist = { path = "../rustydns-blocklist", version = "0.1.0" }
+rustydns-authority = { path = "../rustydns-authority", version = "0.1.0" }
+rustydns-resolver  = { path = "../rustydns-resolver", version = "0.1.0" }
 tokio              = { workspace = true }
 tokio-util         = { workspace = true }
 tracing            = { workspace = true }

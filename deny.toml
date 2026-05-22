@@ -1,0 +1,133 @@
+# cargo-deny configuration for rustydns.
+#
+# Run locally with: `cargo install cargo-deny && cargo deny check`
+# CI runs `cargo deny check` on every push / PR (see .github/workflows/ci.yml).
+#
+# The four sub-commands cargo-deny runs:
+#   - advisories: known security advisories
+#   - bans:       banned crates / banned versions / duplicate detection
+#   - licenses:   SPDX expression allowlist
+#   - sources:    only registries/git sources we trust
+
+# ---------------------------------------------------------------------------
+# Advisory database
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+# Pull from the official RustSec advisory DB.
+db-path = "$CARGO_HOME/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Yanked crates aren't an immediate vulnerability but they shouldn't
+# end up in a release either — fail CI so we notice before shipping.
+yanked = "deny"
+# Each ignored advisory MUST carry a rationale and a removal trigger.
+# Today every active ignore is in the hickory-resolver 0.24 / rustls
+# 0.21 / quinn 0.10 dep chain; they all resolve together when we
+# upgrade to hickory 0.26 (which uses rustls 0.23, ring 0.17, etc.).
+# Tracking comments live next to the TLS-1.3-floor TODO in
+# crates/rustydns-resolver/src/lib.rs.
+ignore = [
+    # hickory-proto 0.24 — O(n²) name compression CPU exhaustion.
+    # rustydns mitigates with a 256 KiB bundle cap and bounded
+    # blocklist fetches, so the practical exposure is small.
+    { id = "RUSTSEC-2024-0437", reason = "fixed by hickory 0.26 upgrade" },
+    # ring < 0.17 panic on overflow checking + unmaintained.
+    { id = "RUSTSEC-2025-0009", reason = "fixed by hickory 0.26 (pulls ring 0.17)" },
+    { id = "RUSTSEC-2025-0010", reason = "fixed by hickory 0.26 (pulls ring 0.17)" },
+    # rustls 0.21 family — name-constraint and CRL parsing bugs.
+    { id = "RUSTSEC-2025-0134", reason = "fixed by hickory 0.26 (rustls 0.23)" },
+    { id = "RUSTSEC-2026-0037", reason = "fixed by hickory 0.26 (rustls 0.23)" },
+    { id = "RUSTSEC-2026-0098", reason = "fixed by hickory 0.26 (rustls 0.23)" },
+    { id = "RUSTSEC-2026-0099", reason = "fixed by hickory 0.26 (rustls 0.23)" },
+    # quinn 0.10 — DoS in endpoint reset handling.
+    { id = "RUSTSEC-2026-0104", reason = "fixed by hickory 0.26 (quinn 0.11)" },
+    # rustls-pemfile 1 unmaintained.
+    { id = "RUSTSEC-2026-0119", reason = "fixed by hickory 0.26 (rustls-pemfile 2)" },
+]
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+[bans]
+# AGENTS.md forbids the openssl C bindings ("rustls backend only, no
+# openssl") and the old unmaintained trust-dns crate family.
+multiple-versions = "warn"  # log duplicates without failing CI
+wildcards = "deny"          # `foo = "*"` deps are forbidden
+# Workspace-internal path deps don't carry version constraints; that's
+# correct usage (cargo resolves them via the path) but cargo-deny
+# treats it as a wildcard without this opt-in.
+allow-wildcard-paths = true
+
+deny = [
+    # AGENTS.md "do not introduce" list.
+    { name = "openssl-sys" },
+    { name = "openssl" },
+    { name = "native-tls" },
+    # trust-dns-* is the old unmaintained name for the hickory family.
+    { name = "trust-dns-proto" },
+    { name = "trust-dns-resolver" },
+    { name = "trust-dns-server" },
+    { name = "trust-dns-client" },
+]
+
+# Don't penalise the duplicate rustls 0.21 / 0.23 that hickory 0.24
+# forces on us — that's tracked as a TODO in the resolver crate and
+# will resolve when we move to hickory 0.26+. Same for the duplicate
+# tokio-rustls.
+skip = [
+    { name = "rustls" },
+    { name = "tokio-rustls" },
+    { name = "rustls-pemfile" },
+    { name = "rustls-webpki" },
+    { name = "webpki-roots" },
+]
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+# Workspace ships under MIT OR Apache-2.0; allow the standard set of
+# permissive licenses we'd be comfortable shipping. Add to this list
+# explicitly rather than relaxing the policy.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "Unlicense",
+    # Mozilla's Community Data License — used by `webpki-roots` (the
+    # CA bundle itself is "data" rather than "code"). Permissive.
+    "CDLA-Permissive-2.0",
+    # crypto-grade primitives that distribute under the OpenSSL or
+    # equivalent compatible licenses — `ring` lives here.
+    "OpenSSL",
+]
+confidence-threshold = 0.93
+
+# A handful of crates ship without a SPDX expression in their
+# manifest but DO carry a recognised LICENSE file at their root.
+# `ring` is the canonical example.
+[[licenses.clarify]]
+crate = "ring"
+expression = "ISC AND OpenSSL AND MIT"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+[sources]
+# Only the official crates.io registry. Any git dep would have to be
+# explicitly allowlisted; we don't pull any today.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
