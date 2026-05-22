@@ -10,7 +10,10 @@ resolver = "2"
 
 [workspace.package]
 edition      = "2024"
-rust-version = "1.85"
+# hickory-{net,proto,resolver,server} 0.26.1 require rustc 1.88.
+# Bump this in lockstep with the Dockerfile builder image and the
+# CI `dtolnay/rust-toolchain` pin.
+rust-version = "1.88"
 license      = "MIT OR Apache-2.0"
 authors      = ["Iwan Teague <iwanteague@gmail.com>"]
 repository   = "https://github.com/Iwan-Teague/rustydns"

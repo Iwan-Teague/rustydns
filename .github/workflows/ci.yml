@@ -24,7 +24,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           # Match workspace.package.rust-version from Cargo.toml.
-          toolchain: "1.85"
+          # hickory 0.26 requires rustc 1.88, so the floor is pinned
+          # to 1.88 here and in the Dockerfile.
+          toolchain: "1.88"
           components: rustfmt, clippy
 
       - name: Cache cargo registry, index, and target

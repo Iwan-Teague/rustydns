@@ -115,7 +115,7 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Packaging
 
-- **Multi-stage `Dockerfile`** — `rust:1.85-bookworm` builder →
+- **Multi-stage `Dockerfile`** — `rust:1.88-bookworm` builder →
   `debian:bookworm-slim` runtime. Non-root `rustydns` user,
   `cap_net_bind_service` file capability on the binary so `:53`
   and `:853` bind without root. `tini` as PID 1 for zombie reaping

@@ -1005,12 +1005,7 @@ mod tests {
         )
         .await;
 
-        let resp = query(
-            harness.port,
-            "alias.lab.example.com.",
-            ProtoRecordType::A,
-        )
-        .await;
+        let resp = query(harness.port, "alias.lab.example.com.", ProtoRecordType::A).await;
 
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
         assert!(

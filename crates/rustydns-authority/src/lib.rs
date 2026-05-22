@@ -360,10 +360,7 @@ fn collect_with_cname_chain(
             }
 
             // Another CNAME hop?
-            if let Some(next_cname) = recs
-                .iter()
-                .find(|r| matches!(r.data, RecordData::Cname(_)))
-            {
+            if let Some(next_cname) = recs.iter().find(|r| matches!(r.data, RecordData::Cname(_))) {
                 out.push(next_cname.clone());
                 next = match &next_cname.data {
                     RecordData::Cname(t) => t.clone(),
@@ -1067,14 +1064,8 @@ mod tests {
         ]))
         .unwrap();
 
-        let result = auth
-            .lookup("alias.lab.example.com", "A")
-            .expect("in zone");
-        assert_eq!(
-            result.len(),
-            2,
-            "expected [CNAME, A]; got: {result:?}"
-        );
+        let result = auth.lookup("alias.lab.example.com", "A").expect("in zone");
+        assert_eq!(result.len(), 2, "expected [CNAME, A]; got: {result:?}");
         assert_eq!(result[0].type_name(), "CNAME");
         assert_eq!(result[1].type_name(), "A");
         match &result[1].data {
@@ -1180,9 +1171,7 @@ mod tests {
         )]))
         .unwrap();
 
-        let result = auth
-            .lookup("alias.lab.example.com", "A")
-            .expect("in zone");
+        let result = auth.lookup("alias.lab.example.com", "A").expect("in zone");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].type_name(), "CNAME");
     }
@@ -1193,11 +1182,7 @@ mod tests {
         // mesh zone (we're authoritative for it even without a bundle
         // loaded, so the chase will land in an authoritative-NoData
         // state and return the CNAME alone).
-        let auth = Authority::new(cfg(vec![cname(
-            "alias.example.com",
-            "router.mesh",
-        )]))
-        .unwrap();
+        let auth = Authority::new(cfg(vec![cname("alias.example.com", "router.mesh")])).unwrap();
 
         let result = auth.lookup("alias.example.com", "A").expect("in zone");
         // Mesh zone is authoritative; no record at router.mesh in this
@@ -1219,9 +1204,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let result = auth
-            .lookup("host.lab.example.com", "A")
-            .expect("in zone");
+        let result = auth.lookup("host.lab.example.com", "A").expect("in zone");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].type_name(), "A");
     }

@@ -25,7 +25,7 @@ Then point a client at the host on port 53 (UDP/TCP), 853 (DoT), or
 
 The `Dockerfile` is multi-stage:
 
-- **`builder`** — `rust:1.85-bookworm`. Copies workspace manifests
+- **`builder`** — `rust:1.88-bookworm`. Copies workspace manifests
   first so Cargo's dep graph is cached independently of source churn,
   then builds `rustydnsd` with the workspace's release profile (`lto =
   "thin"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"`).
