@@ -23,12 +23,14 @@ yanked = "deny"
 # Ignored advisories carry a rationale and a removal trigger.
 ignore = [
     # rustls-pemfile 2.x is marked unmaintained but has no
-    # successor with the same API surface. We use it only inside
-    # `load_tls_config` for the DoT listener path, which currently
-    # bails before the call (hickory-server DoT integration is
-    # pending — see the TODO in `main.rs`). When DoT lands we'll
-    # migrate to `rustls-pki-types::pem` and drop this dep entirely.
-    { id = "RUSTSEC-2025-0134", reason = "unmaintained-only; dep is dead-code-gated until DoT lands" },
+    # successor with the same streaming API surface. We use it inside
+    # `load_tls_config` (rustydnsd::main) to parse the DoT
+    # listener's certificate and private key from PEM. The
+    # `rustls-pki-types::pem` replacement is API-stable but
+    # different shape; migration is tracked separately. The exposure
+    # surface is small: we read trusted operator-provided PEM files
+    # at startup, not network input.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained-only; load_tls_config reads operator-provided PEM at startup, no network input. Migration to rustls-pki-types::pem pending." },
 ]
 
 # ---------------------------------------------------------------------------
