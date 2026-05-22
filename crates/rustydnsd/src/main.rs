@@ -139,6 +139,27 @@ async fn main() -> Result<()> {
         "configuration loaded"
     );
 
+    // Warn about privacy knobs that the operator may believe are
+    // active but are not, because hickory 0.26's stub resolver
+    // doesn't yet expose them. Keeping the config keys around lets
+    // the daemon adopt them silently when hickory ships support —
+    // but until then, an operator with `upstream_padding = true`
+    // would have no signal that padding isn't actually happening.
+    if config.privacy.query_minimization {
+        warn!(
+            "privacy.query_minimization is enabled in config but hickory 0.26's stub \
+             resolver does not yet apply RFC 7816 qmin — queries are sent in full. \
+             The setting is honoured the moment hickory exposes it."
+        );
+    }
+    if config.privacy.upstream_padding {
+        warn!(
+            "privacy.upstream_padding is enabled in config but hickory 0.26 does not \
+             yet apply RFC 8467 DoH padding — encrypted query sizes still leak which \
+             domain was queried. The setting is honoured the moment hickory exposes it."
+        );
+    }
+
     // Build authority (mesh integration is best-effort — failures are
     // logged at warn! inside Authority::new and the daemon continues in
     // static-only mode).
