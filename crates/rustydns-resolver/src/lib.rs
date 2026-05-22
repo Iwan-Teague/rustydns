@@ -341,6 +341,56 @@ fn default_port(scheme: &str, protocol: UpstreamProtocol) -> u16 {
     }
 }
 
+/// Bootstrap-resolve `host:port` via the OS resolver with bounded
+/// retries. Each attempt waits 1s, 2s, 4s before retry — total
+/// ~7 seconds. Returns the first successful set of IPs, or the
+/// final attempt's error.
+async fn bootstrap_resolve_with_retry(host: &str, port: u16) -> ResolverResult<Vec<IpAddr>> {
+    const ATTEMPTS: usize = 4;
+    let host_port = format!("{host}:{port}");
+    let mut delay = Duration::from_secs(1);
+    let mut last_err: Option<String> = None;
+
+    for attempt in 1..=ATTEMPTS {
+        match tokio::net::lookup_host(&host_port).await {
+            Ok(addrs) => {
+                let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
+                if !ips.is_empty() {
+                    if attempt > 1 {
+                        tracing::info!(
+                            host = %host,
+                            attempt,
+                            "bootstrap DNS recovered after transient failure"
+                        );
+                    }
+                    return Ok(ips);
+                }
+                last_err = Some("returned no addresses".to_string());
+            }
+            Err(e) => last_err = Some(e.to_string()),
+        }
+
+        if attempt < ATTEMPTS {
+            tracing::warn!(
+                host = %host,
+                attempt,
+                next_retry_secs = delay.as_secs(),
+                error = last_err.as_deref().unwrap_or("?"),
+                "bootstrap DNS failed; retrying"
+            );
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+        }
+    }
+
+    Err(RustyDnsError::Resolver(format!(
+        "bootstrap DNS for `{}` failed after {} attempts: {}",
+        host,
+        ATTEMPTS,
+        last_err.unwrap_or_else(|| "unknown".to_string())
+    )))
+}
+
 /// Resolve `host` to one or more IP addresses via the OS resolver, then
 /// build one [`NameServerConfig`] per IP.
 async fn build_name_servers(
@@ -359,15 +409,18 @@ async fn build_name_servers(
     // outside the encrypted channel is resolved by anything other than
     // the configured DoH/DoQ providers. We document this in the module
     // doc and AGENTS.md.
+    //
+    // The OS resolver can be transiently unavailable at startup —
+    // k8s init-container ordering, systemd `network-online.target`
+    // races, slow links. Rather than refusing to start on the first
+    // hiccup, we retry a small number of times with exponential
+    // backoff (1s → 2s → 4s, 7 seconds total). After the budget we
+    // bubble the error up; the caller logs a warn and tries the next
+    // upstream URL.
     let ips: Vec<IpAddr> = if let Ok(ip) = IpAddr::from_str(&parsed.host) {
         vec![ip]
     } else {
-        let addrs = tokio::net::lookup_host(format!("{}:{}", parsed.host, parsed.port))
-            .await
-            .map_err(|e| {
-                RustyDnsError::Resolver(format!("bootstrap DNS failed for `{}`: {e}", parsed.host))
-            })?;
-        addrs.map(|sa| sa.ip()).collect()
+        bootstrap_resolve_with_retry(&parsed.host, parsed.port).await?
     };
 
     if ips.is_empty() {
@@ -621,6 +674,19 @@ mod tests {
             RustyDnsError::Resolver(msg) => assert!(msg.contains("NOTAREALTYPE")),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bootstrap_resolve_passes_through_for_ipv4_literal() {
+        // IPv4 literals are passed through in `build_name_servers`
+        // before this helper is consulted — but to keep the helper
+        // testable, exercise it directly with localhost. `localhost`
+        // is always resolvable on a developer box or CI runner, so
+        // it never trips the retry path.
+        let ips = bootstrap_resolve_with_retry("localhost", 53)
+            .await
+            .expect("localhost must resolve");
+        assert!(!ips.is_empty());
     }
 
     #[tokio::test]
