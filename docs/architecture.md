@@ -63,17 +63,17 @@ Authority answers are trusted answers. The authority never forwards to an upstre
 
 Recursive resolver forwarding to upstream servers using DoH (default) or DoQ. Privacy features applied to every outgoing query:
 
-| Feature | RFC | Default |
-|---------|-----|---------|
-| DNS-over-HTTPS upstream | RFC 8484 | ✓ (planned) |
-| TLS 1.3 minimum | RFC 8446 | ✓ (planned) |
-| Certificate validation (always-on, not configurable) | — | ✓ (planned) |
-| DNSSEC validation | RFC 4033–4035 | ✓ (planned) |
-| Query Name Minimisation | RFC 7816 | ✓ (planned) |
-| Strip EDNS0 Client Subnet | RFC 7871 | ✓ (planned) |
-| DoH query/response padding | RFC 8467 | ✓ (planned) |
-| Randomised upstream selection | — | ✓ (planned) |
-| Fail-closed (SERVFAIL, no stale fallback) | — | ✓ (planned) |
+| Feature | RFC | Status |
+|---------|-----|--------|
+| DNS-over-HTTPS upstream | RFC 8484 | ✓ implemented |
+| TLS 1.3 minimum | RFC 8446 | ✓ implemented (`upstream.min_tls_version`) |
+| Certificate validation (always-on, not configurable) | — | ✓ implemented (Mozilla bundle via `webpki-roots`) |
+| DNSSEC validation | RFC 4033–4035 | ✓ implemented (`upstream.dnssec_validation`) |
+| Strip EDNS0 Client Subnet | RFC 7871 | ✓ implemented (resolver never sets ECS) |
+| Randomised upstream selection | — | ✓ implemented (`upstream.randomize_upstream_selection`) |
+| Fail-closed (SERVFAIL, no stale fallback) | — | ✓ implemented (`upstream.fail_closed`) |
+| Query Name Minimisation | RFC 7816 | ⏳ pending (hickory 0.26 still doesn't expose qmin) |
+| DoH query/response padding | RFC 8467 | ⏳ pending (hickory 0.26 still doesn't expose RFC 8467) |
 
 **There is no stale-answer mode.** When `fail_closed = true` (the default), a failure of all upstreams returns `SERVFAIL`. Returning a stale answer without indicating staleness is a silent privacy degradation — a client might rely on that answer for a domain that has since changed, or the cached answer may have been for a different client's query.
 
