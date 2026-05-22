@@ -36,6 +36,13 @@ impl BlocklistLoader {
         let timeout = Duration::from_millis(config.fetch_timeout_ms);
         let client = Client::builder()
             .timeout(timeout)
+            // Defence in depth: validate_config already rejects http://
+            // sources, but if a future caller bypasses validation (or
+            // a redirect lands on http://), `https_only(true)` makes
+            // reqwest itself refuse plaintext at request time. The
+            // AGENTS.md privacy invariant "HTTPS-only blocklist
+            // sources" is then enforced in two places, not one.
+            .https_only(true)
             .build()
             .map_err(|e| RustyDnsError::Blocklist(format!("failed to build HTTP client: {e}")))?;
 
