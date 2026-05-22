@@ -40,7 +40,7 @@ mod mesh;
 
 pub use mesh::{LoadedBundle, MeshBundleError};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -202,21 +202,7 @@ impl Authority {
             return None;
         }
 
-        let matching: Vec<DnsRecord> = snap
-            .records
-            .get(&key)
-            .map(|recs| {
-                if rtype == "ANY" {
-                    recs.clone()
-                } else {
-                    recs.iter()
-                        .filter(|r| r.type_name() == rtype)
-                        .cloned()
-                        .collect()
-                }
-            })
-            .unwrap_or_default();
-
+        let matching = collect_with_cname_chain(self, &key, &rtype, &snap);
         tracing::trace!(qtype = %rtype, count = matching.len(), "authority lookup");
         Some(matching)
     }
@@ -256,6 +242,149 @@ impl Authority {
             .filter(|r| r.mesh_node_id.is_some())
             .count()
     }
+}
+
+/// Maximum number of CNAME hops to follow inside the authority's zones
+/// before giving up.
+///
+/// RFC 1034 §3.6.2 expects authoritative servers to chase intra-zone
+/// CNAME chains so a stub resolver can answer with one round-trip. We
+/// cap the depth to bound work per query and to break alias cycles
+/// (which would otherwise loop forever).
+///
+/// 8 hops is generous — real chains in mesh deployments are 1–2 deep.
+const MAX_CNAME_DEPTH: usize = 8;
+
+/// Resolve `name` for `rtype` against `snap`, following intra-zone CNAME
+/// chains.
+///
+/// Behaviour:
+/// - If a non-CNAME record of `rtype` exists directly at `name`, return
+///   those records and stop (RFC 1034: a name with non-CNAME RRs must
+///   not also have a CNAME).
+/// - If `rtype == "CNAME"` or `rtype == "ANY"`, return the literal set
+///   at `name` without chasing.
+/// - Otherwise, if a CNAME exists at `name`, follow its target. Append
+///   each CNAME on the path to the answer; if the chain reaches a
+///   terminal record of `rtype`, append those too.
+/// - Stop and return the partial chain when the target leaves the
+///   authority's zones (the daemon's resolver pipeline will then chase
+///   the rest), when a loop is detected, or when [`MAX_CNAME_DEPTH`] is
+///   exceeded.
+///
+/// Authoritative NXDOMAIN (name in zone but no records of requested
+/// type and no CNAME) returns an empty vector — the caller then emits
+/// a NoError / NoData response.
+fn collect_with_cname_chain(
+    auth: &Authority,
+    name: &str,
+    rtype: &str,
+    snap: &Snapshot,
+) -> Vec<DnsRecord> {
+    let records_at = |n: &str| snap.records.get(n);
+
+    let initial = records_at(name);
+    let direct: Vec<DnsRecord> = initial
+        .map(|recs| {
+            if rtype == "ANY" {
+                recs.clone()
+            } else {
+                recs.iter()
+                    .filter(|r| r.type_name() == rtype)
+                    .cloned()
+                    .collect()
+            }
+        })
+        .unwrap_or_default();
+
+    // Asked for CNAME / ANY explicitly, or we already have a non-CNAME
+    // direct answer of the requested type → no chasing.
+    if rtype == "CNAME" || rtype == "ANY" || !direct.is_empty() {
+        return direct;
+    }
+
+    // Direct answer empty for the requested type. If there's a CNAME at
+    // this name, follow it.
+    let Some(first_cname) = initial.and_then(|recs| {
+        recs.iter()
+            .find(|r| matches!(r.data, RecordData::Cname(_)))
+            .cloned()
+    }) else {
+        // No CNAME, no terminal record of `rtype` → authoritative
+        // empty (NoData).
+        return Vec::new();
+    };
+
+    let mut out: Vec<DnsRecord> = vec![first_cname.clone()];
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(name.to_string());
+
+    let mut next = match &first_cname.data {
+        RecordData::Cname(t) => t.clone(),
+        _ => return out,
+    };
+
+    for _ in 0..MAX_CNAME_DEPTH {
+        if !visited.insert(next.clone()) {
+            // Cycle. The CNAME author shot themselves in the foot. We
+            // log at debug — bumping to warn would log a (low-cardinality
+            // but still operator-visible) qname-shaped string, which
+            // we'd rather not do.
+            tracing::debug!(
+                qname = %name,
+                cycle_at = %next,
+                "CNAME loop in authority zone; truncating chain",
+            );
+            return out;
+        }
+
+        // Target outside authoritative scope. Return the partial chain;
+        // the daemon's resolver pipeline (or the client's stub) will
+        // chase from here.
+        if !auth.is_authoritative_for_normalised(&next, snap) {
+            return out;
+        }
+
+        let recs_at_next = records_at(&next);
+
+        // Terminal records of the requested type at the target?
+        if let Some(recs) = recs_at_next {
+            let terminal: Vec<DnsRecord> = recs
+                .iter()
+                .filter(|r| r.type_name() == rtype)
+                .cloned()
+                .collect();
+            if !terminal.is_empty() {
+                out.extend(terminal);
+                return out;
+            }
+
+            // Another CNAME hop?
+            if let Some(next_cname) = recs
+                .iter()
+                .find(|r| matches!(r.data, RecordData::Cname(_)))
+            {
+                out.push(next_cname.clone());
+                next = match &next_cname.data {
+                    RecordData::Cname(t) => t.clone(),
+                    _ => return out,
+                };
+                continue;
+            }
+        }
+
+        // Authoritative for the target, but neither a terminal record
+        // of `rtype` nor a further CNAME — authoritative NoData for
+        // the type at the chain end. Return the chain we have.
+        return out;
+    }
+
+    tracing::warn!(
+        qname = %name,
+        max_depth = MAX_CNAME_DEPTH,
+        "CNAME chain exceeded max depth in authority zone; truncating",
+    );
+    out
 }
 
 /// Build a [`Snapshot`] from the immutable static state plus the optional
@@ -914,5 +1043,186 @@ mod tests {
     fn mesh_record_count_zero_when_no_bundle() {
         let auth = Authority::new(cfg(vec![a("static.example.com", "10.0.0.1")])).unwrap();
         assert_eq!(auth.mesh_record_count(), 0);
+    }
+
+    // ----- CNAME chain following -----------------------------------------
+
+    fn cname(name: &str, target: &str) -> StaticRecord {
+        StaticRecord {
+            name: name.to_string(),
+            record_type: "CNAME".to_string(),
+            address: None,
+            target: Some(target.to_string()),
+            ttl: 300,
+            client_filter: None,
+        }
+    }
+
+    #[test]
+    fn cname_chain_resolves_intra_zone_one_hop() {
+        // alias → host (A=10.0.0.5). Query A=alias must return [CNAME, A].
+        let auth = Authority::new(cfg(vec![
+            cname("alias.lab.example.com", "host.lab.example.com"),
+            a("host.lab.example.com", "10.0.0.5"),
+        ]))
+        .unwrap();
+
+        let result = auth
+            .lookup("alias.lab.example.com", "A")
+            .expect("in zone");
+        assert_eq!(
+            result.len(),
+            2,
+            "expected [CNAME, A]; got: {result:?}"
+        );
+        assert_eq!(result[0].type_name(), "CNAME");
+        assert_eq!(result[1].type_name(), "A");
+        match &result[1].data {
+            RecordData::A(ip) => assert_eq!(ip.to_string(), "10.0.0.5"),
+            other => panic!("expected A record at end of chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cname_chain_resolves_two_hops() {
+        // a → b → c (A=10.0.0.7). Query A=a must return [CNAME(a→b),
+        // CNAME(b→c), A(c)].
+        let auth = Authority::new(cfg(vec![
+            cname("a.lab.example.com", "b.lab.example.com"),
+            cname("b.lab.example.com", "c.lab.example.com"),
+            a("c.lab.example.com", "10.0.0.7"),
+        ]))
+        .unwrap();
+
+        let result = auth.lookup("a.lab.example.com", "A").expect("in zone");
+        assert_eq!(result.len(), 3, "expected 2 CNAMEs + 1 A: {result:?}");
+        assert_eq!(result[0].type_name(), "CNAME");
+        assert_eq!(result[1].type_name(), "CNAME");
+        assert_eq!(result[2].type_name(), "A");
+    }
+
+    #[test]
+    fn cname_query_for_cname_type_returns_only_the_cname() {
+        // Asking explicitly for CNAME must NOT chase the chain.
+        let auth = Authority::new(cfg(vec![
+            cname("alias.lab.example.com", "host.lab.example.com"),
+            a("host.lab.example.com", "10.0.0.5"),
+        ]))
+        .unwrap();
+
+        let result = auth
+            .lookup("alias.lab.example.com", "CNAME")
+            .expect("in zone");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].type_name(), "CNAME");
+    }
+
+    #[test]
+    fn cname_loop_truncated_at_chain_head() {
+        // a → b → a. Query A=a must return the CNAMEs collected up to
+        // loop detection without spinning forever.
+        let auth = Authority::new(cfg(vec![
+            cname("a.lab.example.com", "b.lab.example.com"),
+            cname("b.lab.example.com", "a.lab.example.com"),
+        ]))
+        .unwrap();
+
+        let result = auth.lookup("a.lab.example.com", "A").expect("in zone");
+        // Both CNAMEs are recorded before the cycle is hit on the
+        // second visit of "a".
+        assert_eq!(
+            result.len(),
+            2,
+            "expected the two CNAMEs collected before loop trip: {result:?}",
+        );
+        assert!(result.iter().all(|r| r.type_name() == "CNAME"));
+    }
+
+    #[test]
+    fn cname_max_depth_truncates_chain() {
+        // 10 hops: 0 → 1 → 2 → ... → 9 (each a CNAME). MAX_CNAME_DEPTH
+        // is 8, so the answer must be capped at the first CNAME plus
+        // MAX_CNAME_DEPTH further CNAMEs collected during the chase.
+        let mut recs = Vec::new();
+        for i in 0..9 {
+            recs.push(cname(
+                &format!("h{i}.lab.example.com"),
+                &format!("h{}.lab.example.com", i + 1),
+            ));
+        }
+        // Terminal A so the chain *could* resolve if depth allowed it.
+        recs.push(a("h9.lab.example.com", "10.0.0.9"));
+
+        let auth = Authority::new(cfg(recs)).unwrap();
+        let result = auth.lookup("h0.lab.example.com", "A").expect("in zone");
+
+        // First CNAME pushed eagerly + up to MAX_CNAME_DEPTH hops chased.
+        assert!(
+            result.len() <= 1 + MAX_CNAME_DEPTH,
+            "chain length {} exceeds 1 + MAX_CNAME_DEPTH = {}: {result:?}",
+            result.len(),
+            1 + MAX_CNAME_DEPTH,
+        );
+        assert!(
+            result.iter().all(|r| r.type_name() == "CNAME"),
+            "expected only CNAMEs since terminal A is past the depth cap",
+        );
+    }
+
+    #[test]
+    fn cname_target_outside_zone_returns_partial_chain() {
+        // alias → external.example.org (not in any authoritative zone
+        // we own). Should return just the CNAME so the resolver
+        // pipeline can chase the rest.
+        let auth = Authority::new(cfg(vec![cname(
+            "alias.lab.example.com",
+            "external.example.org",
+        )]))
+        .unwrap();
+
+        let result = auth
+            .lookup("alias.lab.example.com", "A")
+            .expect("in zone");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].type_name(), "CNAME");
+    }
+
+    #[test]
+    fn cname_chain_into_mesh_zone_resolves() {
+        // alias.example.com → router.mesh — the target is inside our
+        // mesh zone (we're authoritative for it even without a bundle
+        // loaded, so the chase will land in an authoritative-NoData
+        // state and return the CNAME alone).
+        let auth = Authority::new(cfg(vec![cname(
+            "alias.example.com",
+            "router.mesh",
+        )]))
+        .unwrap();
+
+        let result = auth.lookup("alias.example.com", "A").expect("in zone");
+        // Mesh zone is authoritative; no record at router.mesh in this
+        // test → return the single CNAME (authoritative NoData at the
+        // chain end).
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].type_name(), "CNAME");
+    }
+
+    #[test]
+    fn cname_direct_a_wins_over_chain() {
+        // A name with both an A and a CNAME shouldn't normally exist
+        // per RFC 1034, but if static config carries one we prefer the
+        // direct answer of the requested type and do NOT chase the
+        // CNAME. (Defensive.)
+        let auth = Authority::new(cfg(vec![
+            a("host.lab.example.com", "10.0.0.5"),
+            cname("host.lab.example.com", "other.lab.example.com"),
+        ]))
+        .unwrap();
+
+        let result = auth
+            .lookup("host.lab.example.com", "A")
+            .expect("in zone");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].type_name(), "A");
     }
 }
