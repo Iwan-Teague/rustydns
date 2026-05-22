@@ -28,11 +28,26 @@ trade-offs — performance, convenience, feature completeness — are secondary.
 
 ### Prerequisites
 
-- Rust 1.75+ (install from [rustup.rs](https://rustup.rs))
-- Linux with systemd (for the hardened service unit)
+- Rust **1.88+** (install from [rustup.rs](https://rustup.rs)) — pinned by `hickory 0.26`
+- Linux with systemd, **or** Docker, for the production-hardened deployment paths
 - A DoH upstream resolver (e.g. `https://dns.quad9.net/dns-query`)
 
-### Build
+### Run with Docker (fastest path)
+
+```sh
+git clone https://github.com/Iwan-Teague/rustydns.git
+cd rustydns
+cp rustydns.example.toml rustydns.toml
+$EDITOR rustydns.toml
+docker compose up -d
+```
+
+The shipped `docker-compose.yml` enforces the AGENTS.md security posture:
+read-only rootfs, `cap_drop: ALL` + `CAP_NET_BIND_SERVICE`,
+`no-new-privileges`, json-file log cap. Full image walkthrough lives in
+[`docs/deployment-docker.md`](docs/deployment-docker.md).
+
+### Build from source
 
 ```sh
 git clone https://github.com/Iwan-Teague/rustydns.git
@@ -40,7 +55,7 @@ cd rustydns
 cargo build --release
 ```
 
-### Install
+### Install on systemd
 
 ```sh
 sudo bash scripts/install.sh
