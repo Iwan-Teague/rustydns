@@ -131,17 +131,21 @@ For a detailed description of each component, see [`docs/architecture.md`](docs/
 
 ## Privacy Features
 
-| Feature                         | Status    | RFC       |
-|---------------------------------|-----------|-----------|
-| DNS-over-HTTPS upstream         | Planned   | RFC 8484  |
-| DNS-over-QUIC upstream          | Planned   | RFC 9250  |
-| EDNS0 Client Subnet stripping   | Planned   | RFC 7871  |
-| Query Name Minimisation         | Planned   | RFC 7816  |
-| Query padding                   | Planned   | RFC 8467  |
-| DNSSEC validation               | Planned   | RFC 4033  |
-| Randomised upstream selection   | Planned   | —         |
-| Client IP anonymisation (/16)   | Implemented | —      |
-| In-memory query logs only       | Implemented | —      |
+| Feature                                  | Status                                  | RFC       |
+|------------------------------------------|-----------------------------------------|-----------|
+| DNS-over-HTTPS upstream                  | Implemented                             | RFC 8484  |
+| DNS-over-QUIC upstream                   | Implemented (via hickory `quic-ring`)   | RFC 9250  |
+| DNS-over-TLS listener                    | Implemented (`server.dot_listen`)       | RFC 7858  |
+| DNS-over-HTTPS listener                  | Implemented (`server.doh_listen`)       | RFC 8484  |
+| TLS 1.3 floor for upstreams              | Implemented (`upstream.min_tls_version`)| RFC 8446  |
+| EDNS0 Client Subnet stripping            | Implemented (never set on upstreams)    | RFC 7871  |
+| DNSSEC validation                        | Implemented (`upstream.dnssec_validation`) | RFC 4033 |
+| Randomised upstream selection            | Implemented (`upstream.randomize_upstream_selection`) | — |
+| Fail-closed on upstream failure          | Implemented (`upstream.fail_closed`)    | —         |
+| Client IP anonymisation (/16 IPv4, /64 IPv6) | Implemented                         | —         |
+| In-memory query log (hashed qname, anonymised client) | Implemented                | —         |
+| Query Name Minimisation                  | Pending (hickory 0.26 doesn't expose)   | RFC 7816  |
+| Query/response padding                   | Pending (hickory 0.26 doesn't expose)   | RFC 8467  |
 
 ---
 
