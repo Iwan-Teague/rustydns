@@ -15,6 +15,21 @@ HTTPS (TLS) ensures:
 - **Integrity** — a network attacker cannot modify the list.
 - **Authenticity** — the server presenting the TLS certificate is the configured host.
 
+### Defence-in-depth on the fetcher
+
+`validate_config` rejects `http://` sources at parse time (primary defence), and
+on top of that the HTTP client itself is configured to refuse plaintext:
+
+- `reqwest::Client::builder().https_only(true)` — any request that would touch
+  plain HTTP, including after a 3xx redirect, fails at request time. A
+  compromised TLS endpoint that redirects to `http://attacker.example/list`
+  cannot downgrade the fetch.
+- Redirect chain capped at 3 hops (vs reqwest's default of 10) so a misconfigured
+  or hostile endpoint cannot walk the loader through an unbounded chain.
+- Identifying `User-Agent`: `rustydnsd/<version> (+<repo url>)` — visible to
+  blocklist hosts so they can attribute traffic, shape rate limits, and reach
+  out about a misbehaving release without packet captures.
+
 ### What HTTPS does not protect
 
 HTTPS does not protect against:
