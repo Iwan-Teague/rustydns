@@ -953,3 +953,223 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
 
     Ok(())
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A baseline-valid config. Every test starts from this and mutates
+    /// the single field under examination so failures are unambiguous.
+    fn baseline() -> DnsConfig {
+        DnsConfig {
+            server: ServerConfig::default(),
+            upstream: UpstreamConfig::default(),
+            authority: AuthorityConfig::default(),
+            blocklist: BlocklistConfig::default(),
+            privacy: PrivacyConfig::default(),
+            metrics: MetricsConfig::default(),
+            policy: Vec::new(),
+        }
+    }
+
+    fn assert_config_err(result: Result<(), crate::RustyDnsError>, needle: &str) {
+        match result {
+            Ok(()) => panic!("expected Err containing `{needle}`, got Ok"),
+            Err(crate::RustyDnsError::Config(msg)) => {
+                assert!(
+                    msg.contains(needle),
+                    "error message did not contain `{needle}`:\n  {msg}"
+                );
+            }
+            Err(other) => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn baseline_config_validates() {
+        validate_config(&baseline()).expect("baseline must pass");
+    }
+
+    // --- server -----------------------------------------------------
+
+    #[test]
+    fn mesh_zone_without_trailing_dot_rejected() {
+        let mut cfg = baseline();
+        cfg.server.mesh_zone = "mesh".to_string();
+        assert_config_err(validate_config(&cfg), "must end with '.'");
+    }
+
+    #[test]
+    fn dot_listen_without_cert_rejected() {
+        let mut cfg = baseline();
+        cfg.server.dot_listen = Some("0.0.0.0:853".to_string());
+        assert_config_err(validate_config(&cfg), "tls_cert_path");
+    }
+
+    // --- upstream ---------------------------------------------------
+
+    #[test]
+    fn empty_resolver_list_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.resolvers.clear();
+        assert_config_err(validate_config(&cfg), "empty");
+    }
+
+    #[test]
+    fn http_resolver_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.resolvers = vec!["http://insecure.example/dns-query".to_string()];
+        assert_config_err(validate_config(&cfg), "plain HTTP");
+    }
+
+    #[test]
+    fn zero_timeout_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.timeout_ms = 0;
+        assert_config_err(validate_config(&cfg), "timeout_ms = 0");
+    }
+
+    #[test]
+    fn excessive_cache_size_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.max_cache_entries = 500_001;
+        assert_config_err(validate_config(&cfg), "500,000");
+    }
+
+    // --- blocklist --------------------------------------------------
+
+    #[test]
+    fn http_blocklist_source_rejected() {
+        let mut cfg = baseline();
+        cfg.blocklist.sources = vec!["http://insecure.example/list".to_string()];
+        assert_config_err(validate_config(&cfg), "plain HTTP");
+    }
+
+    #[test]
+    fn reload_interval_too_short_rejected() {
+        let mut cfg = baseline();
+        cfg.blocklist.reload_interval_secs = 60; // < 300
+        assert_config_err(validate_config(&cfg), "Minimum is 300");
+    }
+
+    #[test]
+    fn reload_interval_zero_is_allowed() {
+        let mut cfg = baseline();
+        cfg.blocklist.reload_interval_secs = 0;
+        validate_config(&cfg).expect("0 means SIGHUP-only — explicitly allowed");
+    }
+
+    #[test]
+    fn malformed_sinkhole_ip_rejected_when_sinkhole_response() {
+        let mut cfg = baseline();
+        cfg.blocklist.block_response = BlockResponse::Sinkhole;
+        cfg.blocklist.sinkhole_ip = "not-an-ip".to_string();
+        assert_config_err(validate_config(&cfg), "not a valid IPv4 or IPv6");
+    }
+
+    #[test]
+    fn single_label_allowlist_rejected() {
+        let mut cfg = baseline();
+        cfg.blocklist.allowlist = vec!["*.com".to_string()];
+        assert_config_err(validate_config(&cfg), "single-label");
+    }
+
+    #[test]
+    fn multi_label_allowlist_passes() {
+        let mut cfg = baseline();
+        cfg.blocklist.allowlist = vec![
+            "safe.example.com".to_string(),
+            "*.example.org".to_string(),
+        ];
+        validate_config(&cfg).expect("legitimate allowlist entries must pass");
+    }
+
+    // --- privacy ----------------------------------------------------
+
+    #[test]
+    fn excessive_ring_buffer_rejected() {
+        let mut cfg = baseline();
+        cfg.privacy.query_log_ring_size = 100_001;
+        assert_config_err(validate_config(&cfg), "100,000");
+    }
+
+    // --- metrics ----------------------------------------------------
+
+    #[test]
+    fn metrics_listen_invalid_socket_rejected() {
+        let mut cfg = baseline();
+        cfg.metrics.listen = "not-a-socket".to_string();
+        assert_config_err(validate_config(&cfg), "not a valid socket address");
+    }
+
+    // --- policy -----------------------------------------------------
+
+    fn empty_policy() -> NodePolicy {
+        NodePolicy {
+            node_id: None,
+            client_ip: None,
+            blocklist_bypass: false,
+            zones_allowed: Vec::new(),
+            log_all_queries: false,
+        }
+    }
+
+    #[test]
+    fn policy_without_any_identifier_rejected() {
+        let mut cfg = baseline();
+        cfg.policy = vec![empty_policy()];
+        assert_config_err(validate_config(&cfg), "at least one of `node_id` or `client_ip`");
+    }
+
+    #[test]
+    fn policy_node_id_without_ed25519_prefix_rejected() {
+        let mut cfg = baseline();
+        let mut p = empty_policy();
+        p.node_id = Some("not-a-key".to_string());
+        cfg.policy = vec![p];
+        assert_config_err(validate_config(&cfg), "ed25519:");
+    }
+
+    #[test]
+    fn policy_malformed_client_ip_rejected() {
+        let mut cfg = baseline();
+        let mut p = empty_policy();
+        p.client_ip = Some("999.999.999.999".to_string());
+        cfg.policy = vec![p];
+        assert_config_err(validate_config(&cfg), "not a valid IPv4 or IPv6");
+    }
+
+    #[test]
+    fn policy_with_client_ip_passes() {
+        let mut cfg = baseline();
+        let mut p = empty_policy();
+        p.client_ip = Some("10.0.0.5".to_string());
+        cfg.policy = vec![p];
+        validate_config(&cfg).expect("client_ip-only policy must validate");
+    }
+
+    #[test]
+    fn policy_with_node_id_passes_with_warning() {
+        // node_id-only is currently a no-op at runtime but parses cleanly
+        // (warn emitted, not error).
+        let mut cfg = baseline();
+        let mut p = empty_policy();
+        p.node_id = Some("ed25519:test-pubkey".to_string());
+        cfg.policy = vec![p];
+        validate_config(&cfg).expect("node_id-only policy must validate");
+    }
+
+    #[test]
+    fn policy_with_both_identifiers_passes() {
+        let mut cfg = baseline();
+        let mut p = empty_policy();
+        p.node_id = Some("ed25519:test".to_string());
+        p.client_ip = Some("10.0.0.5".to_string());
+        cfg.policy = vec![p];
+        validate_config(&cfg).expect("both identifiers set must validate");
+    }
+}
