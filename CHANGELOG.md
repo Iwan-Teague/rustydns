@@ -51,12 +51,31 @@ This project does not yet follow semantic versioning — every change up to
 - Fail-closed: `AllUpstreamsFailed` returned from `resolve()` for
   every upstream error, never a stale or silently downgraded answer.
 - Randomised upstream selection.
+- DoQ (RFC 9250) upstreams wired via hickory `quic-ring` feature;
+  `protocol = "doq"` accepts `quic://` URLs.
+- Plain-mode upstreams accept bare `host:port` (e.g. `"8.8.8.8:53"`)
+  — `parse_upstream_url` synthesises a `"plain"` scheme so the rest
+  of the parser handles a single shape.
+- `validate_config` now rejects protocol/URL-scheme mismatches at
+  parse time (`doh` + `quic://`, `doq` + `https://`, `plain` with a
+  scheme), so a misconfiguration fails fast instead of bubbling up
+  as an opaque hickory connect error.
+- Resolved upstream URLs logged one-per-line at debug level so
+  operators can confirm rotation contents without re-reading config.
 - Plaintext upstream emits a persistent `warn!` containing
   "UNENCRYPTED" / "leaks" per AGENTS.md.
 
 ### Blocklist
 
 - HTTPS-only sources; HTTP rejected at startup.
+- Defence in depth on the fetcher itself: `reqwest::Client` is built
+  with `https_only(true)` so plaintext is refused at request time
+  too (including after a 3xx redirect), and the redirect chain is
+  capped at 3 hops (vs reqwest's default of 10) to bound exposure
+  to chain-walking endpoints.
+- Identifying `User-Agent` ("rustydnsd/<version> (+<repo url>)")
+  so blocklist hosts can attribute the traffic and rate-limit
+  intelligently.
 - Bounded fetch with `fetch_timeout_ms` and `max_fetch_bytes` caps.
 - Trusted/untrusted source distinction for RPZ passthru entries.
 - Hosts, plain, RPZ, and AdGuard formats auto-detected.
