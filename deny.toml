@@ -20,29 +20,15 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Yanked crates aren't an immediate vulnerability but they shouldn't
 # end up in a release either — fail CI so we notice before shipping.
 yanked = "deny"
-# Each ignored advisory MUST carry a rationale and a removal trigger.
-# Today every active ignore is in the hickory-resolver 0.24 / rustls
-# 0.21 / quinn 0.10 dep chain; they all resolve together when we
-# upgrade to hickory 0.26 (which uses rustls 0.23, ring 0.17, etc.).
-# Tracking comments live next to the TLS-1.3-floor TODO in
-# crates/rustydns-resolver/src/lib.rs.
+# Ignored advisories carry a rationale and a removal trigger.
 ignore = [
-    # hickory-proto 0.24 — O(n²) name compression CPU exhaustion.
-    # rustydns mitigates with a 256 KiB bundle cap and bounded
-    # blocklist fetches, so the practical exposure is small.
-    { id = "RUSTSEC-2024-0437", reason = "fixed by hickory 0.26 upgrade" },
-    # ring < 0.17 panic on overflow checking + unmaintained.
-    { id = "RUSTSEC-2025-0009", reason = "fixed by hickory 0.26 (pulls ring 0.17)" },
-    { id = "RUSTSEC-2025-0010", reason = "fixed by hickory 0.26 (pulls ring 0.17)" },
-    # rustls 0.21 family — name-constraint and CRL parsing bugs.
-    { id = "RUSTSEC-2025-0134", reason = "fixed by hickory 0.26 (rustls 0.23)" },
-    { id = "RUSTSEC-2026-0037", reason = "fixed by hickory 0.26 (rustls 0.23)" },
-    { id = "RUSTSEC-2026-0098", reason = "fixed by hickory 0.26 (rustls 0.23)" },
-    { id = "RUSTSEC-2026-0099", reason = "fixed by hickory 0.26 (rustls 0.23)" },
-    # quinn 0.10 — DoS in endpoint reset handling.
-    { id = "RUSTSEC-2026-0104", reason = "fixed by hickory 0.26 (quinn 0.11)" },
-    # rustls-pemfile 1 unmaintained.
-    { id = "RUSTSEC-2026-0119", reason = "fixed by hickory 0.26 (rustls-pemfile 2)" },
+    # rustls-pemfile 2.x is marked unmaintained but has no
+    # successor with the same API surface. We use it only inside
+    # `load_tls_config` for the DoT listener path, which currently
+    # bails before the call (hickory-server DoT integration is
+    # pending — see the TODO in `main.rs`). When DoT lands we'll
+    # migrate to `rustls-pki-types::pem` and drop this dep entirely.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained-only; dep is dead-code-gated until DoT lands" },
 ]
 
 # ---------------------------------------------------------------------------
@@ -74,13 +60,12 @@ deny = [
 # forces on us — that's tracked as a TODO in the resolver crate and
 # will resolve when we move to hickory 0.26+. Same for the duplicate
 # tokio-rustls.
-skip = [
-    { name = "rustls" },
-    { name = "tokio-rustls" },
-    { name = "rustls-pemfile" },
-    { name = "rustls-webpki" },
-    { name = "webpki-roots" },
-]
+# The hickory 0.26 upgrade aligned the rustls family on a single
+# version across the workspace, so we no longer need the skip list
+# that worked around the old hickory-0.24/rustls-0.21 split. Left
+# empty intentionally — any duplicate that appears in future will
+# trip the `multiple-versions = "warn"` lint above.
+skip = []
 
 # ---------------------------------------------------------------------------
 # Licenses

@@ -57,7 +57,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use hickory_server::server::ServerFuture;
+use hickory_server::Server;
 
 use blocklist_loader::BlocklistLoader;
 use doh as doh_server;
@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
         &config.policy,
     )?;
     let doh_handler = Arc::new(handler.clone());
-    let mut server = ServerFuture::new(handler);
+    let mut server = Server::new(handler);
 
     for addr in &config.server.listen {
         let udp = UdpSocket::bind(addr)
@@ -189,7 +189,10 @@ async fn main() -> Result<()> {
         let tcp = TcpListener::bind(addr)
             .await
             .with_context(|| format!("failed to bind TCP listener on {addr}"))?;
-        server.register_listener(tcp, Duration::from_secs(5));
+        // hickory 0.26 added a response-buffer-size param to
+        // register_listener. 4096 is the hickory default elsewhere
+        // in the crate.
+        server.register_listener(tcp, Duration::from_secs(5), 4096);
 
         info!(listen = %addr, "listening for DNS queries");
     }

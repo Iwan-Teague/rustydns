@@ -7,7 +7,6 @@
 //! forms of RFC 8484. The listener is HTTP/2 only — TLS termination is the
 //! reverse proxy's job (per `AGENTS.md`).
 
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,9 +26,10 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncoder};
-use hickory_server::authority::MessageRequest;
-use hickory_server::server::{Protocol, Request, RequestHandler, ResponseHandler, ResponseInfo};
+use hickory_proto::serialize::binary::BinEncoder;
+use hickory_server::net::NetError;
+use hickory_server::net::xfer::Protocol;
+use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 
 use rustydns_core::RustyDnsError;
 
@@ -110,23 +110,29 @@ async fn handle_dns_message(handler: Arc<DnsHandler>, src: SocketAddr, bytes: Ve
             .unwrap();
     }
 
-    let mut decoder = BinDecoder::new(&bytes);
-    let message = match MessageRequest::read(&mut decoder) {
-        Ok(message) => message,
+    // hickory 0.26 has Request::from_bytes which does the whole
+    // parse (header + queries + edns) in one shot. Cleaner than the
+    // old two-step.
+    let request = match Request::from_bytes(bytes, src, Protocol::Https) {
+        Ok(request) => request,
         Err(e) => {
             // Form errors are a client problem — return HTTP 400 rather
-            // than try to synthesise a DNS-format FormErr response
-            // (which would require a parsed Header we don't have).
+            // than synthesise a DNS-format FormErr response (which
+            // would require a parsed Header we don't have).
             warn!(src = %src, error = %e, "malformed DNS-over-HTTPS request");
             return bad_request("malformed DNS message");
         }
     };
 
-    let request = Request::new(message, src, Protocol::Https);
     let (tx, rx) = oneshot::channel();
     let response_handler = DohResponseHandler::new(tx);
 
-    handler.handle_request(&request, response_handler).await;
+    // hickory 0.26 added a `T: Time` type param to handle_request.
+    // Use the default Tokio time impl via turbofish; nothing in our
+    // handler reads it.
+    handler
+        .handle_request::<_, hickory_server::net::runtime::TokioTime>(&request, response_handler)
+        .await;
 
     let response_bytes = match timeout(DOH_TIMEOUT, rx).await {
         Ok(Ok(bytes)) => bytes,
@@ -170,9 +176,12 @@ impl DohResponseHandler {
 
 #[async_trait::async_trait]
 impl ResponseHandler for DohResponseHandler {
+    // hickory 0.26: MessageResponse moved to `zone_handler`,
+    // send_response returns `Result<ResponseInfo, NetError>` instead
+    // of `io::Result<ResponseInfo>`.
     async fn send_response<'a>(
         &mut self,
-        response: hickory_server::authority::MessageResponse<
+        response: hickory_server::zone_handler::MessageResponse<
             '_,
             'a,
             impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
@@ -180,13 +189,13 @@ impl ResponseHandler for DohResponseHandler {
             impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
             impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
         >,
-    ) -> io::Result<ResponseInfo> {
+    ) -> Result<ResponseInfo, NetError> {
         let mut buffer = Vec::with_capacity(512);
         let mut encoder = BinEncoder::new(&mut buffer);
         encoder.set_max_size(u16::MAX);
         let info = response
             .destructive_emit(&mut encoder)
-            .map_err(|e| io::Error::other(format!("encode error: {e}")))?;
+            .map_err(|e| NetError::Msg(format!("encode error: {e}")))?;
 
         let mut sender = self.sender.lock().await;
         if let Some(sender) = sender.take() {
@@ -313,11 +322,8 @@ mod tests {
     }
 
     fn build_query(name: &str, qtype: ProtoRecordType) -> Vec<u8> {
-        let mut msg = Message::new();
-        msg.set_id(0x4242)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query)
-            .set_recursion_desired(true);
+        let mut msg = Message::new(0x4242, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
         msg.add_query({
             let mut q = Query::new();
             q.set_name(ProtoName::from_ascii(name).unwrap())
@@ -356,11 +362,11 @@ mod tests {
         );
         let body = resp.bytes().await.unwrap();
         let dns = Message::from_bytes(&body).unwrap();
-        assert_eq!(dns.response_code(), ResponseCode::NoError);
-        assert!(dns.authoritative());
-        let answers = dns.answers();
+        assert_eq!(dns.metadata.response_code, ResponseCode::NoError);
+        assert!(dns.metadata.authoritative);
+        let answers = dns.answers;
         assert_eq!(answers.len(), 1);
-        match answers[0].data().unwrap() {
+        match &answers[0].data {
             RData::A(a) => assert_eq!(a.0.to_string(), "100.64.0.5"),
             other => panic!("expected A, got {other:?}"),
         }
@@ -387,8 +393,8 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body = resp.bytes().await.unwrap();
         let dns = Message::from_bytes(&body).unwrap();
-        assert_eq!(dns.response_code(), ResponseCode::NXDomain);
-        assert!(dns.answers().is_empty());
+        assert_eq!(dns.metadata.response_code, ResponseCode::NXDomain);
+        assert!(dns.answers.is_empty());
 
         shutdown.cancel();
     }

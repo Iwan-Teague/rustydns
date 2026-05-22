@@ -93,14 +93,27 @@ See `docs/operator-endpoints.md` for the full reference.
 - Per-crate `lib.rs` modules carry the security/privacy rules in
   their crate-level docs.
 
+### Upgraded
+
+- `hickory-{proto,resolver,server}` 0.24 → 0.26 across the
+  workspace. The 0.26 line uses `rustls 0.23` (matching axum/reqwest)
+  and `quinn 0.11`, clearing nine RUSTSEC advisories that had been
+  documented in `deny.toml` for the previous chain.
+- **TLS 1.3 floor enforcement now active.** `upstream.min_tls_version`
+  is honoured by a real `rustls::ClientConfig` built with
+  `with_protocol_versions(&[&TLS13])` (or `[TLS13, TLS12]` if 1.2 is
+  asked for). The previous workspace had to leave this as a
+  warning-only setting because hickory 0.24's internal rustls 0.21
+  wouldn't accept the workspace's rustls 0.23 config.
+
 ### Known deferrals
 
-- DNS-over-TLS listener — blocked on `hickory-server` upgrading
-  from rustls 0.21 to 0.23. Daemon errors with a clear
-  reverse-proxy workaround message if `dot_listen` is set.
-- RFC 8467 padding and RFC 7816 query name minimisation — not
-  currently exposed by hickory 0.24.
-- TLS 1.3 floor enforcement on upstreams — same hickory blocker.
+- DNS-over-TLS listener — hickory-server 0.26 exposes the right TLS
+  API but the daemon hasn't been wired to it yet; tracked as a
+  TODO in `main.rs`. Use a TLS-terminating reverse proxy in the
+  meantime.
+- RFC 8467 padding and RFC 7816 query name minimisation —
+  hickory 0.26's stub resolver still doesn't expose either.
 - Rustynet peer-table → `NodeId` resolution for the `node_id`
   half of `[[policy]]` — pending Rustynet-side work.
 - Disk persistence for the query log — `privacy.query_log_to_disk`

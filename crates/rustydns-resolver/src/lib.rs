@@ -17,9 +17,9 @@
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
 //! | Strip EDNS Client Subnet | RFC 7871 | ✓ | `privacy.no_edns_client_subnet = true` | implemented (we never set ECS) |
-//! | DoH query padding | RFC 8467 | ✓ | `privacy.upstream_padding = true` | **planned** (not exposed by hickory 0.24) |
-//! | Randomise upstream selection | — | ✓ | `privacy.randomize_upstream_selection = true` | implemented (hickory `shuffle_dns_servers`) |
-//! | Query Name Minimisation | RFC 7816 | ✓ | `privacy.query_minimization = true` | **planned** (not exposed by hickory 0.24 stub resolver) |
+//! | DoH query padding | RFC 8467 | ✓ | `privacy.upstream_padding = true` | **planned** (hickory 0.26 still doesn't expose RFC 8467) |
+//! | Randomise upstream selection | — | ✓ | `privacy.randomize_upstream_selection = true` | implemented (round-robin server-ordering strategy) |
+//! | Query Name Minimisation | RFC 7816 | ✓ | `privacy.query_minimization = true` | **planned** (hickory 0.26's stub resolver still doesn't apply qmin) |
 //!
 //! # Fail-closed guarantee
 //!
@@ -48,17 +48,19 @@
 //! - `qname` may appear at `debug` / `trace` (require explicit opt-in via
 //!   `RUST_LOG=debug`); prefer hashed or truncated forms.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_proto::rr::{RData, Record, RecordType};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::Resolver as HickoryResolver;
+use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{
-    NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts,
-    ServerOrderingStrategy,
+    NameServerConfig, ResolverConfig, ResolverOpts, ServerOrderingStrategy,
 };
-use hickory_resolver::error::{ResolveError, ResolveErrorKind};
+use hickory_resolver::net::NetError;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
 use rustydns_core::RustyDnsError;
 use rustydns_core::config::{DnsConfig, TlsVersion, UpstreamProtocol};
@@ -75,7 +77,7 @@ pub type ResolverResult<T> = Result<T, RustyDnsError>;
 #[derive(Debug)]
 pub struct Resolver {
     config: DnsConfig,
-    inner: TokioAsyncResolver,
+    inner: TokioResolver,
     /// The upstream URLs as configured — kept for logging only.
     upstream_urls: Vec<String>,
 }
@@ -117,32 +119,19 @@ impl Resolver {
             );
         }
 
-        // TLS version enforcement note: hickory-resolver 0.24 is pinned
-        // to rustls 0.21 internally while the rest of our workspace uses
-        // rustls 0.23 (axum, reqwest). Passing a custom TlsClientConfig
-        // would require linking both versions; for now we let hickory
-        // use its built-in TLS defaults (TLS 1.2+ with native roots and
-        // mandatory certificate validation). This is AGENTS.md-compliant
-        // (TLS 1.2 is accepted with a warning, TLS 1.3 is the default).
-        //
-        // TODO: enforce TLS 1.3 floor here once hickory upgrades to
-        //       rustls 0.23, at which point we can pass an
-        //       hickory_resolver::config::TlsClientConfig with
-        //       with_protocol_versions(&[&rustls::version::TLS13]).
-        if config.upstream.min_tls_version == TlsVersion::Tls13 {
-            tracing::debug!(
-                "TLS 1.3 floor requested but not yet enforceable due to hickory 0.24 / rustls 0.21 mismatch — \
-                 connections may still negotiate TLS 1.2. Tracked as a TODO in rustydns-resolver."
-            );
-        }
+        // TLS 1.3 floor: hickory-resolver 0.26 takes a rustls 0.23
+        // ClientConfig matching our workspace, so the configured
+        // `upstream.min_tls_version` actually pins the floor (instead
+        // of being a soft warning the way it was on 0.24).
+        let tls_client_config = build_tls_client_config(config.upstream.min_tls_version)?;
 
-        let mut group = NameServerConfigGroup::new();
+        let mut name_servers: Vec<NameServerConfig> = Vec::new();
         let mut configured_any = false;
         for url in &config.upstream.resolvers {
             match build_name_servers(url, config.upstream.protocol).await {
                 Ok(ns_configs) => {
                     for ns in ns_configs {
-                        group.push(ns);
+                        name_servers.push(ns);
                     }
                     configured_any = true;
                 }
@@ -164,7 +153,7 @@ impl Resolver {
             ));
         }
 
-        let resolver_config = ResolverConfig::from_parts(None, Vec::new(), group);
+        let resolver_config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
 
         let mut opts = ResolverOpts::default();
         // PRIVACY: never advertise EDNS0 Client Subnet. hickory does not
@@ -173,18 +162,30 @@ impl Resolver {
         opts.edns0 = config.upstream.dnssec_validation;
         opts.validate = config.upstream.dnssec_validation;
         opts.timeout = Duration::from_millis(config.upstream.timeout_ms);
-        opts.cache_size = config.upstream.max_cache_entries;
-        opts.use_hosts_file = false;
+        opts.cache_size = config.upstream.max_cache_entries as u64;
+        // Hickory 0.26 took an enum for use_hosts_file. We never want
+        // /etc/hosts consulted for upstream queries (it would leak
+        // mesh names to the OS resolver path on misconfigurations).
+        opts.use_hosts_file = hickory_resolver::config::ResolveHosts::Never;
         opts.preserve_intermediates = true;
-        opts.shuffle_dns_servers = config.privacy.randomize_upstream_selection;
+        // hickory 0.26 dropped `shuffle_dns_servers`; the equivalent is
+        // `ServerOrderingStrategy::RoundRobin` which distributes load
+        // uniformly over time. When randomisation is off we fall back
+        // to QueryStatistics so the healthiest provider gets preference.
         opts.server_ordering_strategy = if config.privacy.randomize_upstream_selection {
-            // We rely on `shuffle_dns_servers` for randomisation per query.
-            ServerOrderingStrategy::UserProvidedOrder
+            ServerOrderingStrategy::RoundRobin
         } else {
             ServerOrderingStrategy::QueryStatistics
         };
 
-        let inner = TokioAsyncResolver::tokio(resolver_config, opts);
+        let inner: TokioResolver =
+            HickoryResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+                .with_options(opts)
+                .with_tls_config((*tls_client_config).clone())
+                .build()
+                .map_err(|e| {
+                    RustyDnsError::Resolver(format!("hickory resolver build failed: {e}"))
+                })?;
 
         tracing::info!(
             resolvers   = config.upstream.resolvers.len(),
@@ -230,7 +231,7 @@ impl Resolver {
 
         match self.inner.lookup(name, record_type).await {
             Ok(lookup) => {
-                let records = lookup_to_dns_records(lookup.records());
+                let records = lookup_to_dns_records(lookup.answers());
                 tracing::trace!(qtype = %record_type, count = records.len(), "upstream answer");
                 Ok(records)
             }
@@ -238,33 +239,31 @@ impl Resolver {
         }
     }
 
-    /// Translate a hickory `ResolveError` into a `RustyDnsError`.
-    fn map_resolve_error(&self, e: ResolveError) -> ResolverResult<Vec<DnsRecord>> {
-        match e.kind() {
-            // No records is not an upstream failure — return empty vec.
-            ResolveErrorKind::NoRecordsFound { .. } => Ok(Vec::new()),
-            _ => {
-                // qname is inside e.to_string() in some kinds; we log
-                // only the error kind at warn level, never the full
-                // Display, to avoid leaking the query name. The full
-                // error chain is available at debug level for operators
-                // who explicitly opt in (RUST_LOG=rustydns_resolver=debug).
-                tracing::warn!(
-                    upstreams = self.upstream_urls.len(),
-                    kind = error_kind_label(&e),
-                    "upstream resolution failed"
-                );
-                tracing::debug!(
-                    upstreams = self.upstream_urls.len(),
-                    error     = %e,
-                    "upstream resolution failed (full error)"
-                );
-                if self.config.upstream.fail_closed {
-                    Err(RustyDnsError::AllUpstreamsFailed)
-                } else {
-                    Err(RustyDnsError::Resolver(error_kind_label(&e).to_string()))
-                }
-            }
+    /// Translate a hickory `NetError` into a `RustyDnsError`.
+    fn map_resolve_error(&self, e: NetError) -> ResolverResult<Vec<DnsRecord>> {
+        // No records is not an upstream failure — return empty vec.
+        if e.is_no_records_found() {
+            return Ok(Vec::new());
+        }
+        // qname is inside e.to_string() in some kinds; we log only the
+        // error kind at warn level, never the full Display, to avoid
+        // leaking the query name. The full error chain is available at
+        // debug level for operators who opt in via
+        // RUST_LOG=rustydns_resolver=debug.
+        tracing::warn!(
+            upstreams = self.upstream_urls.len(),
+            kind = error_kind_label(&e),
+            "upstream resolution failed"
+        );
+        tracing::debug!(
+            upstreams = self.upstream_urls.len(),
+            error     = %e,
+            "upstream resolution failed (full error)"
+        );
+        if self.config.upstream.fail_closed {
+            Err(RustyDnsError::AllUpstreamsFailed)
+        } else {
+            Err(RustyDnsError::Resolver(error_kind_label(&e).to_string()))
         }
     }
 }
@@ -391,32 +390,45 @@ async fn bootstrap_resolve_with_retry(host: &str, port: u16) -> ResolverResult<V
     )))
 }
 
+/// Build a rustls [`ClientConfig`] honouring the configured minimum
+/// TLS version. Uses the embedded Mozilla CA bundle via `webpki-roots`
+/// (deterministic; matches `CLAUDE.md` §"DoH upstream needs an
+/// explicit root-CA feature"). Returned as `Arc` so we can pass an
+/// owned `(*arc).clone()` into the hickory builder.
+fn build_tls_client_config(min_tls: TlsVersion) -> ResolverResult<Arc<rustls::ClientConfig>> {
+    // Install ring as the default crypto provider (idempotent —
+    // multiple installs are a no-op after the first). hickory 0.26
+    // with the `https-ring`/`quic-ring`/`dnssec-ring` features
+    // expects ring.
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let versions: &[&rustls::SupportedProtocolVersion] = match min_tls {
+        TlsVersion::Tls13 => &[&rustls::version::TLS13],
+        TlsVersion::Tls12 => &[&rustls::version::TLS13, &rustls::version::TLS12],
+    };
+
+    let cfg = rustls::ClientConfig::builder_with_protocol_versions(versions)
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(cfg))
+}
+
 /// Resolve `host` to one or more IP addresses via the OS resolver, then
-/// build one [`NameServerConfig`] per IP.
+/// build one [`NameServerConfig`] per IP using hickory 0.26's typed
+/// constructors (`NameServerConfig::https`, `quic`, `udp_and_tcp`).
 async fn build_name_servers(
     url: &str,
     protocol: UpstreamProtocol,
 ) -> ResolverResult<Vec<NameServerConfig>> {
     let parsed = parse_upstream_url(url, protocol)?;
 
-    let hickory_proto = match protocol {
-        UpstreamProtocol::Doh => Protocol::Https,
-        UpstreamProtocol::Doq => Protocol::Quic,
-        UpstreamProtocol::Plain => Protocol::Udp,
-    };
-
-    // Bootstrap-resolve via OS. This is the only point at which a name
-    // outside the encrypted channel is resolved by anything other than
-    // the configured DoH/DoQ providers. We document this in the module
-    // doc and AGENTS.md.
-    //
-    // The OS resolver can be transiently unavailable at startup —
-    // k8s init-container ordering, systemd `network-online.target`
-    // races, slow links. Rather than refusing to start on the first
-    // hiccup, we retry a small number of times with exponential
-    // backoff (1s → 2s → 4s, 7 seconds total). After the budget we
-    // bubble the error up; the caller logs a warn and tries the next
-    // upstream URL.
+    // Bootstrap-resolve via OS. The retry helper buys us ~7s of
+    // tolerance for k8s init-container races / systemd ordering
+    // hiccups before giving up. See `bootstrap_resolve_with_retry`.
     let ips: Vec<IpAddr> = if let Ok(ip) = IpAddr::from_str(&parsed.host) {
         vec![ip]
     } else {
@@ -430,29 +442,19 @@ async fn build_name_servers(
         )));
     }
 
-    let needs_tls = matches!(protocol, UpstreamProtocol::Doh | UpstreamProtocol::Doq);
+    let server_name: Arc<str> = Arc::from(parsed.host.as_str());
     let mut configs = Vec::with_capacity(ips.len());
     for ip in ips {
-        let ns = NameServerConfig {
-            socket_addr: SocketAddr::new(ip, parsed.port),
-            protocol: hickory_proto,
-            tls_dns_name: if needs_tls {
-                Some(parsed.host.clone())
-            } else {
-                None
-            },
-            trust_negative_responses: true,
-            // None → hickory builds its own rustls 0.21 client config.
-            // The root-CA store comes from hickory-resolver's `webpki-roots`
-            // or `native-certs` feature — one of them MUST be enabled in
-            // the workspace Cargo.toml. Without either, the default config
-            // has an empty RootCertStore and every cert fails as
-            // `UnknownIssuer`, which hickory surfaces opaquely as
-            // `proto error: io error: invalid data` at our log level.
-            // See CLAUDE.md §"DoH upstream needs an explicit root-CA feature".
-            // See also the TLS 1.3 floor TODO in Resolver::new.
-            tls_config: None,
-            bind_addr: None,
+        let ns = match protocol {
+            UpstreamProtocol::Doh => NameServerConfig::https(
+                ip,
+                server_name.clone(),
+                // RFC 8484 says /dns-query by default. We don't surface
+                // the URL path yet; hickory uses the default.
+                None,
+            ),
+            UpstreamProtocol::Doq => NameServerConfig::quic(ip, server_name.clone()),
+            UpstreamProtocol::Plain => NameServerConfig::udp_and_tcp(ip),
         };
         configs.push(ns);
     }
@@ -474,11 +476,14 @@ fn lookup_to_dns_records(records: &[Record]) -> Vec<DnsRecord> {
 }
 
 fn record_to_dns_record(rec: &Record) -> Option<DnsRecord> {
-    let data = rdata_to_record_data(rec.data()?)?;
+    // hickory 0.26 exposes Record fields publicly; accessor methods
+    // only live on the borrowed `RecordRef` newtype. For owned/&Record
+    // we go through the fields directly.
+    let data = rdata_to_record_data(&rec.data)?;
     Some(DnsRecord::new(
-        rec.name().to_utf8(),
+        rec.name.to_utf8(),
         data,
-        Duration::from_secs(u64::from(rec.ttl())),
+        Duration::from_secs(u64::from(rec.ttl)),
     ))
 }
 
@@ -490,31 +495,35 @@ fn rdata_to_record_data(rdata: &RData) -> Option<RecordData> {
         RData::PTR(p) => Some(RecordData::Ptr(p.0.to_utf8())),
         RData::NS(n) => Some(RecordData::Ns(n.0.to_utf8())),
         RData::MX(mx) => Some(RecordData::Mx {
-            preference: mx.preference(),
-            exchange: mx.exchange().to_utf8(),
+            preference: mx.preference,
+            exchange: mx.exchange.to_utf8(),
         }),
         RData::SRV(s) => Some(RecordData::Srv {
-            priority: s.priority(),
-            weight: s.weight(),
-            port: s.port(),
-            target: s.target().to_utf8(),
+            priority: s.priority,
+            weight: s.weight,
+            port: s.port,
+            target: s.target.to_utf8(),
         }),
         RData::TXT(t) => Some(RecordData::Txt(
-            t.txt_data().iter().map(|b| b.to_vec()).collect(),
+            t.txt_data.iter().map(|b| b.to_vec()).collect(),
         )),
         _ => None, // record types we don't model are dropped
     }
 }
 
-fn error_kind_label(e: &ResolveError) -> &'static str {
-    match e.kind() {
-        ResolveErrorKind::Message(_) => "message",
-        ResolveErrorKind::Msg(_) => "msg",
-        ResolveErrorKind::NoConnections => "no-connections",
-        ResolveErrorKind::NoRecordsFound { .. } => "no-records",
-        ResolveErrorKind::Io(_) => "io",
-        ResolveErrorKind::Proto(_) => "proto",
-        ResolveErrorKind::Timeout => "timeout",
+fn error_kind_label(e: &NetError) -> &'static str {
+    // hickory 0.26 collapsed the old `ResolveErrorKind` into NetError
+    // with semantic accessors. Map the common shapes back to the short
+    // labels we already use in metrics + tracing fields.
+    if e.is_no_records_found() {
+        return "no-records";
+    }
+    match e {
+        NetError::Busy => "busy",
+        NetError::Dns(_) => "dns",
+        NetError::Message(_) | NetError::Msg(_) => "message",
+        NetError::NoConnections => "no-connections",
+        NetError::Proto(_) => "proto",
         _ => "other",
     }
 }

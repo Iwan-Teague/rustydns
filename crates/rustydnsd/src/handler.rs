@@ -5,11 +5,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hickory_proto::op::{Header, OpCode, ResponseCode};
+use hickory_proto::op::{Header, HeaderCounts, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, PTR, SRV, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
-use hickory_server::authority::MessageResponseBuilder;
+use hickory_server::net::runtime::Time;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
+use hickory_server::zone_handler::MessageResponseBuilder;
 use tracing::{debug, warn};
 
 use rustydns_authority::Authority;
@@ -187,17 +188,26 @@ impl DnsHandler {
         authoritative: bool,
         answers: Vec<Record>,
     ) -> ResponseInfo {
-        if let Some(edns) = request.edns() {
-            builder.edns(edns.clone());
+        // hickory 0.26: Request derefs to MessageRequest, and the
+        // EDNS opt-record lives on `MessageRequest::edns` directly.
+        // The builder's `.edns()` now takes `&Edns` (borrowed,
+        // tied to the request's lifetime).
+        if let Some(edns) = request.edns.as_ref() {
+            builder.edns(edns);
         }
 
-        let mut header = Header::response_from_request(request.header());
-        header.set_response_code(response_code);
-        header.set_authoritative(authoritative);
-        header.set_recursion_available(true);
+        // hickory 0.26 split `Header` into `{ metadata, counts }`,
+        // and `MessageResponseBuilder::build` takes `Metadata`
+        // directly (counts are computed by the encoder). Mutate the
+        // response metadata's public fields in place — no setters
+        // anymore.
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.response_code = response_code;
+        metadata.authoritative = authoritative;
+        metadata.recursion_available = true;
 
         let response = builder.build(
-            header,
+            metadata,
             answers.iter(),
             std::iter::empty::<&Record>(),
             std::iter::empty::<&Record>(),
@@ -208,7 +218,17 @@ impl DnsHandler {
             Ok(info) => info,
             Err(e) => {
                 warn!(error = %e, "failed to send DNS response");
-                Header::new().into()
+                // On the unrecoverable send-side error we return a
+                // synthetic ResponseInfo so the trait sig is satisfied.
+                Header {
+                    metadata: Metadata::new(
+                        0,
+                        hickory_proto::op::MessageType::Response,
+                        OpCode::Query,
+                    ),
+                    counts: HeaderCounts::default(),
+                }
+                .into()
             }
         }
     }
@@ -252,12 +272,43 @@ impl DnsHandler {
 
 #[async_trait]
 impl RequestHandler for DnsHandler {
-    async fn handle_request<R: ResponseHandler>(
+    // hickory 0.26 added a `T: Time` type parameter to handle_request.
+    // We don't use it ourselves — it lets the server's transport layer
+    // plug in its own time impl — but the trait sig now requires it.
+    async fn handle_request<R: ResponseHandler, T: Time>(
         &self,
         request: &Request,
         response_handle: R,
     ) -> ResponseInfo {
-        let info = request.request_info();
+        // `request_info()` now returns Result. A malformed multi-query
+        // message would Err here; we treat that as the moral equivalent
+        // of the old class-mismatch branch and SERVFAIL.
+        let info = match request.request_info() {
+            Ok(info) => info,
+            Err(_) => {
+                let builder = MessageResponseBuilder::from_message_request(request);
+                let client = ClientId::from_ip(request.src().ip());
+                let policy = self.resolve_policy(request.src().ip());
+                self.log_query(
+                    &policy,
+                    &client,
+                    "",
+                    "?",
+                    ResponseCode::FormErr,
+                    ServedBy::Rejected,
+                );
+                return self
+                    .respond(
+                        request,
+                        response_handle,
+                        builder,
+                        ResponseCode::FormErr,
+                        false,
+                        Vec::new(),
+                    )
+                    .await;
+            }
+        };
         let qname = info.query.name().to_string();
         let qtype = info.query.query_type();
         let qclass = info.query.query_class();
@@ -272,7 +323,9 @@ impl RequestHandler for DnsHandler {
         // class rejections) honours `log_all_queries`.
         let policy = self.resolve_policy(info.src.ip());
 
-        if request.op_code() != OpCode::Query {
+        // hickory 0.26 dropped the `op_code()` accessor; it's now a
+        // public field on the deref'd MessageRequest's metadata.
+        if request.metadata.op_code != OpCode::Query {
             let builder = MessageResponseBuilder::from_message_request(request);
             self.log_query(
                 &policy,
@@ -571,7 +624,7 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{Name as ProtoName, RecordType as ProtoRecordType};
     use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
-    use hickory_server::server::ServerFuture;
+    use hickory_server::Server;
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
 
@@ -595,7 +648,7 @@ mod tests {
         query_log: Arc<crate::query_log::QueryLog>,
         // Hold the server future so it isn't dropped (which would shut
         // the listener down). The test drops it at the end of scope.
-        _server: ServerFuture<DnsHandler>,
+        _server: Server<DnsHandler>,
     }
 
     async fn build_harness(
@@ -692,9 +745,9 @@ mod tests {
             .await
             .expect("bind tcp on same port");
 
-        let mut server = ServerFuture::new(handler);
+        let mut server = Server::new(handler);
         server.register_socket(udp);
-        server.register_listener(tcp, Duration::from_secs(5));
+        server.register_listener(tcp, Duration::from_secs(5), 4096);
 
         Harness {
             port,
@@ -710,11 +763,8 @@ mod tests {
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .expect("tcp connect");
-        let mut msg = Message::new();
-        msg.set_id(0x1234)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query)
-            .set_recursion_desired(true);
+        let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
         msg.add_query({
             let mut q = Query::new();
             q.set_name(ProtoName::from_ascii(name).unwrap())
@@ -737,11 +787,8 @@ mod tests {
     /// Send a question over UDP, return the parsed response.
     async fn query(port: u16, name: &str, rtype: ProtoRecordType) -> Message {
         let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
-        let mut msg = Message::new();
-        msg.set_id(0x1234)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query)
-            .set_recursion_desired(true);
+        let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
         let name = ProtoName::from_ascii(name).expect("name parse");
         msg.add_query({
             let mut q = Query::new();
@@ -784,11 +831,14 @@ mod tests {
 
         let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
 
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        assert!(resp.authoritative(), "authority hit must set the aa flag");
-        let answers = resp.answers();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            resp.metadata.authoritative,
+            "authority hit must set the aa flag"
+        );
+        let answers = resp.answers;
         assert_eq!(answers.len(), 1, "exactly one A record expected");
-        let rdata = answers[0].data().expect("rdata");
+        let rdata = &answers[0].data;
         let ip = match rdata {
             hickory_proto::rr::RData::A(a) => a.0.to_string(),
             other => panic!("expected A, got {other:?}"),
@@ -812,14 +862,14 @@ mod tests {
         let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
 
         assert_eq!(
-            resp.response_code(),
+            resp.metadata.response_code,
             ResponseCode::NoError,
             "authority record must NOT be blocked by the blocklist"
         );
-        assert!(resp.authoritative());
-        let answers = resp.answers();
+        assert!(resp.metadata.authoritative);
+        let answers = resp.answers;
         assert_eq!(answers.len(), 1);
-        match answers[0].data().unwrap() {
+        match &answers[0].data {
             hickory_proto::rr::RData::A(a) => assert_eq!(a.0.to_string(), "10.0.0.99"),
             other => panic!("expected A, got {other:?}"),
         }
@@ -837,8 +887,8 @@ mod tests {
 
         let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
 
-        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
-        assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(resp.answers.len(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -852,7 +902,7 @@ mod tests {
         .await;
 
         let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
-        assert_eq!(resp.response_code(), ResponseCode::Refused);
+        assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -874,11 +924,11 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resp.response_code(),
+            resp.metadata.response_code,
             ResponseCode::ServFail,
             "fail-closed must return SERVFAIL when no upstream is reachable"
         );
-        assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.answers.len(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -942,10 +992,10 @@ mod tests {
 
         let resp = query_tcp(harness.port, "router.mesh.", ProtoRecordType::A).await;
 
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        assert!(resp.authoritative());
-        assert_eq!(resp.answers().len(), 1);
-        match resp.answers()[0].data().unwrap() {
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(resp.metadata.authoritative);
+        assert_eq!(resp.answers.len(), 1);
+        match &resp.answers[0].data {
             hickory_proto::rr::RData::A(a) => assert_eq!(a.0.to_string(), "100.64.0.5"),
             other => panic!("expected A, got {other:?}"),
         }
@@ -966,7 +1016,7 @@ mod tests {
             ProtoRecordType::A,
         )
         .await;
-        assert_eq!(resp.response_code(), ResponseCode::ServFail);
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -992,7 +1042,7 @@ mod tests {
         .await;
         let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
         assert_eq!(
-            resp.response_code(),
+            resp.metadata.response_code,
             ResponseCode::ServFail,
             "blocklist_bypass should let the query reach the resolver, which then fail-closes"
         );
@@ -1019,13 +1069,13 @@ mod tests {
 
         // In-zone query still works.
         let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
 
         // Out-of-zone query → REFUSED, pipeline never consulted.
         let resp = query(harness.port, "example.com.", ProtoRecordType::A).await;
-        assert_eq!(resp.response_code(), ResponseCode::Refused);
-        assert!(resp.answers().is_empty());
+        assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
+        assert!(resp.answers.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1052,7 +1102,7 @@ mod tests {
         .await;
 
         let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
 
         // Buffer entry exists — same shape as non-audited paths.
         let snap = harness.query_log.snapshot();
@@ -1081,7 +1131,7 @@ mod tests {
         .await;
         // Query from 127.0.0.1 should still be blocked (policy is for 10.0.0.5).
         let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
-        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
     }
 
     #[test]
@@ -1115,10 +1165,7 @@ mod tests {
         .await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut msg = Message::new();
-        msg.set_id(1)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Update); // not Query
+        let mut msg = Message::new(1, MessageType::Query, OpCode::Update); // not Query
         let n = ProtoName::from_ascii("ignored.example.").unwrap();
         msg.add_query({
             let mut q = Query::new();
@@ -1138,6 +1185,6 @@ mod tests {
             .unwrap()
             .unwrap();
         let resp = Message::from_bytes(&buf[..n]).unwrap();
-        assert_eq!(resp.response_code(), ResponseCode::NotImp);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NotImp);
     }
 }

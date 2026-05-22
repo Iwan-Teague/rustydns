@@ -24,9 +24,9 @@ tokio      = { version = "1",   features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # DNS — hickory-* ONLY (trust-dns-* is unmaintained, do not add)
-hickory-server   = { version = "0.24", features = ["dns-over-rustls"] }
-hickory-proto    = "0.24"
-hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "dns-over-quic", "dnssec-ring", "webpki-roots"] }
+hickory-server   = { version = "0.26", features = ["tls-ring"] }
+hickory-proto    = "0.26"
+hickory-resolver = { version = "0.26", features = ["https-ring", "quic-ring", "dnssec-ring", "webpki-roots"] }
 
 # HTTP / TLS — rustls backend only, no openssl
 axum              = { version = "0.7", features = ["http2"] }
@@ -73,7 +73,7 @@ futures-util = "0.3"
 moka = { version = "0.12", features = ["future"] }
 
 # Prometheus metrics
-prometheus = "0.13"
+prometheus = "0.14"
 
 # Verifies the ed25519 signature on the Rustynet dns-zone bundle.
 # `default-features = false` drops `rand_core` from the public API surface,
