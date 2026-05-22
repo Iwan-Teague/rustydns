@@ -543,16 +543,56 @@ mod tests {
         )
         .expect("handler");
 
-        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
-        let port = socket.local_addr().unwrap().port();
+        // Bind UDP first, capture the assigned port, then bind TCP on
+        // the same port so a single Harness exposes BOTH transports.
+        // The OS rarely reuses the UDP port for TCP automatically, so
+        // we explicitly request it.
+        let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let port = udp.local_addr().unwrap().port();
+        let tcp = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .expect("bind tcp on same port");
+
         let mut server = ServerFuture::new(handler);
-        server.register_socket(socket);
+        server.register_socket(udp);
+        server.register_listener(tcp, Duration::from_secs(5));
 
         Harness {
             port,
             query_log,
             _server: server,
         }
+    }
+
+    /// Send a question over TCP using the standard 2-byte length prefix
+    /// from RFC 1035 §4.2.2. Returns the parsed response.
+    async fn query_tcp(port: u16, name: &str, rtype: ProtoRecordType) -> Message {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("tcp connect");
+        let mut msg = Message::new();
+        msg.set_id(0x1234)
+            .set_message_type(MessageType::Query)
+            .set_op_code(OpCode::Query)
+            .set_recursion_desired(true);
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(ProtoName::from_ascii(name).unwrap())
+                .set_query_type(rtype);
+            q
+        });
+        let bytes = msg.to_bytes().expect("encode");
+        let len = (bytes.len() as u16).to_be_bytes();
+        stream.write_all(&len).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp).await.unwrap();
+        Message::from_bytes(&resp).expect("decode tcp response")
     }
 
     /// Send a question over UDP, return the parsed response.
@@ -733,6 +773,49 @@ mod tests {
         assert_eq!(snap[2].qname_hash, h_authority);
         assert_eq!(snap[1].qname_hash, h_block);
         assert_eq!(snap[0].qname_hash, h_resolver);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tcp_listener_serves_authority_hit() {
+        // Same scenario as the UDP authority-hit test, but over TCP
+        // (with the 2-byte length prefix). Pins that
+        // `register_listener` is wired into the same DnsHandler and
+        // that the TCP encode/decode round-trip is intact.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        let resp = query_tcp(harness.port, "router.mesh.", ProtoRecordType::A).await;
+
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.authoritative());
+        assert_eq!(resp.answers().len(), 1);
+        match resp.answers()[0].data().unwrap() {
+            hickory_proto::rr::RData::A(a) => assert_eq!(a.0.to_string(), "100.64.0.5"),
+            other => panic!("expected A, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tcp_listener_returns_servfail_when_upstream_fails() {
+        let harness = build_harness(
+            vec![],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let resp = query_tcp(
+            harness.port,
+            "tcp-uncached.example.test.",
+            ProtoRecordType::A,
+        )
+        .await;
+        assert_eq!(resp.response_code(), ResponseCode::ServFail);
     }
 
     #[tokio::test(flavor = "current_thread")]
