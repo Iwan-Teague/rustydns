@@ -198,6 +198,14 @@ impl Resolver {
             cache_size  = config.upstream.max_cache_entries,
             "resolver initialised"
         );
+        // Emit the actual upstream URLs at debug level so operators can
+        // confirm which providers are loaded without reading the config
+        // file back. Upstream URLs are not sensitive — they're well-known
+        // public endpoints — but they're noisy enough to warrant `debug`
+        // rather than `info`.
+        for url in &config.upstream.resolvers {
+            tracing::debug!(upstream = %url, "resolver upstream loaded");
+        }
 
         let upstream_urls = config.upstream.resolvers.clone();
         Ok(Self {
