@@ -37,6 +37,16 @@ impl BlocklistLoader {
         let timeout = Duration::from_millis(config.fetch_timeout_ms);
         let client = Client::builder()
             .timeout(timeout)
+            // Set a stable, identifiable User-Agent so blocklist
+            // hosts can attribute traffic to rustydnsd (helps them
+            // shape rate limits and reach out about abuse). Includes
+            // the package version so a misbehaving release can be
+            // identified server-side without a packet capture.
+            .user_agent(concat!(
+                "rustydnsd/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/Iwan-Teague/rustydns)"
+            ))
             // Defence in depth: validate_config already rejects http://
             // sources, but if a future caller bypasses validation (or
             // a redirect lands on http://), `https_only(true)` makes
