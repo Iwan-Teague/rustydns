@@ -1,0 +1,83 @@
+# rustydnsd — example docker-compose deployment.
+#
+# Intended as an opinionated starting point, not a one-size-fits-all. The
+# defaults below match the security posture documented in AGENTS.md:
+#   - read-only root filesystem
+#   - non-root user (set in the image, not here)
+#   - dropped capabilities except CAP_NET_BIND_SERVICE (needed for :53)
+#   - no Docker secrets exposed via env — config is mounted as a file
+#   - metrics endpoint stays inside the container network (loopback-only
+#     by design; scrape from a sidecar if you need it externally)
+#
+# Usage:
+#   1. Copy rustydns.example.toml to ./rustydns.toml and edit it.
+#   2. If you use the Rustynet mesh feature, drop the signed
+#      `mesh-zone.bin` and `mesh-zone.pub` into ./mesh/.
+#   3. `docker compose up -d`
+#
+# To upgrade later: `docker compose pull && docker compose up -d`.
+
+services:
+  rustydnsd:
+    build: .
+    # When publishing images, swap `build:` for an explicit tag, e.g.:
+    # image: ghcr.io/iwan-teague/rustydnsd:0.1.0
+    container_name: rustydnsd
+    restart: unless-stopped
+
+    # Bind the DNS ports. UDP+TCP/53 for plain DNS, TCP/853 for DoT,
+    # TCP/8053 for DoH. The /metrics + /health + /queries endpoint on
+    # :9153 is intentionally NOT published — keep it loopback-only and
+    # scrape via a sidecar that joins this container's network namespace.
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "853:853/tcp"
+      - "8053:8053/tcp"
+
+    # Read-only rootfs. The daemon writes nothing to its image; the only
+    # writable surfaces are the explicit volumes below and a tmpfs for
+    # /tmp (rustls + tokio occasionally need scratch space).
+    read_only: true
+    tmpfs:
+      - /tmp:size=16M,mode=1777
+
+    # Drop everything except the one capability the daemon needs to bind
+    # privileged ports. `setcap` on the binary is the in-container
+    # equivalent, but cap_add here makes the intent explicit at the
+    # orchestrator level and survives image rebuilds that forget setcap.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+    # Defence in depth: refuse setuid escalation inside the container.
+    security_opt:
+      - no-new-privileges:true
+
+    # Mounts. Config is read-only; the mesh bundle directory is read-only
+    # because rustydnsd never writes to it (the publisher does, out of
+    # band). /var/lib/rustydns is a tiny tmpfs in case the daemon ever
+    # needs a writable working dir — currently unused.
+    volumes:
+      - ./rustydns.toml:/etc/rustydns/rustydns.toml:ro
+      - ./mesh:/var/lib/rustydns/mesh:ro
+
+    # Compose-level healthcheck mirrors the one baked into the image so
+    # `docker compose ps` shows accurate state. Override here if you've
+    # moved the metrics port in rustydns.toml.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9153/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    # Conservative logging cap. Without this, journald/json-file can
+    # eat the disk if the daemon ever ends up in a tight log loop
+    # (e.g. a misconfigured upstream).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
