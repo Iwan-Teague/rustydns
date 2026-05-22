@@ -1,0 +1,51 @@
+# Keep the Docker build context small and avoid leaking host artefacts
+# or secrets into the image. The builder stage only needs the workspace
+# Cargo manifests, lockfile, source tree under `crates/`, and `deny.toml`.
+
+# --- Build artefacts ---------------------------------------------------------
+# `target/` on the host can be many GiB; never ship it to the daemon.
+target/
+**/target/
+
+# --- VCS / CI metadata ------------------------------------------------------
+.git
+.gitignore
+.github
+.gitattributes
+
+# --- Editor / IDE state -----------------------------------------------------
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+
+# --- Docs / non-source ------------------------------------------------------
+# These don't influence the binary; excluding them shrinks the context
+# and avoids cache-busting on doc-only edits.
+README.md
+CHANGELOG.md
+SECURITY.md
+CLAUDE.md
+AGENTS.md
+LICENSE-MIT
+LICENSE-APACHE
+docs/
+install/
+scripts/
+
+# --- Local config / secrets -------------------------------------------------
+# rustydns.toml is mounted at runtime under /etc/rustydns/rustydns.toml.
+# Never bake an operator's config (which may contain DoH tokens) into the
+# image.
+rustydns.toml
+rustydns.example.toml
+*.pem
+*.key
+*.crt
+
+# --- Container infra itself -------------------------------------------------
+# The Dockerfile is read by the daemon (`docker build`), not by the build
+# context tar.
+Dockerfile
+.dockerignore
