@@ -1193,6 +1193,36 @@ mod tests {
     }
 
     #[test]
+    fn cname_chain_into_mesh_zone_resolves_to_bundle_record() {
+        // Static CNAME alias.example.com → router.mesh; bundle loads
+        // router.mesh A=100.64.0.7. Chase must cross from the static
+        // zone into the mesh zone and return [CNAME, A].
+        let (bundle_path, key_path) = make_bundle(&[("router", "100.64.0.7")], "mesh");
+
+        let config = AuthorityConfig {
+            mesh_zone_bundle_path: Some(bundle_path),
+            mesh_zone_verifier_key_path: Some(key_path),
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records: vec![cname("alias.example.com", "router.mesh")],
+            poll_interval_secs: 30,
+        };
+        let auth = Authority::new(config).unwrap();
+
+        let result = auth.lookup("alias.example.com", "A").expect("in zone");
+        assert_eq!(
+            result.len(),
+            2,
+            "expected [CNAME → router.mesh, A=100.64.0.7]: {result:?}",
+        );
+        assert_eq!(result[0].type_name(), "CNAME");
+        match &result[1].data {
+            RecordData::A(ip) => assert_eq!(ip.to_string(), "100.64.0.7"),
+            other => panic!("expected terminal A, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cname_direct_a_wins_over_chain() {
         // A name with both an A and a CNAME shouldn't normally exist
         // per RFC 1034, but if static config carries one we prefer the
