@@ -77,3 +77,36 @@ jobs:
           cp rustydns.example.toml /tmp/rustydns-ci.toml
           chmod 600 /tmp/rustydns-ci.toml
           ./target/release/rustydnsd --config /tmp/rustydns-ci.toml --validate-config
+
+  docker:
+    name: Docker image smoke build
+    runs-on: ubuntu-latest
+    # Independent of the cargo cache in `test`; runs in parallel so a
+    # broken Dockerfile is caught on PR without serialising behind the
+    # cargo build.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: rustydnsd:ci
+          # GHA cache backend keeps successive PR builds fast without
+          # leaking the layer to a registry.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke run: --version inside the image
+        # Confirms the binary actually executes under the non-root user
+        # with the dropped capabilities. We override the entrypoint
+        # because tini-then-rustydnsd would otherwise wait on a config
+        # file we haven't mounted.
+        run: |
+          docker run --rm --entrypoint /usr/local/bin/rustydnsd \
+            rustydnsd:ci --version
