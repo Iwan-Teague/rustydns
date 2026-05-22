@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::Client;
+use reqwest::redirect::Policy as RedirectPolicy;
 use tracing::{info, warn};
 
 use rustydns_blocklist::{BlocklistEngine, BlocklistSource};
@@ -43,6 +44,13 @@ impl BlocklistLoader {
             // AGENTS.md privacy invariant "HTTPS-only blocklist
             // sources" is then enforced in two places, not one.
             .https_only(true)
+            // reqwest's default of 10 redirects gives a 3xx-chain
+            // operator far too much rope. Three hops covers normal
+            // host-rename / CDN-edge patterns (e.g. raw.githubusercontent
+            // → ...cdn.github.com → ...blob) without letting a
+            // misconfigured (or hostile) endpoint walk the loader
+            // through an unbounded chain.
+            .redirect(RedirectPolicy::limited(3))
             .build()
             .map_err(|e| RustyDnsError::Blocklist(format!("failed to build HTTP client: {e}")))?;
 
