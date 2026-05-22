@@ -283,7 +283,17 @@ mod tests {
 
         let resolver = Arc::new(Resolver::new(dns_config).await.unwrap());
         let query_log = Arc::new(crate::query_log::QueryLog::new(64));
-        Arc::new(DnsHandler::new(authority, blocklist, resolver, metrics, query_log).unwrap())
+        Arc::new(
+            DnsHandler::new(
+                authority,
+                blocklist,
+                resolver,
+                metrics,
+                query_log,
+                &[],
+            )
+            .unwrap(),
+        )
     }
 
     /// Boot a DoH listener on a random port. Returns `(base_url, shutdown_token)`.

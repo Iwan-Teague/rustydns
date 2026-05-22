@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 use rustydns_authority::Authority;
 use rustydns_blocklist::BlocklistEngine;
 use rustydns_core::client::ClientId;
-use rustydns_core::config::BlockResponse;
+use rustydns_core::config::{BlockResponse, NodePolicy};
 use rustydns_core::record::{DnsRecord, RecordData};
 use rustydns_core::RustyDnsError;
 use rustydns_resolver::Resolver;
@@ -23,7 +23,19 @@ use rustydns_resolver::Resolver;
 use crate::metrics::Metrics;
 use crate::query_log::{QueryLog, ServedBy};
 
+use std::collections::HashMap;
+
 const SINKHOLE_TTL_SECS: u32 = 60;
+
+/// Resolved per-client policy decision for one query.
+///
+/// Built once per query from the source IP. `None` for clients with no
+/// matching `[[policy]]` entry — the pipeline runs with defaults.
+#[derive(Debug, Clone, Default)]
+struct PolicyDecision {
+    blocklist_bypass: bool,
+    zones_allowed: Vec<String>,
+}
 
 /// DNS request handler implementing Authority -> Blocklist -> Resolver.
 #[derive(Clone)]
@@ -34,6 +46,11 @@ pub struct DnsHandler {
     metrics: Arc<Metrics>,
     query_log: Arc<QueryLog>,
     sinkhole_ip: Option<IpAddr>,
+    /// IP-keyed policy table. Rebuilt at startup; constant for the
+    /// lifetime of the handler. SIGHUP-driven reload of policy is a
+    /// separate TODO (would require config reload, currently only
+    /// blocklist + mesh reload on HUP).
+    policy_by_ip: Arc<HashMap<IpAddr, NodePolicy>>,
 }
 
 impl DnsHandler {
@@ -45,6 +62,7 @@ impl DnsHandler {
         resolver: Arc<Resolver>,
         metrics: Arc<Metrics>,
         query_log: Arc<QueryLog>,
+        policies: &[NodePolicy],
     ) -> Result<Self, RustyDnsError> {
         let sinkhole_ip = if blocklist.block_response() == BlockResponse::Sinkhole {
             Some(IpAddr::from_str(blocklist.sinkhole_ip()).map_err(|_| {
@@ -57,6 +75,31 @@ impl DnsHandler {
             None
         };
 
+        // Build the IP-keyed lookup table once. validate_config already
+        // rejected unparseable client_ip values, so the parse can't fail
+        // here in practice — log and skip if it somehow does.
+        let mut policy_by_ip: HashMap<IpAddr, NodePolicy> = HashMap::new();
+        for policy in policies {
+            if let Some(ip_str) = &policy.client_ip {
+                match ip_str.parse::<IpAddr>() {
+                    Ok(ip) => {
+                        if policy_by_ip.insert(ip, policy.clone()).is_some() {
+                            warn!(
+                                client_ip = %ip,
+                                "duplicate [[policy]] entries for the same client_ip; \
+                                 the later one wins — review your rustydns.toml"
+                            );
+                        }
+                    }
+                    Err(_) => warn!(
+                        client_ip = %ip_str,
+                        "policy.client_ip failed late parse; this should have been caught \
+                         by validate_config — ignoring this entry"
+                    ),
+                }
+            }
+        }
+
         Ok(Self {
             authority,
             blocklist,
@@ -64,7 +107,20 @@ impl DnsHandler {
             metrics,
             query_log,
             sinkhole_ip,
+            policy_by_ip: Arc::new(policy_by_ip),
         })
+    }
+
+    /// Resolve the per-query policy for `src_ip`. Returns the default
+    /// (no restrictions) when no `[[policy]]` entry matches.
+    fn resolve_policy(&self, src_ip: IpAddr) -> PolicyDecision {
+        match self.policy_by_ip.get(&src_ip) {
+            Some(p) => PolicyDecision {
+                blocklist_bypass: p.blocklist_bypass,
+                zones_allowed: p.zones_allowed.clone(),
+            },
+            None => PolicyDecision::default(),
+        }
     }
 
     /// Borrow the query log buffer (for inspection / future
@@ -198,7 +254,22 @@ impl RequestHandler for DnsHandler {
         // PRIVACY: qname logged at debug only; do not enable debug in production.
         debug!(client = %client.anonymized(), qname = %qname, qtype = %qtype, "query received");
 
+        let policy = self.resolve_policy(info.src.ip());
+
         let builder = MessageResponseBuilder::from_message_request(request);
+
+        // Zone allowlist: if the policy restricts this client to a set
+        // of zones, refuse anything outside that set BEFORE consulting
+        // the pipeline. Mesh-local quarantine clients never even probe
+        // the resolver / blocklist.
+        if !policy.zones_allowed.is_empty() && !name_in_any_zone(&qname, &policy.zones_allowed) {
+            warn!(client = %client.anonymized(), "policy denied: name outside zones_allowed");
+            let builder = MessageResponseBuilder::from_message_request(request);
+            self.log_query(&client, &qname, &qtype_str, ResponseCode::Refused, ServedBy::Rejected);
+            return self
+                .respond(request, response_handle, builder, ResponseCode::Refused, false, Vec::new())
+                .await;
+        }
 
         if let Some(records) = self.authority.lookup(&qname, &qtype_str) {
             self.metrics.inc_authority_hits();
@@ -209,7 +280,7 @@ impl RequestHandler for DnsHandler {
                 .await;
         }
 
-        if self.blocklist.is_blocked(&qname) {
+        if !policy.blocklist_bypass && self.blocklist.is_blocked(&qname) {
             self.metrics.inc_blocklist_hits();
             // PRIVACY: qname logged at debug only; do not enable debug in production.
             debug!(client = %client.anonymized(), qname = %qname, "query blocked");
@@ -260,6 +331,30 @@ impl RequestHandler for DnsHandler {
             }
         }
     }
+}
+
+/// Returns `true` if `qname` falls within any of the configured
+/// `zones_allowed` entries (case-insensitive, trailing-dot tolerant
+/// subdomain match). The empty list case is handled by the caller
+/// (treated as "no restriction").
+fn name_in_any_zone(qname: &str, zones: &[String]) -> bool {
+    let lower = qname.trim_end_matches('.').to_ascii_lowercase();
+    for zone in zones {
+        let z = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+        if z.is_empty() {
+            continue;
+        }
+        if lower == z {
+            return true;
+        }
+        if lower.len() > z.len()
+            && lower.ends_with(&z)
+            && lower.as_bytes()[lower.len() - z.len() - 1] == b'.'
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Map a hickory `RecordType` Display string to a stable `&'static str`.
@@ -338,8 +433,11 @@ mod tests {
     use rustydns_authority::Authority;
     use rustydns_blocklist::BlocklistEngine;
     use rustydns_core::config::{
-        AuthorityConfig, BlockResponse, BlocklistConfig, DnsConfig, StaticRecord, UpstreamConfig,
+        AuthorityConfig, BlockResponse, BlocklistConfig, DnsConfig, NodePolicy, StaticRecord,
+        UpstreamConfig,
     };
+
+    use super::name_in_any_zone;
     use rustydns_resolver::Resolver;
 
     use crate::handler::DnsHandler;
@@ -360,6 +458,23 @@ mod tests {
         blocklist_lines: &str,
         upstream_resolvers: Vec<String>,
         block_response: BlockResponse,
+    ) -> Harness {
+        build_harness_with_policies(
+            static_records,
+            blocklist_lines,
+            upstream_resolvers,
+            block_response,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn build_harness_with_policies(
+        static_records: Vec<StaticRecord>,
+        blocklist_lines: &str,
+        upstream_resolvers: Vec<String>,
+        block_response: BlockResponse,
+        policies: Vec<NodePolicy>,
     ) -> Harness {
         let metrics = Arc::new(Metrics::new().expect("metrics"));
 
@@ -409,9 +524,15 @@ mod tests {
         );
 
         let query_log = Arc::new(crate::query_log::QueryLog::new(64));
-        let handler =
-            DnsHandler::new(authority, blocklist, resolver, metrics, query_log.clone())
-                .expect("handler");
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log.clone(),
+            &policies,
+        )
+        .expect("handler");
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         let port = socket.local_addr().unwrap().port();
@@ -603,6 +724,106 @@ mod tests {
         assert_eq!(snap[2].qname_hash, h_authority);
         assert_eq!(snap[1].qname_hash, h_block);
         assert_eq!(snap[0].qname_hash, h_resolver);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_blocklist_bypass_lets_blocked_name_through() {
+        // The query loopback originates from 127.0.0.1, so put a policy
+        // for that IP. With blocklist_bypass = true the same name that
+        // the blocklist would block must reach the resolver — which
+        // will fail-closed → SERVFAIL because the upstream is bogus.
+        let policy = NodePolicy {
+            node_id: None,
+            client_ip: Some("127.0.0.1".to_string()),
+            blocklist_bypass: true,
+            zones_allowed: Vec::new(),
+            log_all_queries: false,
+        };
+        let harness = build_harness_with_policies(
+            vec![],
+            "0.0.0.0 ads.example.com\n",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+            vec![policy],
+        )
+        .await;
+        let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.response_code(),
+            ResponseCode::ServFail,
+            "blocklist_bypass should let the query reach the resolver, which then fail-closes"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_zones_allowed_refuses_out_of_scope_query() {
+        // Restrict 127.0.0.1 to mesh.* only.
+        let policy = NodePolicy {
+            node_id: None,
+            client_ip: Some("127.0.0.1".to_string()),
+            blocklist_bypass: false,
+            zones_allowed: vec!["mesh.".to_string()],
+            log_all_queries: false,
+        };
+        let harness = build_harness_with_policies(
+            vec![static_a("router.mesh", "100.64.0.1")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+            vec![policy],
+        )
+        .await;
+
+        // In-zone query still works.
+        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.answers().len(), 1);
+
+        // Out-of-zone query → REFUSED, pipeline never consulted.
+        let resp = query(harness.port, "example.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.response_code(), ResponseCode::Refused);
+        assert!(resp.answers().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_does_not_match_other_clients() {
+        // Policy keyed to 10.0.0.5 — must NOT affect 127.0.0.1.
+        let policy = NodePolicy {
+            node_id: None,
+            client_ip: Some("10.0.0.5".to_string()),
+            blocklist_bypass: true,
+            zones_allowed: Vec::new(),
+            log_all_queries: false,
+        };
+        let harness = build_harness_with_policies(
+            vec![],
+            "0.0.0.0 ads.example.com\n",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+            vec![policy],
+        )
+        .await;
+        // Query from 127.0.0.1 should still be blocked (policy is for 10.0.0.5).
+        let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
+    }
+
+    #[test]
+    fn name_in_any_zone_handles_trailing_dot_and_case() {
+        let zones = vec!["MESH.".to_string(), "lab.example.com".to_string()];
+        assert!(name_in_any_zone("router.mesh.", &zones));
+        assert!(name_in_any_zone("Router.MESH", &zones));
+        assert!(name_in_any_zone("nas.lab.example.com.", &zones));
+        // Zone apex itself matches.
+        assert!(name_in_any_zone("mesh", &zones));
+        // Not a subdomain — "meshx" must not match "mesh".
+        assert!(!name_in_any_zone("meshx", &zones));
+        // Outside any zone.
+        assert!(!name_in_any_zone("example.com", &zones));
+        // Empty zone list: caller treats as no restriction; we don't
+        // exercise that path through this helper but the predicate
+        // returns false for "matches nothing".
+        assert!(!name_in_any_zone("anything", &[]));
     }
 
     #[tokio::test(flavor = "current_thread")]

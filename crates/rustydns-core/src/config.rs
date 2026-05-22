@@ -579,20 +579,48 @@ impl Default for MetricsConfig {
 // Per-node policy
 // ---------------------------------------------------------------------------
 
-/// Per-Rustynet-node DNS policy override.
+/// Per-client DNS policy override.
+///
+/// At least one of `node_id` or `client_ip` must be set; configs with
+/// neither are rejected at startup.
+///
+/// # Matching
+///
+/// Until the Rustynet peer-table integration arrives, only `client_ip`
+/// is actively matched. A policy with `node_id` set parses cleanly but
+/// the runtime currently never matches it — `node_id` is reserved for
+/// the future peer-table lookup. See `docs/integration-rustynet.md`.
 ///
 /// In TOML, declare as `[[policy]]` (array of tables):
 ///
 /// ```toml
+/// # IP-keyed (works today):
 /// [[policy]]
-/// node_id = "ed25519:AbCdEf..."
+/// client_ip        = "10.0.0.5"
 /// blocklist_bypass = true
+///
+/// # NodeId-keyed (schema accepted; matching deferred):
+/// [[policy]]
+/// node_id       = "ed25519:AbCdEf..."
+/// zones_allowed = ["mesh."]
 /// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct NodePolicy {
     /// Rustynet node ID (`ed25519:<base64-pubkey>`).
-    /// Format is validated at startup.
-    pub node_id: String,
+    ///
+    /// Currently **not enforced at runtime** — pending peer-table
+    /// integration that maps the source IP of a query back to the
+    /// Rustynet NodeId. Validation still runs (the prefix must be
+    /// `ed25519:`) so existing configs continue to parse.
+    #[serde(default)]
+    pub node_id: Option<String>,
+
+    /// IPv4 or IPv6 literal that this policy applies to.
+    ///
+    /// Matched against the source IP of every incoming query. Use
+    /// this until the NodeId-based path is wired up.
+    #[serde(default)]
+    pub client_ip: Option<String>,
 
     /// Allow this node to bypass the blocklist. Default: `false`.
     ///
@@ -603,7 +631,10 @@ pub struct NodePolicy {
 
     /// Restrict this node to resolving only these zones. Default: `[]` (unrestricted).
     ///
-    /// Useful for quarantining guest or untrusted nodes to internal resolution only.
+    /// A query for a name outside every listed zone is refused with
+    /// `REFUSED` before the pipeline is consulted. Useful for
+    /// quarantining guest or untrusted nodes to internal resolution
+    /// only.
     #[serde(default)]
     pub zones_allowed: Vec<String>,
 
@@ -889,13 +920,34 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
 
     // --- Per-node policy ---------------------------------------------------------
 
-    for policy in &cfg.policy {
-        if !policy.node_id.starts_with("ed25519:") {
-            return Err(crate::RustyDnsError::Config(format!(
-                "policy.node_id `{}` does not start with `ed25519:`. \
-                 Expected format: `ed25519:<base64-pubkey>`.",
-                policy.node_id
-            )));
+    for (idx, policy) in cfg.policy.iter().enumerate() {
+        match (&policy.node_id, &policy.client_ip) {
+            (None, None) => {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "policy[{idx}] must set at least one of `node_id` or `client_ip`",
+                )));
+            }
+            (Some(node_id), _) if !node_id.starts_with("ed25519:") => {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "policy[{idx}].node_id `{node_id}` does not start with `ed25519:`. \
+                     Expected format: `ed25519:<base64-pubkey>`."
+                )));
+            }
+            _ => {}
+        }
+        if let Some(ip) = &policy.client_ip {
+            if ip.parse::<std::net::IpAddr>().is_err() {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "policy[{idx}].client_ip `{ip}` is not a valid IPv4 or IPv6 literal"
+                )));
+            }
+        }
+        if policy.node_id.is_some() && policy.client_ip.is_none() {
+            tracing::warn!(
+                "policy[{idx}].node_id is configured but Rustynet peer-table integration \
+                 is not yet implemented — this policy will not match any incoming query. \
+                 Add `client_ip` to enforce it today."
+            );
         }
     }
 

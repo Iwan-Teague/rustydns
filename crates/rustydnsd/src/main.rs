@@ -167,6 +167,7 @@ async fn main() -> Result<()> {
         resolver,
         metrics.clone(),
         query_log.clone(),
+        &config.policy,
     )?;
     let doh_handler = Arc::new(handler.clone());
     let mut server = ServerFuture::new(handler);

@@ -247,23 +247,23 @@ path   = "/metrics"
 # Use [[policy]] (TOML array of tables) for each node entry.
 # ---------------------------------------------------------------------------
 
+# A policy matches by EITHER `node_id` (Rustynet NodeId, schema accepted
+# but matching is pending peer-table integration) OR `client_ip` (works
+# today). At least one must be set.
+
+# Example: a known server allowed to resolve ad-network names for testing.
 # [[policy]]
-# # Node identifier in the Rusty Suite mesh (format: ed25519:<base64pubkey>).
-# node_id = "ed25519:AbCdEf..."
-#
-# # Allow this node to bypass the blocklist.
-# # ⚠ SECURITY: Grants the node unrestricted DNS resolution. Only enable for
-# #   nodes that legitimately need it (e.g. a local DNS testing tool).
-# blocklist_bypass = false
-#
-# # Restrict this node to resolving names only in these zones.
-# # Empty list = no restriction.
-# zones_allowed = []
-#
-# # Log all queries from this node regardless of the global log_client_ips setting.
-# # Requires log_client_ips = true to have any effect.
-# log_all_queries = false
-#
+# client_ip        = "10.0.0.5"
+# blocklist_bypass = true
+
+# Example: a guest device quarantined to mesh-internal names only. Any
+# query outside `zones_allowed` returns REFUSED before the pipeline runs.
 # [[policy]]
-# node_id = "ed25519:XyZwVu..."
+# client_ip     = "10.0.0.99"
+# zones_allowed = ["mesh."]
+
+# Example: NodeId-keyed policy. Parsed but not yet matched at runtime —
+# `client_ip` is required for actual enforcement today.
+# [[policy]]
+# node_id          = "ed25519:AbCdEf..."
 # blocklist_bypass = false
