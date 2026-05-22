@@ -823,18 +823,54 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         ));
     }
 
-    // All resolver URLs must be https:// or quic://
+    // All resolver URLs must be https:// or quic:// (or — only when the
+    // selected protocol is "plain" — bare host:port), AND the scheme
+    // has to match `upstream.protocol`. Mismatches (e.g. protocol=doq
+    // with an https:// URL) silently fail at runtime with opaque
+    // hickory errors — easier to reject at config parse time.
     for url in &cfg.upstream.resolvers {
+        if url.is_empty() {
+            return Err(crate::RustyDnsError::Config(
+                "upstream.resolvers contains an empty URL".to_string(),
+            ));
+        }
         if url.starts_with("http://") {
             return Err(crate::RustyDnsError::Config(format!(
                 "upstream resolver `{url}` uses plain HTTP — only https:// or quic:// resolvers \
                  are allowed. DNS queries sent over plain HTTP are visible to any network observer."
             )));
         }
-        if url.is_empty() {
-            return Err(crate::RustyDnsError::Config(
-                "upstream.resolvers contains an empty URL".to_string(),
-            ));
+        match cfg.upstream.protocol {
+            UpstreamProtocol::Doh => {
+                if !url.starts_with("https://") {
+                    return Err(crate::RustyDnsError::Config(format!(
+                        "upstream.protocol = \"doh\" but resolver `{url}` is not an https:// URL. \
+                         DoH endpoints must use the https:// scheme. Either switch protocol to \
+                         match the URL or use an https:// URL."
+                    )));
+                }
+            }
+            UpstreamProtocol::Doq => {
+                if !(url.starts_with("quic://") || url.starts_with("h3://")) {
+                    return Err(crate::RustyDnsError::Config(format!(
+                        "upstream.protocol = \"doq\" but resolver `{url}` is not a quic:// URL. \
+                         DoQ endpoints must use the quic:// scheme (RFC 9250). Either switch \
+                         protocol to \"doh\" or use a quic:// URL."
+                    )));
+                }
+            }
+            UpstreamProtocol::Plain => {
+                // Plain mode accepts bare host:port. Reject any explicit
+                // scheme to avoid surprising the operator with silent
+                // protocol downgrades.
+                if url.contains("://") {
+                    return Err(crate::RustyDnsError::Config(format!(
+                        "upstream.protocol = \"plain\" but resolver `{url}` contains a URL scheme. \
+                         Plain mode uses bare host:port (e.g. \"8.8.8.8:53\") — drop the scheme \
+                         or switch protocol to match it."
+                    )));
+                }
+            }
         }
     }
 
@@ -1117,6 +1153,50 @@ mod tests {
         let mut cfg = baseline();
         cfg.upstream.resolvers = vec!["http://insecure.example/dns-query".to_string()];
         assert_config_err(validate_config(&cfg), "plain HTTP");
+    }
+
+    #[test]
+    fn protocol_doh_with_quic_url_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Doh;
+        cfg.upstream.resolvers = vec!["quic://dns.example.net:853".to_string()];
+        assert_config_err(validate_config(&cfg), "not an https://");
+    }
+
+    #[test]
+    fn protocol_doq_with_https_url_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Doq;
+        cfg.upstream.resolvers = vec!["https://dns.example.net/dns-query".to_string()];
+        assert_config_err(validate_config(&cfg), "not a quic://");
+    }
+
+    #[test]
+    fn protocol_doq_with_quic_url_accepted() {
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Doq;
+        cfg.upstream.resolvers = vec!["quic://dns.example.net:853".to_string()];
+        // dnssec_validation default true; min_tls_version 1.3 default;
+        // baseline passes — happy path.
+        validate_config(&cfg).expect("quic URL with doq protocol must validate");
+    }
+
+    #[test]
+    fn protocol_plain_with_scheme_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Plain;
+        cfg.upstream.resolvers = vec!["https://1.1.1.1/dns-query".to_string()];
+        assert_config_err(validate_config(&cfg), "Plain mode uses bare host:port");
+    }
+
+    #[test]
+    fn protocol_plain_with_bare_host_port_accepted() {
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Plain;
+        cfg.upstream.resolvers = vec!["8.8.8.8:53".to_string()];
+        // The plaintext upstream emits a startup warning but does not
+        // reject — the operator is informed but free to proceed.
+        validate_config(&cfg).expect("bare host:port with plain protocol must validate");
     }
 
     #[test]
