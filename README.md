@@ -1,5 +1,8 @@
 # RustyDNS
 
+[![CI](https://github.com/Iwan-Teague/rustydns/actions/workflows/ci.yml/badge.svg)](https://github.com/Iwan-Teague/rustydns/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 A privacy-first, security-hardened DNS resolver for home and small-office networks,
 built in Rust. RustyDNS acts as a local DNS proxy that:
 
@@ -211,4 +214,9 @@ All pull requests must pass `cargo check`, `cargo clippy -- -D warnings`, and
 
 ## License
 
-MIT OR Apache-2.0
+Dual-licensed under either of:
+
+- [MIT License](LICENSE-MIT) (see `LICENSE-MIT`)
+- [Apache License, Version 2.0](LICENSE-APACHE) (see `LICENSE-APACHE`)
+
+at your option. Contributions are assumed to be made under the same terms.
