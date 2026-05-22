@@ -1020,6 +1020,172 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dot_listener_serves_authority_hit_over_real_tls_handshake() {
+        // Full DoT path:
+        //   1. Build the daemon's pipeline (authority + blocklist + resolver).
+        //   2. Bind a TLS listener using our embedded self-signed cert.
+        //   3. Connect via tokio-rustls with a ClientConfig that trusts
+        //      that cert as a root.
+        //   4. Send a length-prefixed DNS query (RFC 7858 framing).
+        //   5. Decode the response and assert the authority hit.
+        //
+        // This catches regressions in:
+        //   - load_tls_config PEM parsing
+        //   - hickory-server's TLS handshake plumbing
+        //   - rustls version compatibility across our deps
+        //   - the rest of the pipeline that the UDP/TCP/DoH tests cover
+
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::ClientConfig;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+
+        use crate::test_pem::{TEST_CA_PEM, TEST_CERT_CN, TEST_LEAF_CERT_PEM, TEST_LEAF_KEY_PEM};
+
+        // Ring crypto provider is required for both sides of the
+        // handshake. Idempotent — second install is a no-op.
+        let _ = tokio_rustls::rustls::crypto::CryptoProvider::install_default(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        );
+
+        // Write test cert + key to per-test unique temp files so
+        // parallel runs don't collide.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let cert_path = std::env::temp_dir().join(format!("rustydns-dot-cert-{id}.pem"));
+        let key_path = std::env::temp_dir().join(format!("rustydns-dot-key-{id}.pem"));
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(TEST_LEAF_CERT_PEM.as_bytes())
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(TEST_LEAF_KEY_PEM.as_bytes())
+            .unwrap();
+
+        // Build the pipeline. Authority answers `router.mesh A 100.64.0.7`.
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority_cfg = AuthorityConfig {
+            mesh_zone_bundle_path: None,
+            mesh_zone_verifier_key_path: None,
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records: vec![static_a("router.mesh", "100.64.0.7")],
+            poll_interval_secs: 30,
+        };
+        let authority = Arc::new(Authority::new(authority_cfg).unwrap());
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            ..BlocklistConfig::default()
+        }));
+        let mut dns_config = DnsConfig {
+            server: Default::default(),
+            upstream: UpstreamConfig {
+                resolvers: vec!["https://127.0.0.1:1/dns-query".to_string()],
+                timeout_ms: 500,
+                ..UpstreamConfig::default()
+            },
+            authority: Default::default(),
+            blocklist: Default::default(),
+            privacy: Default::default(),
+            metrics: Default::default(),
+            policy: Vec::new(),
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.unwrap());
+        let query_log = Arc::new(crate::query_log::QueryLog::new(16));
+        let handler =
+            DnsHandler::new(authority, blocklist, resolver, metrics, query_log, &[]).unwrap();
+
+        // Reuse the daemon's TLS-config loader so the test path
+        // matches production.
+        use rustydns_core::config::ServerConfig as RsServerConfig;
+        let tls_server_config = crate::load_tls_config(&RsServerConfig {
+            tls_cert_path: Some(cert_path.clone()),
+            tls_key_path: Some(key_path.clone()),
+            ..RsServerConfig::default()
+        })
+        .expect("load_tls_config");
+
+        // Pick a random port + register the TLS listener.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server
+            .register_tls_listener_with_tls_config(
+                listener,
+                Duration::from_secs(5),
+                tls_server_config,
+            )
+            .expect("register_tls_listener_with_tls_config");
+
+        // Build a rustls ClientConfig that trusts the embedded cert as
+        // a root. Don't go through webpki — we want the self-signed CN
+        // to validate without DNS plumbing.
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        let ca_der = CertificateDer::from_pem_slice(TEST_CA_PEM.as_bytes())
+            .expect("parse embedded CA as DER");
+        roots.add(ca_der).expect("add CA to root store");
+
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        // Connect, TLS-handshake, send query, read response.
+        let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("tcp connect");
+        let server_name = ServerName::try_from(TEST_CERT_CN.to_string()).expect("server name");
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("tls handshake");
+
+        // Build a wire-format DNS query for `router.mesh A` with the
+        // 2-byte length prefix from RFC 7858 §4.
+        let mut msg = Message::new(0x4242, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(ProtoName::from_ascii("router.mesh.").unwrap())
+                .set_query_type(ProtoRecordType::A);
+            q
+        });
+        let body = msg.to_bytes().expect("encode query");
+        let len = (body.len() as u16).to_be_bytes();
+        tls.write_all(&len).await.expect("write length prefix");
+        tls.write_all(&body).await.expect("write body");
+
+        let mut len_buf = [0u8; 2];
+        tls.read_exact(&mut len_buf)
+            .await
+            .expect("read response length");
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        tls.read_exact(&mut resp_buf)
+            .await
+            .expect("read response body");
+        let resp = Message::from_bytes(&resp_buf).expect("decode response");
+
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(resp.metadata.authoritative, "authority hit must set aa");
+        assert_eq!(resp.answers.len(), 1);
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::A(a) => assert_eq!(a.0.to_string(), "100.64.0.7"),
+            other => panic!("expected A, got {other:?}"),
+        }
+
+        // Drop the server explicitly so the listener future cancels
+        // before tokio drops the runtime.
+        drop(server);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn policy_blocklist_bypass_lets_blocked_name_through() {
         // The query loopback originates from 127.0.0.1, so put a policy
         // for that IP. With blocklist_bypass = true the same name that

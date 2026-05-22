@@ -41,3 +41,9 @@ ahash              = { workspace = true }
 # in main.rs is a no-op stub.
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = { workspace = true }
+
+[dev-dependencies]
+# DoT integration test connects via TLS against the listener using
+# tokio-rustls. Workspace pin matches the runtime rustls 0.23.
+tokio-rustls = { workspace = true }
+webpki-roots = "1"
