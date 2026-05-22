@@ -102,6 +102,10 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Upgraded
 
+- **MSRV: 1.85 → 1.88.** Required by `hickory-{net,proto,resolver,server}
+  0.26.1`, which all declare `rust-version = 1.88` in their manifests.
+  Pinned in `Cargo.toml`, the Dockerfile builder image, and the CI
+  toolchain.
 - `hickory-{proto,resolver,server}` 0.24 → 0.26 across the
   workspace. The 0.26 line uses `rustls 0.23` (matching axum/reqwest)
   and `quinn 0.11`, clearing nine RUSTSEC advisories that had been
