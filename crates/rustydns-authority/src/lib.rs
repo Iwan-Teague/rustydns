@@ -32,9 +32,11 @@
 //!
 //! # Status
 //!
-//! Milestone 2 complete. Implementation: static zones from TOML, plus
-//! signed mesh-zone bundle read from disk with ed25519 verification and
-//! `ArcSwap` hot reload.
+//! Production. Static zones from TOML, signed mesh-zone bundle read from
+//! disk with ed25519 verification, atomic hot reload via `ArcSwap`, and
+//! intra-zone CNAME chain following per RFC 1034 §3.6.2 (depth-capped at
+//! 8 hops, with loop detection and partial-chain return when the chase
+//! crosses out of the authority's zones).
 
 mod mesh;
 
