@@ -12,7 +12,7 @@
 //! | Feature | RFC | Default | Config key | Status |
 //! |---------|-----|---------|------------|--------|
 //! | DNS-over-HTTPS upstream | RFC 8484 | ✓ | `upstream.protocol = "doh"` | implemented |
-//! | DNS-over-QUIC upstream | RFC 9250 | opt-in | `upstream.protocol = "doq"` | planned |
+//! | DNS-over-QUIC upstream | RFC 9250 | opt-in | `upstream.protocol = "doq"` | implemented (via hickory `quic-ring` feature → `NameServerConfig::quic`) |
 //! | TLS 1.3 minimum | RFC 8446 | ✓ | `upstream.min_tls_version = "1.3"` | implemented |
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
