@@ -76,20 +76,18 @@ use rustydns_resolver::Resolver;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Set a restrictive umask so any files the daemon create (e.g. log files
-    // created before the config is read) are not world-readable by default.
-    //
-    // Under systemd, UMask=0077 in the service unit provides this guarantee.
-    // For non-systemd deployments, add the `nix` crate and call:
-    //   nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
-    // nix::sys::stat::umask is a safe function (umask never fails).
-    //
-    // TODO (Milestone 4): add `nix` to workspace dependencies and call it here
-    // so non-systemd deployments also benefit from the restricted umask.
-
-    // Initialise structured logging before anything else so that all startup
-    // errors are captured in the journal.
+    // Initialise structured logging first so the umask line below
+    // (and every subsequent startup event) reaches the subscriber.
+    // Tracing writes go to stdout/stderr/journal, not to disk —
+    // they're not affected by umask.
     init_tracing();
+
+    // Set a restrictive umask so any files the daemon creates later
+    // (e.g. accidental log files written before privileges are
+    // dropped) are owner-only. systemd's `UMask=0077` covers this
+    // under the service unit; this call covers non-systemd deployments
+    // (Docker, runit, OpenRC, bare CLI).
+    set_restrictive_umask();
 
     let args = parse_args()?;
     let config_path = PathBuf::from(&args.config_path);
@@ -805,6 +803,27 @@ fn drop_capabilities() {
         after  = %after,
         "capability dropping complete"
     );
+}
+
+/// Set the process umask to `0o077` so files created by the daemon
+/// default to mode `0o600` (owner-only). Equivalent to systemd's
+/// `UMask=0077` for non-systemd deployments.
+#[cfg(unix)]
+fn set_restrictive_umask() {
+    use nix::sys::stat::{Mode, umask};
+    // umask never fails — the system call returns the previous mask.
+    let previous = umask(Mode::from_bits_truncate(0o077));
+    info!(
+        previous_mask = format!("{:#o}", previous.bits()),
+        new_mask = format!("{:#o}", 0o077),
+        "process umask set"
+    );
+}
+
+#[cfg(not(unix))]
+fn set_restrictive_umask() {
+    // umask is a Unix concept. On Windows, file mode is set via ACLs
+    // that don't have a per-process default the same way.
 }
 
 /// No-op on non-Linux platforms. macOS dev builds, FreeBSD ports, etc.

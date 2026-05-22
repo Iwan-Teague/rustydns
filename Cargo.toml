@@ -92,6 +92,12 @@ rand = "0.8"
 # Base64 for DoH query decoding
 base64 = "0.22"
 
+# Unix-only: call umask() at startup so files the daemon creates
+# default to mode 0o600 (group/other have no access). Replaces
+# systemd's `UMask=0077` in the service unit for non-systemd
+# deployments.
+nix = { version = "0.30", default-features = false, features = ["fs"] }
+
 # In-process Linux capability dropping. Pulled in only on Linux targets
 # (see crates/rustydnsd/Cargo.toml). macOS dev builds compile without it.
 caps = "0.5"

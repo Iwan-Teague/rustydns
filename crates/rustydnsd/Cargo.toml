@@ -42,6 +42,12 @@ ahash              = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = { workspace = true }
 
+# Unix-only: `nix::sys::stat::umask` is the in-process equivalent of
+# systemd's `UMask=0077`. The cfg gate keeps the dep off Windows
+# (which it doesn't even compile on).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
 [dev-dependencies]
 # DoT integration test connects via TLS against the listener using
 # tokio-rustls. Workspace pin matches the runtime rustls 0.23.
