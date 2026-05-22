@@ -201,6 +201,9 @@ allowlist = [
 
 # RFC 7816: send only the minimum necessary labels to each upstream nameserver.
 # Disabling means the full query name is sent to every upstream at every step.
+# ⚠ NOT YET ACTIVE: hickory 0.26's stub resolver does not expose qmin. The
+#   daemon emits a tracing::warn! at startup if this is true; the setting will
+#   be honoured the moment hickory ships support.
 query_minimization = true
 
 # RFC 7871: strip EDNS0 Client Subnet from all outgoing queries.
@@ -209,6 +212,9 @@ no_edns_client_subnet = true
 
 # RFC 8467: pad DoH queries to fixed block sizes (128-byte blocks).
 # Disabling allows packet-size analysis to infer query name lengths.
+# ⚠ NOT YET ACTIVE: hickory 0.26 does not expose RFC 8467 padding. The daemon
+#   emits a tracing::warn! at startup if this is true; encrypted query sizes
+#   still leak the queried domain until hickory ships support.
 upstream_padding = true
 
 # Select an upstream resolver uniformly at random per query.

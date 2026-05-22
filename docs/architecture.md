@@ -95,14 +95,15 @@ Fast in-memory blocklist engine. Key properties:
 
 The binary. Responsibilities:
 - Parse config, validate, fail fast on bad configuration (before binding any ports).
-- Attempt in-process capability dropping after binding privileged ports (also enforced by systemd unit).
-- Check config file permissions at startup — warn if world-readable.
-- Spawn the query pipeline as a `tower` `Service` stack: `Authority → Blocklist → Resolver`.
-- Serve the management HTTP API (`/metrics`, `/blocklist/reload`, `/cache/flush`, `/zones`).
-- Background task: fetch blocklist sources on schedule; swap `ArcSwap` atomically on success.
-- Signal handling: `SIGHUP` reloads config and blocklists; `SIGTERM`/`SIGINT` shuts down cleanly.
+- Refuse to start if `rustydns.toml` is world-readable; warn (not refuse) if group-readable.
+- Set `umask(0o077)` in-process so any files the daemon writes are owner-only.
+- Drop Linux capabilities in-process after binding privileged ports (via the `caps` crate; also enforced by the systemd unit and Docker file caps).
+- Wire the request pipeline as a single `RequestHandler` impl (`DnsHandler`) that runs `Authority → Blocklist → Resolver` directly. Not a `tower::Service` stack — the pipeline is short enough that a hand-written async fn beats the layer-builder ceremony.
+- Serve the loopback management API on `metrics.listen` (default `127.0.0.1:9153`): `/metrics` (Prometheus), `/health` (JSON liveness), `/queries` (JSON snapshot of the in-memory ring buffer). All three refuse to bind off-loopback; see [`operator-endpoints.md`](operator-endpoints.md).
+- Background tasks: periodic blocklist reload on `blocklist.reload_interval_secs`; periodic mesh-zone bundle reload on `authority.poll_interval_secs`; both swap their state via `ArcSwap` atomically on success.
+- Signal handling: `SIGHUP` re-reads blocklists and the mesh-zone bundle (NOT the full `rustydns.toml` — listener addresses, TLS material, upstreams, and per-client policy are fixed for the process lifetime). `SIGTERM`/`SIGINT` runs the bounded graceful shutdown (`RUSTYDNS_SHUTDOWN_TIMEOUT_SECS`, default 10s); a second signal collapses the timeout to zero.
 - DoH listener: axum HTTP/2 server. **No TLS on the listener itself** — TLS is on upstream connections going out. If DoH is exposed externally, a TLS-terminating reverse proxy must be in front.
-- DoT listener (optional): requires `tls_cert_path` and `tls_key_path` in config.
+- DoT listener (optional): requires `tls_cert_path` and `tls_key_path`; rejected by `validate_config` if either is missing.
 
 ## Data flow — detailed
 
@@ -117,22 +118,28 @@ The binary. Responsibilities:
     a. Yes → return record, increment authority_hits counter
     b. No  → continue
 6.  Blocklist checked: does qname match a blocklist entry?
-    a. Yes → NXDOMAIN / REFUSED / sinkhole, increment blocked_queries counter
-              log: tracing::info!(client = %client.anonymized(), qname = %name, "query blocked")
-              (full qname is logged here because the blocklist hit is the event of interest;
-               note this is at info level — see AGENTS.md log redaction invariant)
+    a. Yes → NXDOMAIN / REFUSED / sinkhole, increment blocklist_hits_total counter
+              log: tracing::debug!(client = %client.anonymized(), qname = %name, "query blocked")
+              (raw qname only at debug level per AGENTS.md privacy invariants —
+               info-level path uses the hashed qname from QueryLog::hash_qname)
+              query log ring buffer records: hashed qname + anonymised client + ServedBy::Blocklist
     b. No  → continue
-7.  Resolver: check cache
+7.  Resolver: check cache (moka LRU, bounded by upstream.max_cache_entries)
     a. Hit  → return, no upstream query
-    b. Miss → forward to upstream DoH/DoQ with privacy features applied:
-               - Select upstream at random (if privacy.randomize_upstream_selection)
-               - Apply query name minimisation (if privacy.query_minimization)
-               - Strip ECS option (if privacy.no_edns_client_subnet)
-               - Pad query to 128-byte blocks (if privacy.upstream_padding)
-               - Validate DNSSEC on response
+    b. Miss → forward to upstream DoH/DoQ/plain with privacy features applied:
+               - Select upstream via ServerOrderingStrategy::RoundRobin
+                 (if privacy.randomize_upstream_selection) else QueryStatistics
+               - Strip ECS option (always — we never set EDNS Client Subnet)
+               - Enforce TLS 1.3 floor on the encrypted transports
+                 (upstream.min_tls_version)
+               - Validate DNSSEC on response (upstream.dnssec_validation)
                - On failure: SERVFAIL (fail_closed=true — there is no other mode)
+               - NOT yet applied: RFC 7816 query minimisation and RFC 8467
+                 padding — hickory 0.26's stub resolver doesn't expose either,
+                 and the daemon warns at startup if the matching privacy.*
+                 knob is enabled.
 8.  Response encoded and returned to client
-9.  Metrics updated (latency histogram, per-step counters)
+9.  Metrics updated (per-arm counters, policy effect counters)
 ```
 
 ## Rustynet integration

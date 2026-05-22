@@ -66,13 +66,20 @@ accidental full-IP logging.
 
 ## Privacy: Hiding Your Queries from Upstream Resolvers
 
-### Query Name Minimisation (RFC 7816)
+### Query Name Minimisation (RFC 7816) — pending
 
 When resolving `www.example.com`, a naive resolver sends the full QNAME to every
-nameserver in the chain. RustyDNS (planned) will send only the minimum labels needed
-at each delegation step — the root sees only `.com`, the TLD sees only `example.com`,
-and only the authoritative server sees the full name. This limits the data each party
-receives to what they strictly need.
+nameserver in the chain. RFC 7816 reduces each hop to the minimum labels needed
+at the relevant delegation step — the root sees only `.com`, the TLD sees only
+`example.com`, and only the authoritative server sees the full name. RustyDNS
+forwards to a DoH/DoQ recursive (it is not a from-scratch recursor itself), so
+the upstream is the only party that ever sees the full QNAME, and only it (not
+the root or TLD operators) is positioned to build a profile.
+
+`privacy.query_minimization = true` is the default and is honoured at the
+moment hickory's stub resolver exposes the knob. As of hickory 0.26 it does
+not, and the daemon emits a `tracing::warn!` at startup when the setting is
+enabled so operators do not silently believe qmin is active.
 
 ### EDNS0 Client Subnet Stripping (RFC 7871)
 
