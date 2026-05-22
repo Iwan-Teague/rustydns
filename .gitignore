@@ -1,5 +1,7 @@
 /target/
-Cargo.lock
+# Cargo.lock IS committed — this workspace ships a binary (`rustydnsd`)
+# and we want reproducible builds + supply-chain visibility. Per Rust
+# convention only library-only workspaces ignore the lock.
 *.swp
 *.swo
 .DS_Store
