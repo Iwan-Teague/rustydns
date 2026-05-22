@@ -134,10 +134,10 @@ pub fn parse_hosts(content: &str) -> Vec<ParsedEntry> {
             _ => continue,
         }
         for domain in parts {
-            if let Some(d) = validate_and_normalize(domain) {
-                if !is_always_skipped(&d) {
-                    entries.push(ParsedEntry::Exact(d));
-                }
+            if let Some(d) = validate_and_normalize(domain)
+                && !is_always_skipped(&d)
+            {
+                entries.push(ParsedEntry::Exact(d));
             }
         }
     }
@@ -172,10 +172,10 @@ pub fn parse_plain(content: &str) -> Vec<ParsedEntry> {
         if line.is_empty() || line.contains(' ') || line.contains('\t') {
             continue;
         }
-        if let Some(d) = validate_and_normalize(line) {
-            if !is_always_skipped(&d) {
-                entries.push(ParsedEntry::Exact(d));
-            }
+        if let Some(d) = validate_and_normalize(line)
+            && !is_always_skipped(&d)
+        {
+            entries.push(ParsedEntry::Exact(d));
         }
     }
 
@@ -227,10 +227,10 @@ pub fn parse_rpz(content: &str) -> Vec<ParsedEntry> {
                 if let Some(d) = validate_and_normalize(parent) {
                     entries.push(ParsedEntry::WildcardParent(d));
                 }
-            } else if let Some(d) = validate_and_normalize(name) {
-                if !is_always_skipped(&d) {
-                    entries.push(ParsedEntry::Exact(d));
-                }
+            } else if let Some(d) = validate_and_normalize(name)
+                && !is_always_skipped(&d)
+            {
+                entries.push(ParsedEntry::Exact(d));
             }
         }
         // All other rdata values are silently ignored.
@@ -259,28 +259,28 @@ pub fn parse_adguard(content: &str) -> Vec<ParsedEntry> {
         if let Some(rest) = line.strip_prefix("@@||") {
             if let Some(caret) = rest.find('^') {
                 let domain_part = &rest[..caret];
-                if !domain_part.contains('/') {
-                    if let Some(d) = validate_and_normalize(domain_part) {
-                        entries.push(ParsedEntry::Allow(d));
-                    }
+                if !domain_part.contains('/')
+                    && let Some(d) = validate_and_normalize(domain_part)
+                {
+                    entries.push(ParsedEntry::Allow(d));
                 }
             }
             continue;
         }
 
         // ||domain^ → block apex + all subdomains
-        if let Some(rest) = line.strip_prefix("||") {
-            if let Some(caret) = rest.find('^') {
-                let domain_part = &rest[..caret];
-                if domain_part.contains('/') {
-                    continue; // URL path rule — skip
-                }
-                if let Some(d) = validate_and_normalize(domain_part) {
-                    if !is_always_skipped(&d) {
-                        entries.push(ParsedEntry::Exact(d.clone()));
-                        entries.push(ParsedEntry::WildcardParent(d));
-                    }
-                }
+        if let Some(rest) = line.strip_prefix("||")
+            && let Some(caret) = rest.find('^')
+        {
+            let domain_part = &rest[..caret];
+            if domain_part.contains('/') {
+                continue; // URL path rule — skip
+            }
+            if let Some(d) = validate_and_normalize(domain_part)
+                && !is_always_skipped(&d)
+            {
+                entries.push(ParsedEntry::Exact(d.clone()));
+                entries.push(ParsedEntry::WildcardParent(d));
             }
         }
         // All other lines (cosmetic rules, anchor-only, etc.) are skipped.

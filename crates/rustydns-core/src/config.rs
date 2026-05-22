@@ -1029,12 +1029,12 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
             }
             _ => {}
         }
-        if let Some(ip) = &policy.client_ip {
-            if ip.parse::<std::net::IpAddr>().is_err() {
-                return Err(crate::RustyDnsError::Config(format!(
-                    "policy[{idx}].client_ip `{ip}` is not a valid IPv4 or IPv6 literal"
-                )));
-            }
+        if let Some(ip) = &policy.client_ip
+            && ip.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(crate::RustyDnsError::Config(format!(
+                "policy[{idx}].client_ip `{ip}` is not a valid IPv4 or IPv6 literal"
+            )));
         }
         if policy.node_id.is_some() && policy.client_ip.is_none() {
             tracing::warn!(

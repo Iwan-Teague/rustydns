@@ -396,10 +396,10 @@ fn init_tracing() {
         }
     }
     for crate_name in ["hickory_server", "hickory_proto", "hickory_resolver"] {
-        if !user_filter.contains(crate_name) {
-            if let Ok(d) = format!("{crate_name}=warn").parse() {
-                filter = filter.add_directive(d);
-            }
+        if !user_filter.contains(crate_name)
+            && let Ok(d) = format!("{crate_name}=warn").parse()
+        {
+            filter = filter.add_directive(d);
         }
     }
 

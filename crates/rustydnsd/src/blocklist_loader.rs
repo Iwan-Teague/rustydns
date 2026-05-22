@@ -133,13 +133,13 @@ impl BlocklistLoader {
             )));
         }
 
-        if let Some(len) = response.content_length() {
-            if len > self.config.max_fetch_bytes {
-                return Err(RustyDnsError::Blocklist(format!(
-                    "fetch failed for {url}: content-length {len} exceeds max_fetch_bytes {}",
-                    self.config.max_fetch_bytes
-                )));
-            }
+        if let Some(len) = response.content_length()
+            && len > self.config.max_fetch_bytes
+        {
+            return Err(RustyDnsError::Blocklist(format!(
+                "fetch failed for {url}: content-length {len} exceeds max_fetch_bytes {}",
+                self.config.max_fetch_bytes
+            )));
         }
 
         let mut body: Vec<u8> = Vec::new();
