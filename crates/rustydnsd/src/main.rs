@@ -20,7 +20,12 @@
 //!
 //! # Signal handling
 //!
-//! - `SIGHUP`  — reload config and blocklist sources (no restart required).
+//! - `SIGHUP`  — re-read blocklist sources AND the signed mesh-zone
+//!   bundle. Does NOT re-read `rustydns.toml` itself: listener
+//!   addresses, upstream resolvers, TLS material, and per-client
+//!   policies are fixed for the lifetime of the process. Restart the
+//!   daemon (systemd `restart`, `docker compose restart`, etc.) to
+//!   change anything else.
 //! - `SIGTERM` / `SIGINT` — graceful shutdown (drain in-flight queries, close listeners).
 //!
 //! # Privilege model
@@ -554,7 +559,13 @@ fn spawn_sighup_reload(
         loop {
             tokio::select! {
                 _ = hup.recv() => {
-                    info!("SIGHUP received — reloading blocklists");
+                    // Reload scope is intentionally narrow: blocklists
+                    // and the mesh-zone bundle. Full-config reload
+                    // (listeners, TLS material, per-client policy,
+                    // upstreams) requires restarting the process —
+                    // socket rebinding and Resolver/Server reconstruction
+                    // are not currently driveable from a signal handler.
+                    info!("SIGHUP received — reloading blocklists and mesh-zone bundle");
                     match loader.reload(&engine).await {
                         Ok(summary) => {
                             if summary.loaded_sources == 0 {
