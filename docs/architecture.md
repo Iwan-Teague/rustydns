@@ -57,6 +57,8 @@ Serves authoritative answers for:
 
 Authority answers are trusted answers. The authority never forwards to an upstream. It either has the answer (returns it) or it doesn't (returns `None`, continuing the pipeline to blocklist/resolver).
 
+**Intra-zone CNAME chasing.** When the queried name has a CNAME and the target is inside an authoritative zone (mesh or static), `Authority::lookup` follows the chain and returns the full `[CNAME, …, terminal]` answer so stub resolvers get the terminal record in one round-trip (RFC 1034 §3.6.2). The chase stops when the target leaves the authority's zones (the resolver pipeline takes over from there), when a loop is detected, or when the 8-hop depth cap is hit.
+
 ### `rustydns-resolver`
 
 Recursive resolver forwarding to upstream servers using DoH (default) or DoQ. Privacy features applied to every outgoing query:
