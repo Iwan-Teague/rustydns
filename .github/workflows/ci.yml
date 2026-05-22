@@ -67,7 +67,7 @@ jobs:
           command: check
           arguments: --all-features
 
-      - name: Daemon smoke: --validate-config on the example config
+      - name: "Daemon smoke: --validate-config on the example config"
         run: |
           chmod 600 rustydns.example.toml
           # The example config references blocklist URLs we can't fetch
@@ -102,7 +102,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke run: --version inside the image
+      - name: "Smoke run: --version inside the image"
         # Confirms the binary actually executes under the non-root user
         # with the dropped capabilities. We override the entrypoint
         # because tini-then-rustydnsd would otherwise wait on a config
