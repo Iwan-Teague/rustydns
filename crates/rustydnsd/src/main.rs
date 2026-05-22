@@ -825,3 +825,88 @@ fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
 
     Ok(Arc::new(config))
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Per-test unique temp path so parallel tests don't collide.
+    fn tmp_path(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "rustydnsd-test-{}-{id}-{name}",
+            std::process::id()
+        ))
+    }
+
+    fn write_file(path: &PathBuf, contents: &[u8]) {
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(contents).unwrap();
+    }
+
+    fn server_with_paths(cert: Option<PathBuf>, key: Option<PathBuf>) -> ServerConfig {
+        ServerConfig {
+            tls_cert_path: cert,
+            tls_key_path: key,
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn load_tls_config_requires_cert_path() {
+        let key = tmp_path("k.pem");
+        write_file(&key, b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n");
+        let err = load_tls_config(&server_with_paths(None, Some(key))).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("tls_cert_path"),
+            "error must name the missing field: {err:#}"
+        );
+    }
+
+    #[test]
+    fn load_tls_config_requires_key_path() {
+        let cert = tmp_path("c.pem");
+        write_file(&cert, b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n");
+        let err = load_tls_config(&server_with_paths(Some(cert), None)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("tls_key_path"),
+            "error must name the missing field: {err:#}"
+        );
+    }
+
+    #[test]
+    fn load_tls_config_rejects_missing_cert_file() {
+        let cert = tmp_path("does-not-exist.pem");
+        let key = tmp_path("k.pem");
+        write_file(&key, b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n");
+        let err = load_tls_config(&server_with_paths(Some(cert), Some(key))).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed to open TLS certificate"), "msg = {msg}");
+    }
+
+    #[test]
+    fn load_tls_config_rejects_empty_cert_file() {
+        let cert = tmp_path("empty-cert.pem");
+        let key = tmp_path("k.pem");
+        write_file(&cert, b""); // empty file
+        write_file(&key, b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n");
+        let err = load_tls_config(&server_with_paths(Some(cert), Some(key))).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("contains no certificates"), "msg = {msg}");
+    }
+
+    #[test]
+    fn normalize_metrics_path_prepends_slash() {
+        assert_eq!(normalize_metrics_path(""), "/metrics");
+        assert_eq!(normalize_metrics_path("foo"), "/foo");
+        assert_eq!(normalize_metrics_path("/foo"), "/foo");
+        assert_eq!(normalize_metrics_path("  /foo  "), "/foo");
+    }
+}
