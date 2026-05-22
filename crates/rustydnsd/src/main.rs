@@ -33,12 +33,13 @@
 //!
 //! # Status
 //!
-//! Milestone 4 (substantially complete). UDP/TCP/DoH query pipeline,
+//! Milestone 4 feature-complete. UDP/TCP/DoT/DoH query pipeline,
 //! metrics, mesh-zone bundle reload, blocklist reload, per-client
-//! policy, query log ring buffer, capability dropping, and bounded
-//! graceful shutdown are all wired up. DoT listener remains deferred
-//! pending the hickory-server rustls upgrade (see the DoT block in
-//! [`main`] for details).
+//! policy, query log ring buffer, capability dropping, bounded
+//! graceful shutdown, and `--print-config` / `--validate-config`
+//! CLI flags are all wired up. Remaining gaps are hickory-side
+//! (RFC 8467 padding, RFC 7816 query minimisation) and a
+//! Rustynet-side peer-table integration for NodeId-keyed policy.
 
 mod blocklist_loader;
 mod doh;
@@ -862,10 +863,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!(
-            "rustydnsd-test-{}-{id}-{name}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("rustydnsd-test-{}-{id}-{name}", std::process::id()))
     }
 
     fn write_file(path: &PathBuf, contents: &[u8]) {
@@ -884,7 +882,10 @@ mod tests {
     #[test]
     fn load_tls_config_requires_cert_path() {
         let key = tmp_path("k.pem");
-        write_file(&key, b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n");
+        write_file(
+            &key,
+            b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
+        );
         let err = load_tls_config(&server_with_paths(None, Some(key))).unwrap_err();
         assert!(
             format!("{err:#}").contains("tls_cert_path"),
@@ -895,7 +896,10 @@ mod tests {
     #[test]
     fn load_tls_config_requires_key_path() {
         let cert = tmp_path("c.pem");
-        write_file(&cert, b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n");
+        write_file(
+            &cert,
+            b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+        );
         let err = load_tls_config(&server_with_paths(Some(cert), None)).unwrap_err();
         assert!(
             format!("{err:#}").contains("tls_key_path"),
@@ -907,10 +911,16 @@ mod tests {
     fn load_tls_config_rejects_missing_cert_file() {
         let cert = tmp_path("does-not-exist.pem");
         let key = tmp_path("k.pem");
-        write_file(&key, b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n");
+        write_file(
+            &key,
+            b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
+        );
         let err = load_tls_config(&server_with_paths(Some(cert), Some(key))).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("failed to open TLS certificate"), "msg = {msg}");
+        assert!(
+            msg.contains("failed to open TLS certificate"),
+            "msg = {msg}"
+        );
     }
 
     /// Self-signed RSA-2048 cert + key, generated once with
@@ -998,7 +1008,10 @@ OSL0Z7E6isvW9IgVx9nsYiNF1EoQKLyDUkwsFq83Z0LcGGVL8pseO9fX4RXJTrhm
         let cert = tmp_path("empty-cert.pem");
         let key = tmp_path("k.pem");
         write_file(&cert, b""); // empty file
-        write_file(&key, b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n");
+        write_file(
+            &key,
+            b"-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
+        );
         let err = load_tls_config(&server_with_paths(Some(cert), Some(key))).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("contains no certificates"), "msg = {msg}");

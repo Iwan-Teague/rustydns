@@ -685,8 +685,12 @@ pub struct NodePolicy {
 /// A `String` holding a sensitive value (API token, shared secret, etc.).
 ///
 /// - Never emitted in `Debug` output (shown as `<redacted>`).
+/// - Never emitted in `Serialize` output — `--print-config` and any
+///   future state-dump endpoint sees the literal string `<redacted>`,
+///   not the secret. Deserialise still reads the real value from
+///   `rustydns.toml`.
 /// - Zeroed on drop via `zeroize`.
-#[derive(Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(transparent)]
 pub struct Secret(String);
 
@@ -700,6 +704,54 @@ impl Secret {
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<redacted>")
+    }
+}
+
+// PRIVACY: a manual Serialize impl that always emits the placeholder
+// string `<redacted>` instead of the underlying secret. This means
+// `toml::to_string(&config)` / `serde_json::to_string(&config)` are
+// always safe to surface to operators (e.g. via `--print-config` or a
+// future state-dump endpoint) without leaking tokens.
+//
+// The cost: a serialised config CANNOT be round-tripped back into a
+// real running daemon, because `<redacted>` won't authenticate.
+// That's intended — operators paste secrets from their actual config
+// file, not from a state dump.
+impl serde::Serialize for Secret {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("<redacted>")
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::Secret;
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct Holder {
+        token: Secret,
+    }
+
+    #[test]
+    fn debug_redacts() {
+        let s = Secret("hunter2".to_string());
+        assert_eq!(format!("{s:?}"), "<redacted>");
+    }
+
+    #[test]
+    fn serialize_redacts() {
+        let h = Holder {
+            token: Secret("hunter2".to_string()),
+        };
+        let toml = toml::to_string(&h).unwrap();
+        assert!(toml.contains("<redacted>"), "toml = {toml}");
+        assert!(!toml.contains("hunter2"), "secret leaked: {toml}");
+    }
+
+    #[test]
+    fn deserialize_reads_real_value() {
+        let h: Holder = toml::from_str("token = \"hunter2\"").unwrap();
+        assert_eq!(h.token.expose(), "hunter2");
     }
 }
 
