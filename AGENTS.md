@@ -16,6 +16,7 @@ This file is the entry point for any AI agent or automated tool working in this 
 - `docs/architecture.md` — intended design (authoritative, canonical)
 - `docs/blocklist-format.md` — blocklist source formats and fetch security
 - `docs/integration-rustynet.md` — how rustydns fits into the Rustynet mesh
+- `docs/operator-endpoints.md` — `/metrics`, `/health`, `/queries` reference
 - `docs/security.md` — threat model and all privacy/security decisions
 - `AGENTS.md` — this file
 - `CLAUDE.md` — Claude-specific guidance
