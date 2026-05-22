@@ -86,8 +86,10 @@ See `docs/operator-endpoints.md` for the full reference.
 ### Documentation
 
 - `docs/architecture.md`, `docs/integration-rustynet.md`,
-  `docs/security.md`, `docs/blocklist-format.md`, and the new
-  `docs/operator-endpoints.md`.
+  `docs/security.md`, `docs/blocklist-format.md`,
+  `docs/operator-endpoints.md`, and `docs/deployment-docker.md`
+  (image layout, capability model, compose template, scrape
+  sidecar pattern, troubleshooting).
 - `AGENTS.md` invariants reflected in code and tests.
 - `rustydns.example.toml` with worked examples for every section.
 - Per-crate `lib.rs` modules carry the security/privacy rules in
@@ -105,6 +107,24 @@ See `docs/operator-endpoints.md` for the full reference.
   asked for). The previous workspace had to leave this as a
   warning-only setting because hickory 0.24's internal rustls 0.21
   wouldn't accept the workspace's rustls 0.23 config.
+
+### Packaging
+
+- **Multi-stage `Dockerfile`** — `rust:1.85-bookworm` builder →
+  `debian:bookworm-slim` runtime. Non-root `rustydns` user,
+  `cap_net_bind_service` file capability on the binary so `:53`
+  and `:853` bind without root. `tini` as PID 1 for zombie reaping
+  and clean SIGTERM forwarding. `ca-certificates` deliberately
+  omitted — `webpki-roots` ships the Mozilla CA bundle in-binary.
+- **`.dockerignore`** trims the build context: `target/`, `.git`,
+  docs, and any `*.pem`/`rustydns.toml` are excluded so operator
+  secrets can't accidentally be baked into an image.
+- **`docker-compose.yml`** with read-only rootfs, `cap_drop: ALL` +
+  `cap_add: NET_BIND_SERVICE`, `no-new-privileges`, json-file log
+  cap, and a healthcheck against the loopback `/health` endpoint.
+- **CI `docker` job** builds the image via Buildx with the GHA cache
+  backend and runs `rustydnsd --version` inside it, catching
+  Dockerfile regressions on PR.
 
 ### Added
 
