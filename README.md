@@ -157,6 +157,7 @@ Read the full threat model and deployment checklist in [`docs/security.md`](docs
 | [`docs/blocklist-format.md`](docs/blocklist-format.md) | Supported blocklist formats, source security, RPZ passthru |
 | [`docs/integration-rustynet.md`](docs/integration-rustynet.md) | Rusty Suite mesh integration, per-node policy |
 | [`docs/operator-endpoints.md`](docs/operator-endpoints.md) | `/metrics`, `/health`, `/queries` reference, privacy properties |
+| [`SECURITY.md`](SECURITY.md) | How to report a vulnerability (private channels only) |
 | [`AGENTS.md`](AGENTS.md) | Invariants and rules for AI coding agents working on this repo |
 
 ---

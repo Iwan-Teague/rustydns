@@ -1,0 +1,46 @@
+# Dependabot configuration for rustydns.
+#
+# Auto-opens PRs when Cargo or GitHub Actions dependencies have updates.
+# This matters more than usual here because the security posture of the
+# daemon depends on the rustls / hickory / quinn dep chain staying
+# patched. Every PR runs through the full CI gate (fmt + clippy + test +
+# release-build + cargo-deny + --validate-config smoke), so a bot-opened
+# bump can't sneak through without that verification.
+
+version: 2
+updates:
+  # Cargo: weekly so we don't paper-cut on noise.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/London
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+    # Group patch/minor bumps to keep noise low; surface major bumps
+    # individually so they get the attention they need.
+    groups:
+      patch-and-minor:
+        applies-to: version-updates
+        update-types:
+          - patch
+          - minor
+
+  # GitHub Actions: also weekly. Workflow files don't churn but the
+  # actions we depend on (checkout, rust-toolchain, cargo-deny-action,
+  # cache) DO occasionally publish security fixes.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/London
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - github-actions
