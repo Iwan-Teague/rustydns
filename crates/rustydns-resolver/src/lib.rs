@@ -17,9 +17,9 @@
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
 //! | Strip EDNS Client Subnet | RFC 7871 | ✓ | `privacy.no_edns_client_subnet = true` | implemented (we never set ECS) |
-//! | DoH query padding | RFC 8467 | ✓ | `privacy.upstream_padding = true` | **planned** (hickory 0.26 still doesn't expose RFC 8467) |
+//! | DoH query padding | RFC 8467 | ✓ | `privacy.upstream_padding = true` | **pending** — hickory 0.26 doesn't expose RFC 8467 yet; daemon warns at startup. See `docs/roadmap.md` §1.2. |
 //! | Randomise upstream selection | — | ✓ | `privacy.randomize_upstream_selection = true` | implemented (round-robin server-ordering strategy) |
-//! | Query Name Minimisation | RFC 7816 | ✓ | `privacy.query_minimization = true` | **planned** (hickory 0.26's stub resolver still doesn't apply qmin) |
+//! | Query Name Minimisation | RFC 7816 | ✓ | `privacy.query_minimization = true` | **pending** — hickory 0.26 doesn't apply qmin yet; daemon warns at startup. See `docs/roadmap.md` §1.1. |
 //!
 //! # Fail-closed guarantee
 //!

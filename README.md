@@ -17,7 +17,9 @@ built in Rust. RustyDNS acts as a local DNS proxy that:
 - **Validates DNSSEC** and rejects forged upstream responses with no silent fallback
 - **Anonymises client logs** at /16 (IPv4) or /64 (IPv6) prefix granularity — full
   IPs are never logged by default
-- **Integrates with the Rusty Suite mesh** for per-node DNS policy (planned)
+- **Integrates with the Rusty Suite mesh** — signed dns-zone bundle hot-reload
+  via `ArcSwap`, IP-keyed per-client policy (NodeId-keyed matching pending
+  Rustynet peer-table integration; see [`docs/roadmap.md`](docs/roadmap.md))
 
 Security, privacy, and anonymity are first-class design constraints. All other
 trade-offs — performance, convenience, feature completeness — are secondary.
@@ -177,6 +179,7 @@ Read the full threat model and deployment checklist in [`docs/security.md`](docs
 | [`docs/integration-rustynet.md`](docs/integration-rustynet.md) | Rusty Suite mesh integration, per-node policy |
 | [`docs/operator-endpoints.md`](docs/operator-endpoints.md) | `/metrics`, `/health`, `/queries` reference, privacy properties |
 | [`docs/deployment-docker.md`](docs/deployment-docker.md) | Image layout, capability model, compose example, troubleshooting |
+| [`docs/roadmap.md`](docs/roadmap.md) | Single source of truth for everything pending (upstream-blocked, sibling-blocked, unstarted, test gaps) |
 | [`SECURITY.md`](SECURITY.md) | How to report a vulnerability (private channels only) |
 | [`AGENTS.md`](AGENTS.md) | Invariants and rules for AI coding agents working on this repo |
 

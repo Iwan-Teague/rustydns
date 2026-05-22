@@ -35,18 +35,13 @@ Doc surfaces:
 - `docs/integration-rustynet.md` — signed dns-zone bundle integration
 - `docs/operator-endpoints.md` — `/metrics`, `/health`, `/queries` reference
 - `docs/deployment-docker.md` — image layout, capability model, compose template
+- `docs/roadmap.md` — single source of truth for everything pending (upstream-blocked, sibling-blocked, unstarted features, test gaps)
 - `AGENTS.md` — this file
 - `CLAUDE.md` — Claude-specific guidance
 
-Known deferrals (not blockers):
-- RFC 7816 query name minimisation + RFC 8467 padding — hickory 0.26's stub
-  resolver doesn't expose either; daemon emits a startup `warn!` whenever the
-  matching `privacy.*` knob is enabled so operators aren't misled.
-- NodeId-keyed `[[policy]]` entries — parsed but inert pending Rustynet
-  peer-table integration; IP-keyed policy is fully wired.
-- `privacy.query_log_to_disk` — opt-in but unimplemented; emits a startup warning.
-- SIGHUP today reloads only blocklists + mesh bundle; full config reload
-  (listeners, TLS, upstreams) requires a process restart.
+**Deferrals:** see [`docs/roadmap.md`](docs/roadmap.md). Nothing is hidden in
+crate-level docs or scattered "(planned)" markers — if it isn't in roadmap.md,
+it isn't pending.
 
 ## Conventions inherited from the suite
 

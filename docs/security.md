@@ -381,10 +381,11 @@ service on exit, so an abort is not a permanent denial of service.
 
 An attacker-controlled domain returns a short-TTL record pointing to `127.0.0.1` or
 a private IP. After the TTL expires the browser re-resolves and the attacker's JS can
-now make requests to the local interface. RustyDNS (planned) will optionally reject
-responses from upstream that resolve to RFC 1918, loopback, or link-local addresses
-(`block_private_rdata = true`). Operators on networks where internal names resolve to
-private IPs should leave this option off and instead rely on DNS firewall rules.
+now make requests to the local interface. A pending mitigation (`block_private_rdata
+= true`) would optionally reject upstream responses that resolve to RFC 1918,
+loopback, or link-local addresses; see [`roadmap.md`](roadmap.md) §3.3.
+Operators on networks where internal names legitimately resolve to private IPs
+should leave the option off when it lands and rely on DNS firewall rules instead.
 
 ### DNS Amplification Between Mesh Nodes
 
@@ -392,7 +393,7 @@ Mesh nodes that are granted the `dns` capability can query RustyDNS. A compromis
 node could use RustyDNS as a DNS amplification vector to flood third parties. Mitigations:
 
 - The daemon binds only to local interfaces by default (`listen = "127.0.0.1:53"`).
-- Rate limiting per source IP is planned.
+- Per-client rate limiting is on the roadmap; see [`roadmap.md`](roadmap.md) §3.4.
 - The systemd unit sets `TasksMax=64` to limit concurrency.
 - `MemoryDenyWriteExecute` and `SystemCallFilter` limit what a compromised process
   can do even if it achieves code execution inside the daemon.

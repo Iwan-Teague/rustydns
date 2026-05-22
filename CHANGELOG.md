@@ -163,15 +163,17 @@ See `docs/operator-endpoints.md` for the full reference.
   `validate_config` rejects `dot_listen` without both.
 
 ### Known deferrals
-- RFC 8467 padding and RFC 7816 query name minimisation —
-  hickory 0.26's stub resolver still doesn't expose either.
-  rustydnsd now emits a `tracing::warn!` at startup whenever
-  `privacy.upstream_padding = true` or
-  `privacy.query_minimization = true` is set, so an operator
-  doesn't silently believe these are active. The settings stay
-  in `rustydns.toml` and will be honoured the moment hickory
-  ships support.
-- Rustynet peer-table → `NodeId` resolution for the `node_id`
-  half of `[[policy]]` — pending Rustynet-side work.
-- Disk persistence for the query log — `privacy.query_log_to_disk`
-  is opt-in but unimplemented; emits a startup warning.
+
+The full, structured list of unfinished work lives in
+[`docs/roadmap.md`](docs/roadmap.md) — single source of truth for
+upstream-blocked items (hickory 0.26: RFC 7816 qmin, RFC 8467 padding),
+sibling-blocked items (Rustynet peer-table → NodeId-keyed policy
+matching), unstarted features (`query_log_to_disk`, SIGHUP full-config
+reload, DNS rebinding defence, per-client rate limiting), test
+coverage gaps, and maintenance items.
+
+For each pending item rustydnsd today either emits an explicit
+startup `tracing::warn!` (qmin/padding, NodeId-only policy,
+`query_log_to_disk`) or surfaces the limitation in the relevant
+crate-level doc, so an operator running with that flag set never
+silently believes the feature is active.
