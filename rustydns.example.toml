@@ -66,6 +66,11 @@ resolvers = [
 #   resolved domain name to network observers (ISPs, on-path attackers).
 #   Using "plain" emits a startup warning and will become a hard error in a
 #   future release.
+# ⚠ The `protocol` value MUST match the scheme of every URL in `resolvers`:
+#   - "doh"   → all resolvers must start with `https://`
+#   - "doq"   → all resolvers must start with `quic://`  (e.g. "quic://dns.adguard-dns.com:853")
+#   - "plain" → all resolvers must be bare `host:port` (no scheme), e.g. "1.1.1.1:53"
+#   The daemon refuses to start on a mismatch — caught at validate_config.
 protocol = "doh"
 
 # Return SERVFAIL when all upstreams fail.
