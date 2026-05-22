@@ -292,8 +292,10 @@ mod tests {
 
     #[test]
     fn config_allowlist_overrides_blocklist() {
-        let mut cfg = BlocklistConfig::default();
-        cfg.allowlist = vec!["safe.ads.example.com".to_string()];
+        let cfg = BlocklistConfig {
+            allowlist: vec!["safe.ads.example.com".to_string()],
+            ..BlocklistConfig::default()
+        };
         let e = BlocklistEngine::new(cfg);
         e.load("0.0.0.0 safe.ads.example.com\n0.0.0.0 other.ads.example.com\n");
         assert!(!e.is_blocked("safe.ads.example.com"));

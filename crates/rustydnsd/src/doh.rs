@@ -186,7 +186,7 @@ impl ResponseHandler for DohResponseHandler {
         encoder.set_max_size(u16::MAX);
         let info = response
             .destructive_emit(&mut encoder)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode error: {e}")))?;
+            .map_err(|e| io::Error::other(format!("encode error: {e}")))?;
 
         let mut sender = self.sender.lock().await;
         if let Some(sender) = sender.take() {
@@ -253,18 +253,22 @@ mod tests {
         };
         let authority = Arc::new(Authority::new(authority_cfg).unwrap());
 
-        let mut bl_cfg = BlocklistConfig::default();
-        bl_cfg.sources = Vec::new();
-        bl_cfg.reload_interval_secs = 0;
-        bl_cfg.block_response = block_response;
+        let bl_cfg = BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            block_response,
+            ..BlocklistConfig::default()
+        };
         let blocklist = Arc::new(BlocklistEngine::new(bl_cfg));
         if !blocklist_lines.is_empty() {
             blocklist.load_trusted(blocklist_lines);
         }
 
-        let mut upstream = UpstreamConfig::default();
-        upstream.resolvers = upstream_resolvers;
-        upstream.timeout_ms = 500;
+        let upstream = UpstreamConfig {
+            resolvers: upstream_resolvers,
+            timeout_ms: 500,
+            ..UpstreamConfig::default()
+        };
         let mut dns_config = DnsConfig {
             server: Default::default(),
             upstream,

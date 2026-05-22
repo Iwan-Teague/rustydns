@@ -633,10 +633,12 @@ mod tests {
         };
         let authority = Arc::new(Authority::new(authority_cfg).expect("authority"));
 
-        let mut blocklist_cfg = BlocklistConfig::default();
-        blocklist_cfg.sources = Vec::new();
-        blocklist_cfg.reload_interval_secs = 0;
-        blocklist_cfg.block_response = block_response;
+        let blocklist_cfg = BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            block_response,
+            ..BlocklistConfig::default()
+        };
         let blocklist = Arc::new(BlocklistEngine::new(blocklist_cfg));
         if !blocklist_lines.is_empty() {
             blocklist.load_trusted(blocklist_lines);
@@ -644,11 +646,12 @@ mod tests {
 
         // Build a DnsConfig for the resolver. We intentionally use
         // unreachable upstreams in the SERVFAIL test so we never touch
-        // the network in CI.
-        let mut upstream = UpstreamConfig::default();
-        upstream.resolvers = upstream_resolvers;
-        // Short timeout so the SERVFAIL test doesn't take 5+ seconds.
-        upstream.timeout_ms = 500;
+        // the network in CI. Short timeout so SERVFAIL doesn't take 5+s.
+        let upstream = UpstreamConfig {
+            resolvers: upstream_resolvers,
+            timeout_ms: 500,
+            ..UpstreamConfig::default()
+        };
         let mut dns_config = DnsConfig {
             server: Default::default(),
             upstream,

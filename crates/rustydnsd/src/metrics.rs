@@ -360,6 +360,28 @@ fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn register_counter(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+) -> Result<IntCounter, RustyDnsError> {
+    let counter = IntCounter::new(name, help)
+        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
+    registry
+        .register(Box::new(counter.clone()))
+        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
+    Ok(counter)
+}
+
+fn register_gauge(registry: &Registry, name: &str, help: &str) -> Result<IntGauge, RustyDnsError> {
+    let gauge = IntGauge::new(name, help)
+        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
+    registry
+        .register(Box::new(gauge.clone()))
+        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
+    Ok(gauge)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,26 +435,4 @@ mod tests {
             .unwrap();
         assert_eq!(&body[..], b"{\"status\":\"ok\"}");
     }
-}
-
-fn register_counter(
-    registry: &Registry,
-    name: &str,
-    help: &str,
-) -> Result<IntCounter, RustyDnsError> {
-    let counter = IntCounter::new(name, help)
-        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
-    registry
-        .register(Box::new(counter.clone()))
-        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
-    Ok(counter)
-}
-
-fn register_gauge(registry: &Registry, name: &str, help: &str) -> Result<IntGauge, RustyDnsError> {
-    let gauge = IntGauge::new(name, help)
-        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
-    registry
-        .register(Box::new(gauge.clone()))
-        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
-    Ok(gauge)
 }
