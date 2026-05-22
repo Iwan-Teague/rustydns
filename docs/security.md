@@ -265,10 +265,18 @@ The systemd unit (see `install/rustydns.service`) uses `AmbientCapabilities=CAP_
 and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` to ensure no other capability is ever
 available to the process, and runs the daemon as an unprivileged `rustydns` user.
 
-For deployments without systemd, the binary will perform in-process capability dropping
-after binding its sockets (planned: `caps::securebits` + `prctl(PR_SET_SECUREBITS)`).
-Until that is implemented, operators should use a capability-aware service manager or
-bind the sockets via a privileged helper and pass them via socket activation.
+For deployments without systemd, the binary drops capabilities in-process after
+binding its sockets via the `caps` crate (Linux-only; no-op on other targets).
+The runtime call clears every non-network capability inherited from the parent
+process and the bounding set, leaving only `CAP_NET_BIND_SERVICE` if it was
+present at bind time.
+
+The Docker image ships the same posture two ways: a `setcap
+cap_net_bind_service=+ep` file capability baked onto the binary, plus
+`cap_drop: [ALL]` + `cap_add: [NET_BIND_SERVICE]` in
+[`docker-compose.yml`](../docker-compose.yml) so the orchestrator state matches
+the file caps. See [`docs/deployment-docker.md`](deployment-docker.md) for the
+full image security posture.
 
 ### Systemd Hardening
 
@@ -436,8 +444,10 @@ If disk logging is enabled, query logs may contain domain names that reveal sens
 browsing behaviour. Mitigations:
 
 - Disk logging is opt-in and emits a startup warning.
-- The systemd unit sets `UMask=0077`, ensuring new log files created by the daemon
-  are `600` (owner-read only) by default.
+- The systemd unit sets `UMask=0077`. For non-systemd deployments
+  (Docker, runit, OpenRC, bare CLI) the daemon calls `umask(0o077)` in-process
+  at startup, so every file the daemon creates is owner-only regardless of
+  service-manager state.
 - Operators should configure log rotation (e.g. `logrotate`) with `create 600 rustydns rustydns`.
 - Log files should not be placed in world-readable directories.
 
