@@ -27,13 +27,18 @@
 //!
 //! The daemon binds privileged ports (53, 853) then drops capabilities.
 //! Under systemd the unit enforces `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`.
-//! For non-systemd deployments, the daemon drops capabilities in-process after
-//! binding sockets (see the `drop_capabilities` TODO below).
+//! For non-systemd deployments, the daemon drops capabilities in-process
+//! after binding sockets via [`drop_capabilities`] (Linux-only; no-op on
+//! other targets).
 //!
 //! # Status
 //!
-//! Milestone 4 (in progress). UDP/TCP query pipeline, DoT/DoH listeners,
-//! metrics, and blocklist reload are implemented; capability dropping remains TODO.
+//! Milestone 4 (substantially complete). UDP/TCP/DoH query pipeline,
+//! metrics, mesh-zone bundle reload, blocklist reload, per-client
+//! policy, query log ring buffer, capability dropping, and bounded
+//! graceful shutdown are all wired up. DoT listener remains deferred
+//! pending the hickory-server rustls upgrade (see the DoT block in
+//! [`main`] for details).
 
 mod blocklist_loader;
 mod doh;
