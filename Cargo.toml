@@ -73,7 +73,7 @@ futures-util = "0.3"
 moka = { version = "0.12", features = ["future"] }
 
 # Prometheus metrics
-prometheus = "0.13"
+prometheus = "0.14"
 
 # Verifies the ed25519 signature on the Rustynet dns-zone bundle.
 # `default-features = false` drops `rand_core` from the public API surface,
