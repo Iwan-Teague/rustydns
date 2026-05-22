@@ -209,8 +209,8 @@ async fn main() -> Result<()> {
         // reqwest), and bridging the two ServerConfig types isn't
         // worthwhile for a single listener. For now, run DoT behind a
         // TLS-terminating reverse proxy that forwards to the plain TCP
-        // listener.
-        let _ = load_tls_config; // silence dead_code if compiled
+        // listener. `load_tls_config` is annotated `#[allow(dead_code)]`
+        // so it stays compiled and ready for the hickory upgrade.
         bail!(
             "server.dot_listen `{dot_listen}` requested but DoT is not yet supported in-process \
              (blocked on hickory-server rustls 0.21 → 0.23 upgrade). Remove dot_listen from the \
@@ -783,6 +783,12 @@ fn drop_capabilities() {
     );
 }
 
+/// Build a rustls [`TlsServerConfig`] from the cert+key paths in
+/// `server`. Kept compiled — but not currently called — because the
+/// DoT listener block in `main()` bails before it can use one, see
+/// the TODO there. Will be invoked once hickory-server moves to
+/// rustls 0.23 and we can hand it our workspace `Arc<ServerConfig>`.
+#[allow(dead_code)]
 fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
     let cert_path = server.tls_cert_path.as_ref().ok_or_else(|| {
         anyhow!("server.tls_cert_path must be set when server.dot_listen is enabled")
