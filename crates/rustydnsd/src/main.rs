@@ -214,19 +214,14 @@ async fn main() -> Result<()> {
     drop_capabilities();
 
     if let Some(dot_listen) = &config.server.dot_listen {
-        // TODO: enable DoT listener once hickory-server upgrades to
-        // rustls 0.23. hickory-server 0.24 pins rustls 0.21 internally
-        // while the rest of our workspace uses rustls 0.23 (axum,
-        // reqwest), and bridging the two ServerConfig types isn't
-        // worthwhile for a single listener. For now, run DoT behind a
-        // TLS-terminating reverse proxy that forwards to the plain TCP
-        // listener. `load_tls_config` is annotated `#[allow(dead_code)]`
-        // so it stays compiled and ready for the hickory upgrade.
-        bail!(
-            "server.dot_listen `{dot_listen}` requested but DoT is not yet supported in-process \
-             (blocked on hickory-server rustls 0.21 → 0.23 upgrade). Remove dot_listen from the \
-             config, or terminate TLS at a reverse proxy and forward to the plain TCP listener."
-        );
+        let tls_config = load_tls_config(&config.server)?;
+        let dot = TcpListener::bind(dot_listen)
+            .await
+            .with_context(|| format!("failed to bind DoT listener on {dot_listen}"))?;
+        server
+            .register_tls_listener_with_tls_config(dot, Duration::from_secs(5), tls_config)
+            .with_context(|| format!("failed to register DoT listener on {dot_listen}"))?;
+        info!(listen = %dot_listen, "listening for DoT");
     }
 
     let shutdown = CancellationToken::new();
@@ -797,11 +792,7 @@ fn drop_capabilities() {
 }
 
 /// Build a rustls [`TlsServerConfig`] from the cert+key paths in
-/// `server`. Kept compiled — but not currently called — because the
-/// DoT listener block in `main()` bails before it can use one, see
-/// the TODO there. Will be invoked once hickory-server moves to
-/// rustls 0.23 and we can hand it our workspace `Arc<ServerConfig>`.
-#[allow(dead_code)]
+/// `server`. Called when `dot_listen` is configured.
 fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
     let cert_path = server.tls_cert_path.as_ref().ok_or_else(|| {
         anyhow!("server.tls_cert_path must be set when server.dot_listen is enabled")

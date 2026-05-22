@@ -106,12 +106,15 @@ See `docs/operator-endpoints.md` for the full reference.
   warning-only setting because hickory 0.24's internal rustls 0.21
   wouldn't accept the workspace's rustls 0.23 config.
 
-### Known deferrals
+### Added
 
-- DNS-over-TLS listener — hickory-server 0.26 exposes the right TLS
-  API but the daemon hasn't been wired to it yet; tracked as a
-  TODO in `main.rs`. Use a TLS-terminating reverse proxy in the
-  meantime.
+- **DNS-over-TLS listener** (`server.dot_listen`). Now wired
+  end-to-end with hickory-server 0.26's
+  `register_tls_listener_with_tls_config`. Requires
+  `server.tls_cert_path` and `server.tls_key_path`; validation in
+  `validate_config` rejects `dot_listen` without both.
+
+### Known deferrals
 - RFC 8467 padding and RFC 7816 query name minimisation —
   hickory 0.26's stub resolver still doesn't expose either.
 - Rustynet peer-table → `NodeId` resolution for the `node_id`
