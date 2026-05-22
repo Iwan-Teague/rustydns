@@ -37,6 +37,11 @@ This project does not yet follow semantic versioning — every change up to
 - Background poller on `poll_interval_secs`; SIGHUP also triggers
   reload.
 - Static-record store with merge-on-snapshot.
+- Intra-zone CNAME chain following per RFC 1034 §3.6.2 — `lookup`
+  returns the full `[CNAME, …, terminal]` answer when the chain
+  stays inside the authority's zones, falling back to the partial
+  chain when it crosses into a zone we don't own. Loop detection
+  via a visited-name set; depth capped at 8 hops.
 
 ### Resolver
 
