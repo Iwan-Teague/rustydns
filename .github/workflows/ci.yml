@@ -12,6 +12,11 @@ env:
   # missing docs, etc.). Clippy *style* lints stay as warnings — they
   # surface in the log without breaking the build.
   RUSTFLAGS: -Dwarnings
+  # Opt JavaScript-based actions (checkout, cache, docker/*) onto
+  # Node.js 24 ahead of the June 2026 default switch. The pinned
+  # action versions are unchanged; this just runs them on the newer
+  # Node runtime and silences the deprecation notice in every run.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   test:

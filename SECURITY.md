@@ -79,8 +79,9 @@ Out of scope (please file these as regular issues):
 Independent of receiving a report, please read:
 
 - [`AGENTS.md`](AGENTS.md) §Privacy invariants and §Security invariants
-- [`docs/security.md`](docs/security.md)
-- [`docs/operator-endpoints.md`](docs/operator-endpoints.md)
+- [`docs/security.md`](docs/security.md) — threat model + countermeasure rationale
+- [`docs/operator-endpoints.md`](docs/operator-endpoints.md) — `/metrics`, `/health`, `/queries` reference and loopback-only contract
+- [`docs/deployment-docker.md`](docs/deployment-docker.md) — image capability model, compose hardening, metrics-via-sidecar pattern
 
 These document what the daemon protects against by construction, and
 what the operator is responsible for (firewall placement, file
