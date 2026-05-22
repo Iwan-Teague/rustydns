@@ -35,6 +35,8 @@ pub struct Metrics {
     mesh_zone_reload_success_total: IntCounter,
     mesh_zone_reload_failure_total: IntCounter,
     mesh_zone_last_reload: IntGauge,
+    policy_blocklist_bypass_total: IntCounter,
+    policy_zone_denied_total: IntCounter,
 }
 
 impl Metrics {
@@ -115,6 +117,19 @@ impl Metrics {
             "Unix timestamp of the most recent mesh-zone reload attempt",
         )?;
 
+        let policy_blocklist_bypass_total = register_counter(
+            &registry,
+            "rustydns_policy_blocklist_bypass_total",
+            "Queries for which a [[policy]] entry's blocklist_bypass=true \
+             skipped the blocklist check",
+        )?;
+        let policy_zone_denied_total = register_counter(
+            &registry,
+            "rustydns_policy_zone_denied_total",
+            "Queries refused with REFUSED because they fell outside a \
+             [[policy]] entry's zones_allowed list",
+        )?;
+
         Ok(Self {
             registry,
             dns_queries_total,
@@ -131,6 +146,8 @@ impl Metrics {
             mesh_zone_reload_success_total,
             mesh_zone_reload_failure_total,
             mesh_zone_last_reload,
+            policy_blocklist_bypass_total,
+            policy_zone_denied_total,
         })
     }
 
@@ -195,6 +212,18 @@ impl Metrics {
     pub fn mark_mesh_zone_reload_failure(&self) {
         self.mesh_zone_reload_failure_total.inc();
         self.mesh_zone_last_reload.set(now_unix_secs());
+    }
+
+    /// Increment when a `[[policy]]` entry's `blocklist_bypass = true`
+    /// caused the daemon to skip the blocklist for a query.
+    pub fn inc_policy_blocklist_bypass(&self) {
+        self.policy_blocklist_bypass_total.inc();
+    }
+
+    /// Increment when a query was refused with `REFUSED` because it
+    /// fell outside the matching `[[policy]]` entry's `zones_allowed`.
+    pub fn inc_policy_zone_denied(&self) {
+        self.policy_zone_denied_total.inc();
     }
 }
 

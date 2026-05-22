@@ -263,6 +263,7 @@ impl RequestHandler for DnsHandler {
         // the pipeline. Mesh-local quarantine clients never even probe
         // the resolver / blocklist.
         if !policy.zones_allowed.is_empty() && !name_in_any_zone(&qname, &policy.zones_allowed) {
+            self.metrics.inc_policy_zone_denied();
             warn!(client = %client.anonymized(), "policy denied: name outside zones_allowed");
             let builder = MessageResponseBuilder::from_message_request(request);
             self.log_query(&client, &qname, &qtype_str, ResponseCode::Refused, ServedBy::Rejected);
@@ -280,6 +281,14 @@ impl RequestHandler for DnsHandler {
                 .await;
         }
 
+        // Surface blocklist_bypass only when it ACTUALLY changed the
+        // outcome — i.e. the name would have been blocked but wasn't.
+        // A trivial bypass on a name that wasn't on the blocklist
+        // anyway doesn't deserve a metric bump.
+        let bypassed = policy.blocklist_bypass && self.blocklist.is_blocked(&qname);
+        if bypassed {
+            self.metrics.inc_policy_blocklist_bypass();
+        }
         if !policy.blocklist_bypass && self.blocklist.is_blocked(&qname) {
             self.metrics.inc_blocklist_hits();
             // PRIVACY: qname logged at debug only; do not enable debug in production.
