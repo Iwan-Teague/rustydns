@@ -891,6 +891,86 @@ mod tests {
         assert!(msg.contains("failed to open TLS certificate"), "msg = {msg}");
     }
 
+    /// Self-signed RSA-2048 cert + key, generated once with
+    /// `openssl req -x509 -newkey rsa:2048 -nodes -days 3650
+    ///   -subj /CN=rustydns-dot-test`. Embedded so the DoT
+    /// happy-path tests don't need rcgen as a dev-dep.
+    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDGTCCAgGgAwIBAgIUEd8GWwaMg5zLd0XDLzSa2HZYjsEwDQYJKoZIhvcNAQEL
+BQAwHDEaMBgGA1UEAwwRcnVzdHlkbnMtZG90LXRlc3QwHhcNMjYwNTIyMTA1OTE5
+WhcNMzYwNTE5MTA1OTE5WjAcMRowGAYDVQQDDBFydXN0eWRucy1kb3QtdGVzdDCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMbYbDI5ANPGnkZXL5A2zaUA
+k64xny7whO8juzwIswcWrqXFp/m0e2EFUJujkGu3dIwC8Oqsa+go6sCJpSERg/1p
+Y1mmgKy4ez5FdlgDo+LvjkZJ22mRF+7+N7ElMC9liCJYYOIfvtBKb35CYs8I4zw9
+WpJESxS4Hyy5ia+3YSPsWk4HX/NeccFq9hlcQfCfbte2rfhKTzEnZp7sgxN5zmfy
+UmcIzWJBXcBw+ouLLS6kpr7vNRTg7BcJnjEtL0lPCFj9hP6vw0l4upyA+34SYn5y
+g9eJhkSPJjlsokaj7VhUQxTJBTG2Fz9hGNsQLhE7320JQOlEJDmw+lsENpAd1UsC
+AwEAAaNTMFEwHQYDVR0OBBYEFKHHciKdGQiMvQrXe3iCGa/XsC7eMB8GA1UdIwQY
+MBaAFKHHciKdGQiMvQrXe3iCGa/XsC7eMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZI
+hvcNAQELBQADggEBAFBb4faC0L4sGKISgSwrCNrcP91KXq8ZtEBdc715MCl1Cp+R
+SP/aBwb9Jt9a45AFOhAF4lC2hWWQb9AwhCxlROcPHmbGebt1R9Gh8UMMdvWzKS55
+G0yiXPoSG5xdGAGq8j3uK3qQ3wS+VfbNL0DxeRlIy8LZwzBAkOASiDKxRQoCi3mB
+S5z5o09i0nIrrwb+6phvhmA9hGBD1e7WrH3aBEYNr2KzDLKP1UM1/JRCx6637l7a
+OzruSK0A/KcvkFLz3x8ZsaN9OBY8Yd2/wd6otNnW442NDr36yF6/+OiDwHdWB8Xr
+B4kGZa2yTEPpjUJoAwTj0UuvD0RZowho8BrHpW0=
+-----END CERTIFICATE-----
+";
+
+    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDG2GwyOQDTxp5G
+Vy+QNs2lAJOuMZ8u8ITvI7s8CLMHFq6lxaf5tHthBVCbo5Brt3SMAvDqrGvoKOrA
+iaUhEYP9aWNZpoCsuHs+RXZYA6Pi745GSdtpkRfu/jexJTAvZYgiWGDiH77QSm9+
+QmLPCOM8PVqSREsUuB8suYmvt2Ej7FpOB1/zXnHBavYZXEHwn27Xtq34Sk8xJ2ae
+7IMTec5n8lJnCM1iQV3AcPqLiy0upKa+7zUU4OwXCZ4xLS9JTwhY/YT+r8NJeLqc
+gPt+EmJ+coPXiYZEjyY5bKJGo+1YVEMUyQUxthc/YRjbEC4RO99tCUDpRCQ5sPpb
+BDaQHdVLAgMBAAECggEABW/lhXoJi8DikwnPQyI8fUaGwzyYHbB18hQICpwySP9V
+xzKgZTOKLBz5F0hhqpBZn3p1G/Wa/b4grSMWYNEZytQW41yqKA7jT9CWa9GtqYbj
+XQin9zsAbIiG/VEHAETGdCn2fDhh/1AJvGoUSZT0obELyPQVGXvvXkm0ehmJjnHb
+pZTY4ByyiDjTrHdhXcvm5T88ELzM8bZXssSvzWNcWg/vqK8OpbYruPXUNPrixZFR
+BGRTku4eCKlagCS1UhEexv8qyIIiNMoce2hestcS6oGjwK2srSwjnFZWUmevWjlC
+lWndH60KB84+njzJANT7rOs+D9sgcjVmkoK6Em5oAQKBgQD0UHXRI4lClF6XzS2L
+AHkNo8zKUXosM82aokdMycrg8Z6l0StiT6jUXnGO2ZjiwqzufNsCT7tl6eQDIhus
+PJwiic2fqpNUH9uuaPPI2jKeI/xv4bxp49R/S/YWSYPAjjlamBWnskhUbdbU08y6
+521c7EsF/oRPyYxFT4+i5mxXFQKBgQDQWzZZiC3zC2z0ZggqxRyRCeUhXrB3xgYq
+r3KPIl/SZttto8M6ZDF5gcauuO7lyRkQleMPcp6HfmCVIXeWpzUQFA1bFtZVB9qU
+jkl35VXNRT0vDr19HS8ckuYqvWkRFpbK9lncIoxf1zcP9aJqXGFLX8E7ngISiHNz
+6iB+WsSS3wKBgQCqw15GCq+SwL+JHNkbUf5KgVXPh7l8Ec1AqvJpApZyOY+o2JWZ
+RpJ7tXNr5D2PKYDTxKMTb4VNS3ialAmBjm+XWHhHhGMrpoTW1/alSZWdoQt9a+tU
+m/DX9NERbNrRCNefsbNZHiyeDpPc+Bkd/koba/FYRDhYyEfp3h1IQAQzrQKBgExJ
+2XCWyBxBhrdF1J+0ZG1Grjq1rO9t9jwS2WNHNsaXGqjeWVE79lGDDvhShkZkh2Tn
+PKgfU6RQxZRVGLB0sJ0eenVruzaPFZ1nK8dWlT//phNg1kjFMsbHkrb7e0jieHwA
+D47mp3dAGc0iJ0HCaW1rthjaFfArPfqnMxaQrYEJAoGADtxyxJYTXvwCHiY2TeeK
+OSL0Z7E6isvW9IgVx9nsYiNF1EoQKLyDUkwsFq83Z0LcGGVL8pseO9fX4RXJTrhm
+87hTje9BDp/CSOhaHvEnY/eNJsiRK8heG6+MFE5Kebji6+1gefNnkifSEoDeyb9Z
+2VHms4wsOnEZFoPWoyIxL+Q=
+-----END PRIVATE KEY-----
+";
+
+    #[test]
+    fn load_tls_config_accepts_valid_pem_pair() {
+        let cert = tmp_path("good-cert.pem");
+        let key = tmp_path("good-key.pem");
+        write_file(&cert, TEST_CERT_PEM.as_bytes());
+        write_file(&key, TEST_KEY_PEM.as_bytes());
+
+        // ring needs to be installed as the default provider for
+        // ClientConfig builders elsewhere in the workspace. The DoT
+        // ServerConfig builder used here is happy with whatever
+        // provider is registered globally; this also runs first in
+        // test order on many machines so make the install idempotent
+        // and best-effort.
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+
+        let cfg = load_tls_config(&server_with_paths(Some(cert), Some(key)))
+            .expect("valid PEM pair must load");
+        // The returned config is wrapped in Arc; we don't probe its
+        // internals further — that's hickory's job during the
+        // handshake.
+        assert!(Arc::strong_count(&cfg) >= 1);
+    }
+
     #[test]
     fn load_tls_config_rejects_empty_cert_file() {
         let cert = tmp_path("empty-cert.pem");
