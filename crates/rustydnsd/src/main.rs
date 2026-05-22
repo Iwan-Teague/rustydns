@@ -101,6 +101,16 @@ async fn main() -> Result<()> {
     let config =
         rustydns_core::config::load_config(&config_path).context("failed to load configuration")?;
 
+    // `--print-config`: emit the resolved config and exit. Implies
+    // --validate-config (load_config has already run validate_config).
+    // Sensitive fields render as <redacted> via the Secret Debug impl.
+    if args.print_config {
+        let rendered = toml::to_string_pretty(&config)
+            .context("failed to serialise resolved config as TOML")?;
+        print!("{rendered}");
+        return Ok(());
+    }
+
     // `--validate-config`: stop here. We've already parsed the file and
     // run `validate_config` (inside `load_config`). Exit 0 to signal
     // success to the install script or CI step that invoked us.
@@ -405,6 +415,11 @@ struct CliArgs {
     /// `--validate-config`: load config, run validation, exit. Never
     /// binds sockets. Useful in deployment checklists and CI.
     validate_only: bool,
+    /// `--print-config`: load + validate + emit the resolved config
+    /// to stdout (TOML), then exit 0. Useful for debugging
+    /// "what does the daemon actually think it has?" without
+    /// running it. Implies `--validate-config`.
+    print_config: bool,
 }
 
 fn parse_args() -> Result<CliArgs> {
@@ -412,6 +427,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut i = 1;
     let mut config_path = "rustydns.toml".to_string();
     let mut validate_only = false;
+    let mut print_config = false;
 
     while i < argv.len() {
         match argv[i].as_str() {
@@ -423,6 +439,7 @@ fn parse_args() -> Result<CliArgs> {
                 config_path = argv[i].clone();
             }
             "--validate-config" => validate_only = true,
+            "--print-config" => print_config = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -439,6 +456,7 @@ fn parse_args() -> Result<CliArgs> {
     Ok(CliArgs {
         config_path,
         validate_only,
+        print_config,
     })
 }
 
@@ -459,6 +477,10 @@ OPTIONS:
                           AGENTS.md. Sockets are never bound. Exit 1 on
                           validation failure. Useful in install scripts
                           and CI.
+    --print-config        Load + validate + emit the resolved config to
+                          stdout (TOML) and exit 0. Sockets are never
+                          bound. Useful for debugging deployment issues;
+                          sensitive fields print as <redacted>.
     -V, --version         Print version and exit.
     -h, --help            Show this help and exit.
 
