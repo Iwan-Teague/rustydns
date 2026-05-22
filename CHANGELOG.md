@@ -146,6 +146,12 @@ See `docs/operator-endpoints.md` for the full reference.
 ### Known deferrals
 - RFC 8467 padding and RFC 7816 query name minimisation —
   hickory 0.26's stub resolver still doesn't expose either.
+  rustydnsd now emits a `tracing::warn!` at startup whenever
+  `privacy.upstream_padding = true` or
+  `privacy.query_minimization = true` is set, so an operator
+  doesn't silently believe these are active. The settings stay
+  in `rustydns.toml` and will be honoured the moment hickory
+  ships support.
 - Rustynet peer-table → `NodeId` resolution for the `node_id`
   half of `[[policy]]` — pending Rustynet-side work.
 - Disk persistence for the query log — `privacy.query_log_to_disk`
