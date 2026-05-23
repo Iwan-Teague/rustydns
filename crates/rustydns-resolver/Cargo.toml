@@ -22,4 +22,9 @@ rustls           = { workspace = true }
 webpki-roots     = "1"
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio        = { workspace = true }
+# Integration tests use a tiny in-process UDP mock DNS server to drive
+# the resolver end-to-end. hickory-proto encodes/decodes the wire
+# messages and tokio-util gives us a CancellationToken for clean
+# server shutdown between tests.
+tokio-util   = { workspace = true }

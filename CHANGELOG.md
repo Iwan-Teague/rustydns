@@ -56,6 +56,24 @@ This project does not yet follow semantic versioning — every change up to
 
 ### Resolver
 
+- **Honour explicit ports on every upstream URL.** Previously,
+  `127.0.0.1:8053` (plain), `https://dns.example.com:8443/dns-query`
+  (DoH), and `quic://dns.example.com:8853` (DoQ) silently went to
+  the protocol-default port (53/443/853) — hickory 0.26's
+  `NameServerConfig::{https,quic,udp_and_tcp}` constructors don't
+  accept a port, so the parsed port was dropped on the floor.
+  `build_name_servers` now stamps the parsed port onto every
+  `ConnectionConfig` after construction, so non-default-port
+  endpoints actually work.
+- **End-to-end integration tests** (`tests/upstream_e2e.rs`). Drive
+  the resolver against an in-process plain-UDP mock and assert
+  happy-path forwarding, fail-closed on upstream silence, hickory
+  cache reuse, conditional-forwarding route dispatch, and the
+  rebinding defence (filters on the default arm, passes through on
+  route arms, no-op when off). Tests use plain DNS so no TLS/cert
+  scaffolding is needed — the code paths under test are
+  protocol-agnostic. DoH-specific tests are still tracked in
+  roadmap §4.1.
 - **DNS-rebinding defence** (`upstream.block_private_rdata`). When
   enabled (default off), strips A/AAAA records from the default
   upstream's responses whose rdata is RFC 1918, loopback, link-local,

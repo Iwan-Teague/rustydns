@@ -102,15 +102,28 @@ marker to the code or doc it relates to**, so no item lives only in one place.
 
 ## 4. Test coverage gaps
 
-### 4.1 Resolver DoH integration tests via `wiremock`
+### 4.1 Resolver DoH integration tests via TLS injection
 
-- **What:** spin up a wiremock server returning canned DoH responses and
-  exercise `Resolver::resolve` end-to-end (cache behaviour, fail-closed,
-  error decoding, ECS strip verification).
-- **Why not yet:** wiremock 0.6 ships TLS support but the resolver
-  intentionally uses `webpki-roots` and won't trust a self-signed cert. Either
-  needs a test-mode CA injection point (resolver code change) or a custom
-  reqwest-backed alternative. Tracked as a real gap, not a "no need".
+- **What's covered today:** end-to-end resolver behaviour is exercised
+  against an in-process plain-UDP DNS mock in
+  `crates/rustydns-resolver/tests/upstream_e2e.rs`. Tests cover:
+  happy-path forwarding, fail-closed on upstream failure, hickory
+  cache reuse across repeat queries, conditional-forwarding route
+  dispatch (zone-matched vs default), and DNS-rebinding defence
+  (default arm filters, route arm does not, defence off passes
+  through). These code paths are protocol-agnostic, so plain DNS
+  exercises them as faithfully as DoH would.
+- **What's still pending:** DoH-specific paths — TLS 1.3 floor
+  enforcement on the wire, DNSSEC validation against a signed mock,
+  RFC 7871 ECS stripping verifiable in the request bytes — still
+  need a test-mode CA injection point. The blocker is the same one
+  this roadmap entry originally captured: the resolver uses
+  `webpki-roots` and won't trust a self-signed cert from `wiremock`.
+  Fix: feature-gated `Resolver::new_with_test_root_certs` that
+  injects extra CAs into the rustls `RootCertStore`. Lower priority
+  than it was before — the high-value pipeline tests now exist on
+  plain DNS, and DoH-specific tests would mostly cover hickory's
+  guarantees rather than rustydns code.
 - **Workspace setup:** `wiremock = "0.6"` is already in `[workspace.dependencies]`.
 
 ### 4.2 Subprocess test for qmin/padding startup warnings

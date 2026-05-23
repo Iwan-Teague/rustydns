@@ -655,7 +655,7 @@ async fn build_name_servers(
     let server_name: Arc<str> = Arc::from(parsed.host.as_str());
     let mut configs = Vec::with_capacity(ips.len());
     for ip in ips {
-        let ns = match protocol {
+        let mut ns = match protocol {
             UpstreamProtocol::Doh => NameServerConfig::https(
                 ip,
                 server_name.clone(),
@@ -666,6 +666,15 @@ async fn build_name_servers(
             UpstreamProtocol::Doq => NameServerConfig::quic(ip, server_name.clone()),
             UpstreamProtocol::Plain => NameServerConfig::udp_and_tcp(ip),
         };
+        // hickory 0.26's `NameServerConfig::{https,quic,udp_and_tcp}`
+        // pin every ConnectionConfig to the protocol's default port
+        // (53/443/853). That ignores the operator-supplied port — a
+        // bare `127.0.0.1:8053` or `https://dns.example.com:8443/...`
+        // would otherwise silently hit the wrong port. Stamp the
+        // parsed port on every ConnectionConfig so the URL is honoured.
+        for conn in &mut ns.connections {
+            conn.port = parsed.port;
+        }
         configs.push(ns);
     }
     Ok(configs)
