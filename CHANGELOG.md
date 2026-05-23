@@ -45,6 +45,18 @@ This project does not yet follow semantic versioning — every change up to
 
 ### Resolver
 
+- **Conditional forwarding** (`[[upstream.routes]]`). Route specific
+  DNS zones to specific upstreams — e.g. `lan.` → `192.168.1.1:53`,
+  `corp.internal.` → an internal DoH endpoint, public traffic →
+  default DoH list. Longest matching zone wins; case-insensitive.
+  Each route gets its own hickory resolver instance. All
+  privacy/security knobs (`fail_closed`, `min_tls_version`,
+  `dnssec_validation`, `randomize_upstream_selection`, ECS strip)
+  are inherited from the global config — there are no per-route
+  escape hatches. Plaintext routes emit the same UNENCRYPTED-leaks
+  startup warning the global plain protocol does. Pipeline order
+  (Authority → Blocklist → Resolver) is unchanged: routes only
+  affect dispatch *within* the resolver step.
 - `hickory-resolver`-backed DoH client with bootstrap DNS via the OS
   resolver (consulted only at startup; never for actual queries).
 - DNSSEC validation gated by config.

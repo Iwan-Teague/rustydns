@@ -72,10 +72,13 @@ Recursive resolver forwarding to upstream servers using DoH (default) or DoQ. Pr
 | Strip EDNS0 Client Subnet | RFC 7871 | ✓ implemented (resolver never sets ECS) |
 | Randomised upstream selection | — | ✓ implemented (`upstream.randomize_upstream_selection`) |
 | Fail-closed (SERVFAIL, no stale fallback) | — | ✓ implemented (`upstream.fail_closed`) |
+| Conditional forwarding (per-zone routes) | — | ✓ implemented (`[[upstream.routes]]`) |
 | Query Name Minimisation | RFC 7816 | ⏳ pending (hickory 0.26 still doesn't expose qmin) |
 | DoH query/response padding | RFC 8467 | ⏳ pending (hickory 0.26 still doesn't expose RFC 8467) |
 
 **There is no stale-answer mode.** When `fail_closed = true` (the default), a failure of all upstreams returns `SERVFAIL`. Returning a stale answer without indicating staleness is a silent privacy degradation — a client might rely on that answer for a domain that has since changed, or the cached answer may have been for a different client's query.
+
+**Conditional forwarding.** `[[upstream.routes]]` attaches a list of resolvers (and an upstream protocol) to a DNS zone. A query whose qname falls inside that zone is forwarded to that route's resolvers instead of the global `upstream.resolvers` list. Longest matching zone wins. Each route gets its own hickory resolver instance; all privacy/security settings (`fail_closed`, `min_tls_version`, `dnssec_validation`, `randomize_upstream_selection`, etc.) are inherited from the global config — there are no per-route escape hatches. Authority and blocklist still run **before** route selection — the pipeline order is unchanged.
 
 ### `rustydns-blocklist`
 

@@ -216,6 +216,7 @@ For a detailed description of each component, see [`docs/architecture.md`](docs/
 | DNSSEC validation                        | Implemented (`upstream.dnssec_validation`) | RFC 4033 |
 | Randomised upstream selection            | Implemented (`upstream.randomize_upstream_selection`) | — |
 | Fail-closed on upstream failure          | Implemented (`upstream.fail_closed`)    | —         |
+| Conditional forwarding (per-zone routes) | Implemented (`[[upstream.routes]]`)     | —         |
 | Client IP anonymisation (/16 IPv4, /64 IPv6) | Implemented                         | —         |
 | In-memory query log (hashed qname, anonymised client) | Implemented                | —         |
 | Query Name Minimisation                  | Pending (hickory 0.26 doesn't expose)   | RFC 7816  |

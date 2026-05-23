@@ -16,6 +16,7 @@
 //! | TLS 1.3 minimum | RFC 8446 | ✓ | `upstream.min_tls_version = "1.3"` | implemented |
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
+//! | Conditional forwarding (per-zone routes) | — | opt-in | `[[upstream.routes]]` | implemented (longest-suffix match) |
 //! | Strip EDNS Client Subnet | RFC 7871 | ✓ | `privacy.no_edns_client_subnet = true` | implemented (we never set ECS) |
 //! | DoH query padding | RFC 8467 | ✓ | `privacy.upstream_padding = true` | **pending** — hickory 0.26 doesn't expose RFC 8467 yet; daemon warns at startup. See `docs/roadmap.md` §1.2. |
 //! | Randomise upstream selection | — | ✓ | `privacy.randomize_upstream_selection = true` | implemented (round-robin server-ordering strategy) |
@@ -69,17 +70,58 @@ use rustydns_core::record::{DnsRecord, RecordData};
 /// Result type for resolver operations.
 pub type ResolverResult<T> = Result<T, RustyDnsError>;
 
+/// A single resolver instance — one hickory `TokioResolver` plus its bound
+/// upstream URLs (kept for logging only).
+///
+/// Used both for the global default upstream list and for each
+/// conditional-forwarding route.
+#[derive(Debug)]
+struct ResolverArm {
+    inner: TokioResolver,
+    upstream_urls: Vec<String>,
+}
+
+/// A conditional-forwarding route: a normalised DNS zone bound to one
+/// [`ResolverArm`].
+#[derive(Debug)]
+struct RouteArm {
+    /// Zone in its fully-normalised form: lowercase, trailing dot, no
+    /// leading dot. E.g. `"lan."` or `"corp.internal."`.
+    ///
+    /// Used to match the zone apex itself (a query for `lan.` should hit
+    /// the `lan.` route).
+    zone_with_dot: String,
+    /// `"." + zone_with_dot`. Used for the suffix check — a query for
+    /// `foo.lan.` ends with `.lan.` and therefore matches.
+    dotted_suffix: String,
+    arm: ResolverArm,
+}
+
 /// The upstream recursive resolver.
 ///
 /// Wraps `hickory-resolver`'s `TokioAsyncResolver` with privacy-preserving
 /// defaults and rustydns-specific failure semantics (fail-closed →
 /// `SERVFAIL`).
+///
+/// # Conditional forwarding
+///
+/// When `upstream.routes` is non-empty, the resolver holds one
+/// independent hickory resolver per route plus the global default. On
+/// every query the qname is matched against the configured zones
+/// (longest-suffix wins, case-insensitive); the matching arm forwards
+/// the query. Unmatched qnames go to the default arm. See the
+/// [`UpstreamConfig::routes`] doc for the model and
+/// [`Resolver::select_arm`] for the dispatch rules.
+///
+/// [`UpstreamConfig::routes`]: rustydns_core::config::UpstreamConfig::routes
 #[derive(Debug)]
 pub struct Resolver {
     config: DnsConfig,
-    inner: TokioResolver,
-    /// The upstream URLs as configured — kept for logging only.
-    upstream_urls: Vec<String>,
+    default: ResolverArm,
+    /// Routes, sorted longest-zone-first so first-match-wins is also
+    /// longest-match-wins (`foo.corp.internal.` prefers a `corp.internal.`
+    /// route over a `internal.` route).
+    routes: Vec<RouteArm>,
 }
 
 impl Resolver {
@@ -90,20 +132,28 @@ impl Resolver {
     /// resolver is consulted; once running, all queries go through the
     /// configured encrypted upstreams.
     ///
+    /// One hickory resolver is built per route plus the default. Each
+    /// arm inherits the global privacy/security settings
+    /// (`fail_closed`, `min_tls_version`, `dnssec_validation`,
+    /// `timeout_ms`, `max_cache_entries`, `randomize_upstream_selection`)
+    /// — there are no per-route overrides for any privacy or security
+    /// knob, by design.
+    ///
     /// # Errors
     ///
-    /// - [`RustyDnsError::Config`] if `upstream.resolvers` is empty or
-    ///   contains an unparseable URL.
-    /// - [`RustyDnsError::Resolver`] if bootstrap resolution of every
-    ///   configured upstream hostname fails (no upstream is usable).
+    /// - [`RustyDnsError::Config`] if `upstream.resolvers` is empty.
+    /// - [`RustyDnsError::Resolver`] if bootstrap resolution fails for
+    ///   every upstream in any arm (default or route). A failed route
+    ///   is fatal — operators who configured a route for `corp.internal.`
+    ///   want corp DNS to work, not to silently fall back to public DoH.
     /// - [`RustyDnsError::Tls`] if the rustls client config cannot be
-    ///   built (e.g. no native CA roots found).
+    ///   built.
     ///
     /// # Startup behaviour
     ///
-    /// - If `upstream.protocol = "plain"`, emits a persistent `warn!`
-    ///   containing "UNENCRYPTED" and "leaks" so it's visible at every
-    ///   service start.
+    /// - If `upstream.protocol = "plain"` for the default OR any route,
+    ///   emits a `warn!` containing "UNENCRYPTED" and "leaks" so it's
+    ///   visible at every service start.
     pub async fn new(config: DnsConfig) -> ResolverResult<Self> {
         if config.upstream.resolvers.is_empty() {
             return Err(RustyDnsError::Config(
@@ -118,6 +168,16 @@ impl Resolver {
                  Switch to \"doh\" or \"doq\" for any deployment where privacy matters."
             );
         }
+        for r in &config.upstream.routes {
+            if r.protocol == UpstreamProtocol::Plain {
+                tracing::warn!(
+                    zone = %r.zone,
+                    "upstream.routes zone uses protocol = \"plain\" — DNS queries for this zone \
+                     will be sent UNENCRYPTED. Domain names in this zone leak to any observer on \
+                     the network path between rustydnsd and the routed resolver."
+                );
+            }
+        }
 
         // TLS 1.3 floor: hickory-resolver 0.26 takes a rustls 0.23
         // ClientConfig matching our workspace, so the configured
@@ -125,70 +185,46 @@ impl Resolver {
         // of being a soft warning the way it was on 0.24).
         let tls_client_config = build_tls_client_config(config.upstream.min_tls_version)?;
 
-        let mut name_servers: Vec<NameServerConfig> = Vec::new();
-        let mut configured_any = false;
-        for url in &config.upstream.resolvers {
-            match build_name_servers(url, config.upstream.protocol).await {
-                Ok(ns_configs) => {
-                    for ns in ns_configs {
-                        name_servers.push(ns);
-                    }
-                    configured_any = true;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        upstream = %url,
-                        error = %e,
-                        "upstream bootstrap failed; skipping this resolver"
-                    );
-                }
-            }
+        // Default arm — the global upstream list.
+        let default = build_resolver_arm(
+            "default",
+            &config.upstream.resolvers,
+            config.upstream.protocol,
+            tls_client_config.clone(),
+            &config,
+        )
+        .await?;
+
+        // Per-route arms. A route that fails to bootstrap any upstream
+        // aborts startup: silent fallback to the default arm would let
+        // a misconfigured corp-DNS route leak internal queries to public
+        // DoH, which is exactly what conditional forwarding is meant to
+        // prevent.
+        let mut routes: Vec<RouteArm> = Vec::with_capacity(config.upstream.routes.len());
+        for r in &config.upstream.routes {
+            let zone_with_dot = r.zone.trim().to_ascii_lowercase();
+            let dotted_suffix = format!(".{zone_with_dot}");
+            let arm = build_resolver_arm(
+                &zone_with_dot,
+                &r.resolvers,
+                r.protocol,
+                tls_client_config.clone(),
+                &config,
+            )
+            .await?;
+            routes.push(RouteArm {
+                zone_with_dot,
+                dotted_suffix,
+                arm,
+            });
         }
-
-        if !configured_any {
-            return Err(RustyDnsError::Resolver(
-                "no upstream resolver could be bootstrapped — check network connectivity and \
-                 the URLs in upstream.resolvers"
-                    .to_string(),
-            ));
-        }
-
-        let resolver_config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
-
-        let mut opts = ResolverOpts::default();
-        // PRIVACY: never advertise EDNS0 Client Subnet. hickory does not
-        // attach ECS automatically, but we also do not enable edns0
-        // unless DNSSEC requires it (which we set below).
-        opts.edns0 = config.upstream.dnssec_validation;
-        opts.validate = config.upstream.dnssec_validation;
-        opts.timeout = Duration::from_millis(config.upstream.timeout_ms);
-        opts.cache_size = config.upstream.max_cache_entries as u64;
-        // Hickory 0.26 took an enum for use_hosts_file. We never want
-        // /etc/hosts consulted for upstream queries (it would leak
-        // mesh names to the OS resolver path on misconfigurations).
-        opts.use_hosts_file = hickory_resolver::config::ResolveHosts::Never;
-        opts.preserve_intermediates = true;
-        // hickory 0.26 dropped `shuffle_dns_servers`; the equivalent is
-        // `ServerOrderingStrategy::RoundRobin` which distributes load
-        // uniformly over time. When randomisation is off we fall back
-        // to QueryStatistics so the healthiest provider gets preference.
-        opts.server_ordering_strategy = if config.privacy.randomize_upstream_selection {
-            ServerOrderingStrategy::RoundRobin
-        } else {
-            ServerOrderingStrategy::QueryStatistics
-        };
-
-        let inner: TokioResolver =
-            HickoryResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
-                .with_options(opts)
-                .with_tls_config((*tls_client_config).clone())
-                .build()
-                .map_err(|e| {
-                    RustyDnsError::Resolver(format!("hickory resolver build failed: {e}"))
-                })?;
+        // Longest zone first so a more-specific route shadows a more-
+        // general one (`corp.internal.` beats `internal.`).
+        routes.sort_by_key(|r| std::cmp::Reverse(r.zone_with_dot.len()));
 
         tracing::info!(
             resolvers   = config.upstream.resolvers.len(),
+            routes      = routes.len(),
             protocol    = ?config.upstream.protocol,
             dnssec      = config.upstream.dnssec_validation,
             fail_closed = config.upstream.fail_closed,
@@ -198,20 +234,21 @@ impl Resolver {
             cache_size  = config.upstream.max_cache_entries,
             "resolver initialised"
         );
-        // Emit the actual upstream URLs at debug level so operators can
-        // confirm which providers are loaded without reading the config
-        // file back. Upstream URLs are not sensitive — they're well-known
-        // public endpoints — but they're noisy enough to warrant `debug`
-        // rather than `info`.
         for url in &config.upstream.resolvers {
-            tracing::debug!(upstream = %url, "resolver upstream loaded");
+            tracing::debug!(upstream = %url, "default upstream loaded");
+        }
+        for r in &routes {
+            tracing::debug!(
+                zone = %r.zone_with_dot,
+                resolvers = r.arm.upstream_urls.len(),
+                "conditional-forwarding route loaded"
+            );
         }
 
-        let upstream_urls = config.upstream.resolvers.clone();
         Ok(Self {
             config,
-            inner,
-            upstream_urls,
+            default,
+            routes,
         })
     }
 
@@ -234,21 +271,52 @@ impl Resolver {
     pub async fn resolve(&self, name: &str, qtype: &str) -> ResolverResult<Vec<DnsRecord>> {
         let record_type = parse_record_type(qtype)?;
 
+        let arm = self.select_arm(name);
+
         // PRIVACY: qname only at debug level. See module-level doc.
+        // The matched zone is operator-configured (not user-controlled)
+        // and therefore safe to log at debug too.
         tracing::debug!(qname = name, qtype = %record_type, "resolving via upstream");
 
-        match self.inner.lookup(name, record_type).await {
+        match arm.inner.lookup(name, record_type).await {
             Ok(lookup) => {
                 let records = lookup_to_dns_records(lookup.answers());
                 tracing::trace!(qtype = %record_type, count = records.len(), "upstream answer");
                 Ok(records)
             }
-            Err(e) => self.map_resolve_error(e),
+            Err(e) => self.map_resolve_error(arm, e),
         }
     }
 
+    /// Pick the [`ResolverArm`] that should handle `name`.
+    ///
+    /// Routes are pre-sorted longest-zone-first; the first route whose
+    /// normalised zone is a suffix of (or equal to) the normalised qname
+    /// wins. If nothing matches the default arm is returned.
+    ///
+    /// When no routes are configured this short-circuits without any
+    /// allocation — the hot path for the typical operator (global DoH
+    /// only) is unchanged from pre-routes.
+    fn select_arm(&self, name: &str) -> &ResolverArm {
+        if self.routes.is_empty() {
+            return &self.default;
+        }
+        // Normalise once per query: lowercase + trailing dot so the
+        // suffix match is a single ends_with call.
+        let mut lower = name.to_ascii_lowercase();
+        if !lower.ends_with('.') {
+            lower.push('.');
+        }
+        for r in &self.routes {
+            if lower == r.zone_with_dot || lower.ends_with(&r.dotted_suffix) {
+                return &r.arm;
+            }
+        }
+        &self.default
+    }
+
     /// Translate a hickory `NetError` into a `RustyDnsError`.
-    fn map_resolve_error(&self, e: NetError) -> ResolverResult<Vec<DnsRecord>> {
+    fn map_resolve_error(&self, arm: &ResolverArm, e: NetError) -> ResolverResult<Vec<DnsRecord>> {
         // No records is not an upstream failure — return empty vec.
         if e.is_no_records_found() {
             return Ok(Vec::new());
@@ -259,12 +327,12 @@ impl Resolver {
         // debug level for operators who opt in via
         // RUST_LOG=rustydns_resolver=debug.
         tracing::warn!(
-            upstreams = self.upstream_urls.len(),
+            upstreams = arm.upstream_urls.len(),
             kind = error_kind_label(&e),
             "upstream resolution failed"
         );
         tracing::debug!(
-            upstreams = self.upstream_urls.len(),
+            upstreams = arm.upstream_urls.len(),
             error     = %e,
             "upstream resolution failed (full error)"
         );
@@ -274,6 +342,85 @@ impl Resolver {
             Err(RustyDnsError::Resolver(error_kind_label(&e).to_string()))
         }
     }
+}
+
+/// Bootstrap-resolve every URL in `resolvers`, build the hickory
+/// resolver options from the shared `config`, and return a ready-to-
+/// query [`ResolverArm`].
+///
+/// `label` is used only in log/error messages so operators can tell
+/// which arm failed to bootstrap (e.g. `"default"`, `"lan."`).
+async fn build_resolver_arm(
+    label: &str,
+    resolvers: &[String],
+    protocol: UpstreamProtocol,
+    tls_client_config: Arc<rustls::ClientConfig>,
+    config: &DnsConfig,
+) -> ResolverResult<ResolverArm> {
+    let mut name_servers: Vec<NameServerConfig> = Vec::new();
+    let mut configured_any = false;
+    for url in resolvers {
+        match build_name_servers(url, protocol).await {
+            Ok(ns_configs) => {
+                for ns in ns_configs {
+                    name_servers.push(ns);
+                }
+                configured_any = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    arm = %label,
+                    upstream = %url,
+                    error = %e,
+                    "upstream bootstrap failed; skipping this resolver"
+                );
+            }
+        }
+    }
+
+    if !configured_any {
+        return Err(RustyDnsError::Resolver(format!(
+            "no upstream resolver could be bootstrapped for arm `{label}` — check network \
+             connectivity and the configured URLs"
+        )));
+    }
+
+    let resolver_config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
+
+    let mut opts = ResolverOpts::default();
+    // PRIVACY: never advertise EDNS0 Client Subnet. hickory does not
+    // attach ECS automatically, but we also do not enable edns0
+    // unless DNSSEC requires it (which we set below).
+    opts.edns0 = config.upstream.dnssec_validation;
+    opts.validate = config.upstream.dnssec_validation;
+    opts.timeout = Duration::from_millis(config.upstream.timeout_ms);
+    opts.cache_size = config.upstream.max_cache_entries as u64;
+    // Hickory 0.26 took an enum for use_hosts_file. We never want
+    // /etc/hosts consulted for upstream queries (it would leak
+    // mesh names to the OS resolver path on misconfigurations).
+    opts.use_hosts_file = hickory_resolver::config::ResolveHosts::Never;
+    opts.preserve_intermediates = true;
+    // hickory 0.26 dropped `shuffle_dns_servers`; the equivalent is
+    // `ServerOrderingStrategy::RoundRobin` which distributes load
+    // uniformly over time. When randomisation is off we fall back
+    // to QueryStatistics so the healthiest provider gets preference.
+    opts.server_ordering_strategy = if config.privacy.randomize_upstream_selection {
+        ServerOrderingStrategy::RoundRobin
+    } else {
+        ServerOrderingStrategy::QueryStatistics
+    };
+
+    let inner: TokioResolver =
+        HickoryResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .with_tls_config((*tls_client_config).clone())
+            .build()
+            .map_err(|e| RustyDnsError::Resolver(format!("hickory resolver build failed: {e}")))?;
+
+    Ok(ResolverArm {
+        inner,
+        upstream_urls: resolvers.to_vec(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +700,88 @@ mod tests {
     use super::*;
     use hickory_proto::rr::Name;
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, PTR, SRV, TXT};
+
+    // --- conditional-forwarding zone matching -----------------------
+    //
+    // These tests exercise the pure matching helper (`zone_matches`)
+    // without standing up real hickory resolvers, so they're fast and
+    // don't need network.
+
+    /// Mirror the matching logic from `Resolver::select_arm` for unit
+    /// testing. Keep this in sync with that function — if either drifts
+    /// the routing behaviour drifts with it.
+    fn zone_matches(qname: &str, zone_with_dot: &str) -> bool {
+        let mut lower = qname.to_ascii_lowercase();
+        if !lower.ends_with('.') {
+            lower.push('.');
+        }
+        let dotted_suffix = format!(".{zone_with_dot}");
+        lower == zone_with_dot || lower.ends_with(&dotted_suffix)
+    }
+
+    #[test]
+    fn zone_matches_exact_apex() {
+        assert!(zone_matches("lan.", "lan."));
+        assert!(zone_matches("lan", "lan."));
+        assert!(zone_matches("LAN.", "lan."));
+    }
+
+    #[test]
+    fn zone_matches_subdomain() {
+        assert!(zone_matches("foo.lan.", "lan."));
+        assert!(zone_matches("foo.bar.lan.", "lan."));
+        assert!(zone_matches("FOO.LAN", "lan."));
+    }
+
+    #[test]
+    fn zone_no_match_for_unrelated() {
+        assert!(!zone_matches("example.com.", "lan."));
+        assert!(!zone_matches("notlan.", "lan."));
+        // "lan." must not match a name where "lan" appears mid-label,
+        // e.g. `wlan.example.com.` — the leading dot in `dotted_suffix`
+        // is what prevents this.
+        assert!(!zone_matches("wlan.example.com.", "lan."));
+    }
+
+    #[test]
+    fn zone_match_compound_zone() {
+        // Multi-label zones should match subdomains but not unrelated
+        // names that happen to share the trailing label.
+        assert!(zone_matches("server.corp.internal.", "corp.internal."));
+        assert!(zone_matches("corp.internal.", "corp.internal."));
+        assert!(!zone_matches("internal.", "corp.internal."));
+        assert!(!zone_matches("example.com.", "corp.internal."));
+    }
+
+    #[test]
+    fn zone_match_reverse_dns() {
+        // RFC 1918 reverse zone — a real conditional-forwarding case.
+        let zone = "168.192.in-addr.arpa.";
+        assert!(zone_matches("1.1.168.192.in-addr.arpa.", zone));
+        assert!(zone_matches("168.192.in-addr.arpa.", zone));
+        assert!(!zone_matches("10.in-addr.arpa.", zone));
+    }
+
+    /// Independent of any real hickory build, prove that the
+    /// longest-zone-first sort order produces the expected dispatch.
+    /// We model what `select_arm` does after the sort.
+    #[test]
+    fn longest_zone_wins() {
+        // Two routes — the more specific zone must win.
+        let mut zones = vec!["internal.".to_string(), "corp.internal.".to_string()];
+        zones.sort_by_key(|z| std::cmp::Reverse(z.len()));
+        // First match wins after the sort: `server.corp.internal.`
+        // must hit `corp.internal.`, not `internal.`.
+        let qname = "server.corp.internal.";
+        let mut hit = None;
+        for z in &zones {
+            if zone_matches(qname, z) {
+                hit = Some(z.clone());
+                break;
+            }
+        }
+        assert_eq!(hit.as_deref(), Some("corp.internal."));
+    }
 
     #[test]
     fn parse_upstream_url_https_default_port() {

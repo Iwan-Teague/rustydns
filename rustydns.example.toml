@@ -95,7 +95,45 @@ timeout_ms = 5000
 
 # Maximum cached upstream responses (LRU eviction when full).
 # Must be ≤ 500,000 (hard limit enforced at startup).
+# Note: when conditional-forwarding routes are configured (below), this
+# cache size applies per-arm (default + one per route). Tune down if you
+# add several routes on memory-constrained hosts.
 max_cache_entries = 10000
+
+# Conditional-forwarding routes (optional).
+# ⚠ Each route gets its own independent resolver instance. The
+#   privacy/security knobs above (fail_closed, min_tls_version,
+#   dnssec_validation, timeout_ms, max_cache_entries) AND the privacy
+#   section's settings (no_edns_client_subnet, randomize_upstream_selection,
+#   etc.) are inherited from the global config — there are no per-route
+#   overrides for any privacy or security knob, by design.
+#
+# Matching: a query whose qname equals the `zone` OR ends in `.<zone>`
+# is forwarded to that route's resolvers. Longest matching zone wins
+# (e.g. a `corp.internal.` route beats an `internal.` route for
+# `server.corp.internal.`). Authority and blocklist still run BEFORE
+# route selection — the pipeline order is unchanged.
+#
+# Plaintext routes (protocol = "plain") emit an UNENCRYPTED-leaks
+# warning at startup, the same one the global plain protocol does.
+#
+# Example: route LAN names to the router's DNS (plaintext, RFC 1918).
+# [[upstream.routes]]
+# zone      = "lan."
+# resolvers = ["192.168.1.1:53"]
+# protocol  = "plain"
+#
+# Example: route corporate names to an internal DoH endpoint.
+# [[upstream.routes]]
+# zone      = "corp.internal."
+# resolvers = ["https://internal-dns.example.com/dns-query"]
+# protocol  = "doh"
+#
+# Example: route RFC 1918 reverse DNS to the LAN router.
+# [[upstream.routes]]
+# zone      = "168.192.in-addr.arpa."
+# resolvers = ["192.168.1.1:53"]
+# protocol  = "plain"
 
 # ---------------------------------------------------------------------------
 [authority]

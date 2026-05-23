@@ -273,6 +273,28 @@ pub struct UpstreamConfig {
     /// Maximum allowed: 500,000. Default: 10,000.
     #[serde(default = "default_max_cache_entries")]
     pub max_cache_entries: usize,
+
+    /// Conditional-forwarding routes — zones routed to specific upstreams.
+    ///
+    /// Each entry attaches a list of resolvers (and an upstream protocol) to
+    /// a DNS zone. A query whose qname falls inside that zone (case-
+    /// insensitive suffix match) is forwarded to that route's resolvers
+    /// instead of the global `resolvers` list. Longest matching zone wins.
+    ///
+    /// Typical use: route `.lan` / `.internal` / RFC 1918 reverse zones to
+    /// the LAN router or an internal DoH endpoint, while public traffic
+    /// keeps going to the global DoH providers.
+    ///
+    /// Privacy/security knobs (`fail_closed`, `min_tls_version`,
+    /// `dnssec_validation`, `timeout_ms`, `max_cache_entries`,
+    /// `privacy.*`) are intentionally NOT exposed per-route — they are
+    /// inherited from this struct. There are no per-route escape hatches.
+    ///
+    /// Authority answers (mesh zone, static records) and blocklist hits
+    /// still run BEFORE route selection — the pipeline order from
+    /// `docs/architecture.md` is preserved unchanged.
+    #[serde(default)]
+    pub routes: Vec<UpstreamRoute>,
 }
 
 impl Default for UpstreamConfig {
@@ -285,8 +307,46 @@ impl Default for UpstreamConfig {
             dnssec_validation: true,
             timeout_ms: default_timeout_ms(),
             max_cache_entries: default_max_cache_entries(),
+            routes: Vec::new(),
         }
     }
+}
+
+/// A single conditional-forwarding rule: zone → resolvers.
+///
+/// Declared as `[[upstream.routes]]` in TOML. See [`UpstreamConfig::routes`]
+/// for the model.
+///
+/// Only the routing-relevant fields are configurable here. Every other
+/// security/privacy setting is inherited from the parent [`UpstreamConfig`]
+/// so an operator cannot accidentally degrade privacy on a per-route basis
+/// (no per-route DNSSEC opt-out, no per-route TLS-1.2 floor).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamRoute {
+    /// DNS zone this route applies to (must end with `.`).
+    ///
+    /// A query whose qname equals the zone OR ends in `.<zone>` is forwarded
+    /// to this route's resolvers. Matching is case-insensitive and trailing-
+    /// dot tolerant on input — the value is normalised at validation time.
+    ///
+    /// The root zone (`"."`) is rejected — that's the global default's job.
+    pub zone: String,
+
+    /// Resolvers for this zone.
+    ///
+    /// Same shape as [`UpstreamConfig::resolvers`]: `https://` URLs for
+    /// `doh`, `quic://` URLs for `doq`, bare `host:port` for `plain`.
+    /// At least one resolver is required.
+    pub resolvers: Vec<String>,
+
+    /// Upstream protocol for this route. Default: `doh`.
+    ///
+    /// The most common conditional-forwarding case (LAN router on port 53)
+    /// will use `plain`; doing so emits the same UNENCRYPTED-leaks warning
+    /// at startup that the global `plain` protocol does.
+    #[serde(default)]
+    pub protocol: UpstreamProtocol,
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +961,93 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         );
     }
 
+    // Conditional-forwarding routes. Validated to the same standard as
+    // the global upstream block: scheme matches protocol, resolvers
+    // non-empty, no plain-HTTP URLs. Zones normalised to lower-case +
+    // trailing dot; duplicates rejected so the dispatch order is
+    // unambiguous.
+    let mut seen_zones: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (idx, route) in cfg.upstream.routes.iter().enumerate() {
+        let zone_trimmed = route.zone.trim();
+        if zone_trimmed.is_empty() {
+            return Err(crate::RustyDnsError::Config(format!(
+                "upstream.routes[{idx}].zone is empty — every route must name a DNS zone (e.g. `lan.`)"
+            )));
+        }
+        if !route.zone.ends_with('.') {
+            return Err(crate::RustyDnsError::Config(format!(
+                "upstream.routes[{idx}].zone `{}` must end with '.' (it is a DNS zone name)",
+                route.zone
+            )));
+        }
+        let normalised = zone_trimmed.to_ascii_lowercase();
+        if normalised == "." {
+            return Err(crate::RustyDnsError::Config(format!(
+                "upstream.routes[{idx}].zone `.` is the root zone — use `upstream.resolvers` for the default route instead"
+            )));
+        }
+        if !seen_zones.insert(normalised.clone()) {
+            return Err(crate::RustyDnsError::Config(format!(
+                "upstream.routes[{idx}].zone `{normalised}` is configured twice — each zone may appear in at most one route"
+            )));
+        }
+        if route.resolvers.is_empty() {
+            return Err(crate::RustyDnsError::Config(format!(
+                "upstream.routes[{idx}] for zone `{normalised}` has no resolvers — at least one resolver URL is required"
+            )));
+        }
+        for url in &route.resolvers {
+            if url.is_empty() {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "upstream.routes[{idx}] for zone `{normalised}` contains an empty resolver URL"
+                )));
+            }
+            if url.starts_with("http://") {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "upstream.routes[{idx}] resolver `{url}` uses plain HTTP — only https:// or \
+                     quic:// resolvers are allowed. DNS queries sent over plain HTTP are visible \
+                     to any network observer."
+                )));
+            }
+            match route.protocol {
+                UpstreamProtocol::Doh => {
+                    if !url.starts_with("https://") {
+                        return Err(crate::RustyDnsError::Config(format!(
+                            "upstream.routes[{idx}].protocol = \"doh\" but resolver `{url}` is not \
+                             an https:// URL. DoH endpoints must use the https:// scheme."
+                        )));
+                    }
+                }
+                UpstreamProtocol::Doq => {
+                    if !(url.starts_with("quic://") || url.starts_with("h3://")) {
+                        return Err(crate::RustyDnsError::Config(format!(
+                            "upstream.routes[{idx}].protocol = \"doq\" but resolver `{url}` is not \
+                             a quic:// URL. DoQ endpoints must use the quic:// scheme (RFC 9250)."
+                        )));
+                    }
+                }
+                UpstreamProtocol::Plain => {
+                    if url.contains("://") {
+                        return Err(crate::RustyDnsError::Config(format!(
+                            "upstream.routes[{idx}].protocol = \"plain\" but resolver `{url}` \
+                             contains a URL scheme. Plain mode uses bare host:port \
+                             (e.g. \"192.168.1.1:53\")."
+                        )));
+                    }
+                }
+            }
+        }
+        if route.protocol == UpstreamProtocol::Plain {
+            tracing::warn!(
+                zone = %normalised,
+                "upstream.routes[{idx}].protocol = \"plain\" — DNS queries for this zone will be \
+                 sent UNENCRYPTED. Domain names in this zone leak to any observer on the LAN \
+                 path between rustydnsd and the routed resolver.",
+                idx = idx
+            );
+        }
+    }
+
     // TLS 1.2 warning
     if cfg.upstream.min_tls_version == TlsVersion::Tls12 {
         tracing::warn!(
@@ -1197,6 +1344,119 @@ mod tests {
         // The plaintext upstream emits a startup warning but does not
         // reject — the operator is informed but free to proceed.
         validate_config(&cfg).expect("bare host:port with plain protocol must validate");
+    }
+
+    // --- upstream.routes (conditional forwarding) ------------------
+
+    fn route(zone: &str, resolvers: &[&str], protocol: UpstreamProtocol) -> UpstreamRoute {
+        UpstreamRoute {
+            zone: zone.to_string(),
+            resolvers: resolvers.iter().map(|s| s.to_string()).collect(),
+            protocol,
+        }
+    }
+
+    #[test]
+    fn route_plain_lan_router_accepted() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route("lan.", &["192.168.1.1:53"], UpstreamProtocol::Plain)];
+        validate_config(&cfg).expect("plain LAN-router route must validate");
+    }
+
+    #[test]
+    fn route_doh_internal_accepted() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route(
+            "corp.internal.",
+            &["https://internal-dns.example.com/dns-query"],
+            UpstreamProtocol::Doh,
+        )];
+        validate_config(&cfg).expect("DoH internal-zone route must validate");
+    }
+
+    #[test]
+    fn route_zone_without_trailing_dot_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route("lan", &["192.168.1.1:53"], UpstreamProtocol::Plain)];
+        assert_config_err(validate_config(&cfg), "must end with '.'");
+    }
+
+    #[test]
+    fn route_root_zone_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route(".", &["192.168.1.1:53"], UpstreamProtocol::Plain)];
+        assert_config_err(validate_config(&cfg), "root zone");
+    }
+
+    #[test]
+    fn route_empty_zone_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route("", &["192.168.1.1:53"], UpstreamProtocol::Plain)];
+        assert_config_err(validate_config(&cfg), "is empty");
+    }
+
+    #[test]
+    fn route_empty_resolvers_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route("lan.", &[], UpstreamProtocol::Plain)];
+        assert_config_err(validate_config(&cfg), "no resolvers");
+    }
+
+    #[test]
+    fn route_http_resolver_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route(
+            "corp.internal.",
+            &["http://insecure.example/dns-query"],
+            UpstreamProtocol::Doh,
+        )];
+        assert_config_err(validate_config(&cfg), "plain HTTP");
+    }
+
+    #[test]
+    fn route_scheme_mismatch_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route(
+            "corp.internal.",
+            &["192.168.1.1:53"],
+            UpstreamProtocol::Doh,
+        )];
+        assert_config_err(validate_config(&cfg), "not an https://");
+    }
+
+    #[test]
+    fn route_plain_with_scheme_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route(
+            "lan.",
+            &["https://192.168.1.1/dns-query"],
+            UpstreamProtocol::Plain,
+        )];
+        assert_config_err(validate_config(&cfg), "Plain mode uses bare host:port");
+    }
+
+    #[test]
+    fn route_duplicate_zone_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![
+            route("lan.", &["192.168.1.1:53"], UpstreamProtocol::Plain),
+            route("LAN.", &["192.168.1.2:53"], UpstreamProtocol::Plain),
+        ];
+        assert_config_err(validate_config(&cfg), "configured twice");
+    }
+
+    #[test]
+    fn route_multiple_zones_accepted() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![
+            route("lan.", &["192.168.1.1:53"], UpstreamProtocol::Plain),
+            route(
+                "corp.internal.",
+                &["https://internal-dns.example.com/dns-query"],
+                UpstreamProtocol::Doh,
+            ),
+        ];
+        validate_config(&cfg).expect("distinct routes must validate");
     }
 
     #[test]
