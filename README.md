@@ -160,7 +160,12 @@ running rustydnsd, and every device on the network gets the same filtering.
 | `rustydns_blocklist_hits_total` stays at 0 | Source URL likely failed to fetch (check `rustydns_blocklist_reload_failure_total` + `journalctl`) |
 | Plain DNS being used somehow | Confirm `upstream.protocol = "doh"` (or `"doq"`); `"plain"` emits a `tracing::warn!` containing "UNENCRYPTED" on every startup |
 
-When in doubt, run `rustydnsd --print-config /etc/rustydns/rustydns.toml`
+When in doubt, run
+
+```sh
+rustydnsd --config /etc/rustydns/rustydns.toml --print-config
+```
+
 to see the resolved configuration with all defaults applied and all
 secrets redacted.
 
