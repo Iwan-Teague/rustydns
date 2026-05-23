@@ -6,23 +6,32 @@
 A privacy-first, security-hardened DNS resolver for home and small-office networks,
 built in Rust. RustyDNS acts as a local DNS proxy that:
 
-- **Blocks ads, trackers, and malware domains** using community blocklists (Pi-hole
-  compatible hosts files, AdGuard filter lists, and RPZ zone files)
-- **Encrypts all upstream queries** over DNS-over-HTTPS (RFC 8484) or DNS-over-QUIC
-  (RFC 9250) — plain DNS over UDP/TCP is not used
-- **Strips client subnet information** from upstream queries (RFC 7871) so upstream
-  resolvers cannot see your network's IP address
-- **Minimises query names** sent to upstream resolvers (RFC 7816) so intermediate
-  servers receive only the labels they need
-- **Validates DNSSEC** and rejects forged upstream responses with no silent fallback
-- **Anonymises client logs** at /16 (IPv4) or /64 (IPv6) prefix granularity — full
-  IPs are never logged by default
-- **Integrates with the Rusty Suite mesh** — signed dns-zone bundle hot-reload
-  via `ArcSwap`, IP-keyed per-client policy (NodeId-keyed matching pending
-  Rustynet peer-table integration; see [`docs/roadmap.md`](docs/roadmap.md))
+- **Blocks ads, trackers, and malware domains** using community blocklists
+  (Pi-hole-compatible hosts files, AdGuard filter lists, and RPZ zone files —
+  formats are auto-detected per source)
+- **Encrypts all upstream queries** over DNS-over-HTTPS (RFC 8484) or
+  DNS-over-QUIC (RFC 9250). Plain DNS to upstream is opt-in only and emits a
+  startup warning every time
+- **Strips EDNS0 Client Subnet** from upstream queries (RFC 7871) so upstream
+  resolvers never learn your network's IP range
+- **Validates DNSSEC** and rejects forged upstream responses with no silent
+  fallback (fail-closed → `SERVFAIL`)
+- **Anonymises client logs** at /16 (IPv4) or /64 (IPv6) prefix granularity —
+  full IPs are never logged by default
+- **Integrates with the Rusty Suite mesh** — signed dns-zone bundle with
+  ed25519 verification + atomic hot-reload, IP-keyed per-client policy
+- **Listens on UDP, TCP, DNS-over-TLS, and DNS-over-HTTPS** out of the box;
+  exposes a loopback-only `/metrics`, `/health`, `/queries` for operators
 
 Security, privacy, and anonymity are first-class design constraints. All other
 trade-offs — performance, convenience, feature completeness — are secondary.
+
+> Two privacy knobs in `rustydns.toml` (`query_minimization`,
+> `upstream_padding`) are accepted today but not yet applied — the `hickory
+> 0.26` stub resolver doesn't expose RFC 7816 (qmin) or RFC 8467 (padding) yet.
+> The daemon emits an explicit startup warning when either is enabled, so an
+> operator never silently believes they're active. See
+> [`docs/roadmap.md`](docs/roadmap.md) §1.
 
 ---
 
@@ -72,31 +81,88 @@ The install script:
 
 ### Configure
 
-Edit `/etc/rustydns/rustydns.toml`. The most important fields:
+The shipped [`rustydns.example.toml`](rustydns.example.toml) is a fully
+annotated configuration with every option documented inline. Most operators
+only need to change the listener and (optionally) add or remove blocklist
+sources. The minimum bits that matter:
 
 ```toml
 [server]
 # ⚠ Binding to 0.0.0.0 exposes the resolver to ALL network interfaces.
-# Use "127.0.0.1:53" if you only need local resolution, or a specific
-# interface IP (e.g. "192.168.1.1:53") to serve your LAN only.
-# Never expose port 53 to the public internet.
-listen = "127.0.0.1:53"
+# Use "127.0.0.1:53" for local resolution only, or a specific LAN IP
+# (e.g. "192.168.1.1:53") to serve your network. Never expose port 53
+# to the public internet without a firewall in front.
+listen = ["127.0.0.1:53"]              # <-- TOML array; can list several
 
-[[resolvers]]
-url      = "https://dns.quad9.net/dns-query"
-protocol = "doh"   # or "doq"
+[upstream]
+# All URLs must use https:// (DoH) or quic:// (DoQ).
+# The protocol field must match the URL scheme — validate_config
+# rejects mismatches at startup.
+protocol = "doh"
+resolvers = [
+    "https://dns.quad9.net/dns-query",
+    "https://cloudflare-dns.com/dns-query",
+]
 
-[[blocklist.sources]]
-url    = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
-format = "hosts"
+[blocklist]
+# Remote sources are fetched over HTTPS. Format is auto-detected
+# per source (hosts / plain / RPZ / AdGuard) — no `format` key is needed.
+sources = [
+    "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+]
 ```
 
-Then restart the daemon:
+Then validate the config and restart the daemon:
 
 ```sh
+sudo /usr/local/bin/rustydnsd --config /etc/rustydns/rustydns.toml --validate-config
 sudo systemctl restart rustydns
 sudo systemctl status rustydns
 ```
+
+`--validate-config` parses the file and runs every check the daemon would
+run at startup, without binding any sockets — use it before every
+production change.
+
+### Verify it's working
+
+```sh
+# 1. Daemon is up and ready.
+curl -s http://127.0.0.1:9153/health | jq
+# {"status":"ok","mesh_zone":{...}}
+
+# 2. A normal query resolves.
+dig @127.0.0.1 example.com +short
+# 93.184.216.34
+
+# 3. A known ad/tracker domain returns NXDOMAIN (or your sinkhole).
+dig @127.0.0.1 doubleclick.net +short
+# (empty — status: NXDOMAIN if you use `dig +noshort`)
+
+# 4. Metrics confirm blocking is live.
+curl -s http://127.0.0.1:9153/metrics | grep blocklist_hits_total
+# rustydns_blocklist_hits_total 1
+```
+
+If the blocklist hits counter increments after step 3, ads are being
+blocked. Point your router's DHCP option 6 (or per-device DNS) at the host
+running rustydnsd, and every device on the network gets the same filtering.
+
+### Troubleshooting
+
+| Symptom | Where to look |
+|---|---|
+| Daemon refuses to start | `journalctl -u rustydns -n 50` — `validate_config` prints the offending field and the fix |
+| `Permission denied` on `:53` | The binary needs `CAP_NET_BIND_SERVICE`. The systemd unit grants it; Docker uses file caps + `cap_add`. For bare runs: `sudo setcap cap_net_bind_service=+ep /usr/local/bin/rustydnsd` |
+| Every query → `SERVFAIL` | Upstream DoH is unreachable. Probe with `curl -v https://dns.quad9.net/dns-query`. If that fails, the daemon will too |
+| `/health` returns 503 | Mesh-zone bundle is stale or missing (only when `[authority.mesh_*]` is configured). Inspect `/var/lib/rustynet/dns-zone.bundle` mtime |
+| Config file rejected as world-readable | `chmod 640 /etc/rustydns/rustydns.toml && chown rustydns:rustydns /etc/rustydns/rustydns.toml` |
+| `rustydns_blocklist_hits_total` stays at 0 | Source URL likely failed to fetch (check `rustydns_blocklist_reload_failure_total` + `journalctl`) |
+| Plain DNS being used somehow | Confirm `upstream.protocol = "doh"` (or `"doq"`); `"plain"` emits a `tracing::warn!` containing "UNENCRYPTED" on every startup |
+
+When in doubt, run `rustydnsd --print-config /etc/rustydns/rustydns.toml`
+to see the resolved configuration with all defaults applied and all
+secrets redacted.
 
 ---
 
@@ -107,9 +173,10 @@ Client query
      │
      ▼
 ┌─────────────────┐
-│  Authority zone  │  Local mesh records (.rusty. zone) — checked first
+│  Authority zone  │  Local mesh records (default zone: "mesh.") + static records.
+│                 │   Intra-zone CNAME chains are chased automatically.
 └────────┬────────┘
-         │ no match
+         │ no match (name not in any authoritative zone)
          ▼
 ┌─────────────────┐
 │  Blocklist      │  AHashSet lookup — O(1), lock-free hot-reload via arc-swap
@@ -122,8 +189,8 @@ Client query
          │ cache miss
          ▼
 ┌─────────────────┐
-│  Resolver       │  DoH / DoQ to upstream, DNSSEC validation, ECS stripped,
-│                 │  query name minimised, padded to fixed-size blocks
+│  Resolver       │  DoH / DoQ to upstream, TLS 1.3 floor, DNSSEC validation,
+│                 │   ECS stripped, randomised upstream selection, fail-closed.
 └─────────────────┘
 ```
 
