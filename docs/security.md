@@ -404,7 +404,13 @@ Mesh nodes that are granted the `dns` capability can query RustyDNS. A compromis
 node could use RustyDNS as a DNS amplification vector to flood third parties. Mitigations:
 
 - The daemon binds only to local interfaces by default (`listen = "127.0.0.1:53"`).
-- Per-client rate limiting is on the roadmap; see [`roadmap.md`](roadmap.md) §3.3.
+- **Per-source-IP token-bucket rate limiting.** Default-on with a generous 100 qps
+  sustained / 200 burst per non-loopback client. Excess queries respond with
+  `REFUSED` and increment `rustydns_policy_rate_limited_total`. Loopback is exempt
+  so local proxies aren't penalised. Configurable via the `[rate_limit]` block.
+  The bucket table is bounded by `max_tracked_clients` (default 10,000) with LRU
+  eviction + periodic GC of idle buckets so a forge-source-IP flood cannot OOM the
+  daemon.
 - The systemd unit sets `TasksMax=64` to limit concurrency.
 - `MemoryDenyWriteExecute` and `SystemCallFilter` limit what a compromised process
   can do even if it achieves code execution inside the daemon.

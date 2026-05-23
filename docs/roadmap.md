@@ -98,15 +98,6 @@ marker to the code or doc it relates to**, so no item lives only in one place.
 - **Doc mentions:** `crates/rustydnsd/src/main.rs` crate-level signal-handling
   doc; `spawn_sighup_reload` inline comment.
 
-### 3.3 Per-client rate limiting
-
-- **What:** cap query rate per source IP / per node to prevent a rogue mesh
-  device from using rustydnsd as an amplification vector.
-- **Why not yet:** unstarted. The systemd unit's `TasksMax=64` and the
-  bounded async runtime already constrain blast radius coarsely; per-client
-  rate limiting would make the picture tighter.
-- **Doc mentions:** `docs/security.md` §"DNS Amplification Between Mesh Nodes".
-
 ---
 
 ## 4. Test coverage gaps

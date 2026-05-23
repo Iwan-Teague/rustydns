@@ -70,6 +70,15 @@ fn default_resolvers() -> Vec<String> {
         "https://dns.quad9.net/dns-query".to_string(),
     ]
 }
+fn default_rate_limit_qps() -> u32 {
+    100
+}
+fn default_rate_limit_burst() -> u32 {
+    200
+}
+fn default_rate_limit_max_clients() -> usize {
+    10_000
+}
 fn default_ring_size() -> usize {
     1_000
 }
@@ -119,6 +128,10 @@ pub struct DnsConfig {
     /// Prometheus metrics endpoint settings (loopback-only by default).
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Per-source-IP rate-limit settings. Defaults are generous; disable
+    /// only on hosts with a single proxying client.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
     /// Per-Rustynet-node DNS policy. Use `[[policy]]` in TOML.
     #[serde(default)]
     pub policy: Vec<NodePolicy>,
@@ -695,6 +708,84 @@ impl Default for MetricsConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Per-source-IP rate limiting
+// ---------------------------------------------------------------------------
+
+/// Per-source-IP rate-limit configuration.
+///
+/// rustydnsd applies a token-bucket limiter to incoming queries keyed by
+/// the source IP address. Each non-loopback client gets [`burst`] tokens
+/// to start; tokens regenerate at [`qps`] per second; a query that finds
+/// the bucket empty is refused with `REFUSED` (NOT silently dropped —
+/// the operator needs to see throttling in the resolver's response logs
+/// and the `rustydns_policy_rate_limited_total` counter).
+///
+/// **Loopback (`127.0.0.0/8`, `::1`) is always exempt.** Local proxies
+/// and DoH/DoT terminators that aggregate many users behind a single
+/// connection to `rustydnsd` would otherwise hit the per-IP limit
+/// trivially.
+///
+/// Defaults are deliberately generous (100 qps sustained / 200 burst);
+/// a normal browser session bursts at a few dozen queries per second
+/// and falls well below 100 qps sustained. Operators with a single
+/// heavy-traffic forwarding client should either rely on the loopback
+/// exemption (place the forwarder on the same host) or raise `qps`.
+///
+/// [`qps`]: RateLimitConfig::qps
+/// [`burst`]: RateLimitConfig::burst
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Apply the limiter. Default: `true`.
+    ///
+    /// Set to `false` to disable rate limiting entirely (e.g. a host
+    /// that fronts a single aggregating resolver and trusts every
+    /// query). Disabling drops the `rustydns_policy_rate_limited_total`
+    /// counter to its default-zero state.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Sustained queries-per-second permitted per source IP.
+    ///
+    /// Must be greater than zero. Default: `100`.
+    #[serde(default = "default_rate_limit_qps")]
+    pub qps: u32,
+
+    /// Burst capacity — the maximum number of queries a single source
+    /// IP may issue in immediate succession before the per-second rate
+    /// kicks in. Must be ≥ `qps` (a smaller burst than the sustained
+    /// rate is nonsense and validate_config rejects it).
+    ///
+    /// Default: `200` (two seconds of sustained-rate budget).
+    #[serde(default = "default_rate_limit_burst")]
+    pub burst: u32,
+
+    /// Maximum number of distinct source IPs tracked at any one time.
+    ///
+    /// Bounds the limiter's memory footprint against a forge-source-IP
+    /// flood: once the table is full, the least-recently-used bucket
+    /// is evicted to make room for a new IP. Idle buckets are also
+    /// reaped on a periodic sweep (every 30s, entries idle for >5m
+    /// drop). Must be greater than zero; capped at 1,000,000 to stop
+    /// an operator from accidentally configuring an unbounded table.
+    ///
+    /// Default: `10_000`.
+    #[serde(default = "default_rate_limit_max_clients")]
+    pub max_tracked_clients: usize,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            qps: default_rate_limit_qps(),
+            burst: default_rate_limit_burst(),
+            max_tracked_clients: default_rate_limit_max_clients(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-node policy
 // ---------------------------------------------------------------------------
 
@@ -1219,6 +1310,43 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         }
     }
 
+    // --- Rate limit --------------------------------------------------------------
+
+    if cfg.rate_limit.enabled {
+        if cfg.rate_limit.qps == 0 {
+            return Err(crate::RustyDnsError::Config(
+                "rate_limit.qps = 0 is invalid — set rate_limit.enabled = false to disable, \
+                 or use a positive sustained-rate value"
+                    .to_string(),
+            ));
+        }
+        if cfg.rate_limit.burst == 0 {
+            return Err(crate::RustyDnsError::Config(
+                "rate_limit.burst = 0 is invalid — burst must be at least 1".to_string(),
+            ));
+        }
+        if cfg.rate_limit.burst < cfg.rate_limit.qps {
+            return Err(crate::RustyDnsError::Config(format!(
+                "rate_limit.burst = {} is smaller than rate_limit.qps = {} — burst must be at least \
+                 the sustained rate, otherwise the limiter would refuse legitimate steady-state traffic",
+                cfg.rate_limit.burst, cfg.rate_limit.qps
+            )));
+        }
+        if cfg.rate_limit.max_tracked_clients == 0 {
+            return Err(crate::RustyDnsError::Config(
+                "rate_limit.max_tracked_clients = 0 is invalid — bucket table must hold at least one IP"
+                    .to_string(),
+            ));
+        }
+        if cfg.rate_limit.max_tracked_clients > 1_000_000 {
+            return Err(crate::RustyDnsError::Config(format!(
+                "rate_limit.max_tracked_clients = {} exceeds the maximum of 1,000,000 — \
+                 an unbounded bucket table would OOM the daemon under a forge-IP flood",
+                cfg.rate_limit.max_tracked_clients
+            )));
+        }
+    }
+
     // --- Per-node policy ---------------------------------------------------------
 
     for (idx, policy) in cfg.policy.iter().enumerate() {
@@ -1273,6 +1401,7 @@ mod tests {
             blocklist: BlocklistConfig::default(),
             privacy: PrivacyConfig::default(),
             metrics: MetricsConfig::default(),
+            rate_limit: RateLimitConfig::default(),
             policy: Vec::new(),
         }
     }
@@ -1550,6 +1679,59 @@ mod tests {
         let mut cfg = baseline();
         cfg.privacy.query_log_ring_size = 100_001;
         assert_config_err(validate_config(&cfg), "100,000");
+    }
+
+    // --- rate_limit -------------------------------------------------
+
+    #[test]
+    fn rate_limit_default_validates() {
+        validate_config(&baseline()).expect("default rate_limit must pass");
+    }
+
+    #[test]
+    fn rate_limit_disabled_skips_all_checks() {
+        // With enabled = false, even a nonsense qps must not be rejected
+        // (the limiter doesn't run, so the value is inert).
+        let mut cfg = baseline();
+        cfg.rate_limit.enabled = false;
+        cfg.rate_limit.qps = 0;
+        validate_config(&cfg).expect("disabled limiter must skip validation");
+    }
+
+    #[test]
+    fn rate_limit_zero_qps_rejected_when_enabled() {
+        let mut cfg = baseline();
+        cfg.rate_limit.qps = 0;
+        assert_config_err(validate_config(&cfg), "rate_limit.qps = 0");
+    }
+
+    #[test]
+    fn rate_limit_zero_burst_rejected_when_enabled() {
+        let mut cfg = baseline();
+        cfg.rate_limit.burst = 0;
+        assert_config_err(validate_config(&cfg), "rate_limit.burst = 0");
+    }
+
+    #[test]
+    fn rate_limit_burst_smaller_than_qps_rejected() {
+        let mut cfg = baseline();
+        cfg.rate_limit.qps = 100;
+        cfg.rate_limit.burst = 50;
+        assert_config_err(validate_config(&cfg), "smaller than rate_limit.qps");
+    }
+
+    #[test]
+    fn rate_limit_zero_max_tracked_rejected() {
+        let mut cfg = baseline();
+        cfg.rate_limit.max_tracked_clients = 0;
+        assert_config_err(validate_config(&cfg), "rate_limit.max_tracked_clients = 0");
+    }
+
+    #[test]
+    fn rate_limit_excessive_max_tracked_rejected() {
+        let mut cfg = baseline();
+        cfg.rate_limit.max_tracked_clients = 1_000_001;
+        assert_config_err(validate_config(&cfg), "1,000,000");
     }
 
     // --- metrics ----------------------------------------------------

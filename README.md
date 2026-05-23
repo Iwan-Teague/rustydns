@@ -218,6 +218,7 @@ For a detailed description of each component, see [`docs/architecture.md`](docs/
 | Fail-closed on upstream failure          | Implemented (`upstream.fail_closed`)    | —         |
 | Conditional forwarding (per-zone routes) | Implemented (`[[upstream.routes]]`)     | —         |
 | DNS-rebinding defence (drop private rdata) | Implemented (`upstream.block_private_rdata`, default off) | — |
+| Per-source-IP rate limiting              | Implemented (`[rate_limit]`, default on; loopback exempt) | — |
 | Client IP anonymisation (/16 IPv4, /64 IPv6) | Implemented                         | —         |
 | In-memory query log (hashed qname, anonymised client) | Implemented                | —         |
 | Query Name Minimisation                  | Pending (hickory 0.26 doesn't expose)   | RFC 7816  |

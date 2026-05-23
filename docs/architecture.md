@@ -16,6 +16,12 @@ Security, privacy, and anonymity are first-class design constraints — not feat
          │
          ▼
   ┌─────────────┐
+  │ Rate-limit  │  — per-source-IP token bucket (loopback exempt)
+  │             │    over-budget → REFUSED; counter bumped
+  └──────┬──────┘
+         │ admit
+         ▼
+  ┌─────────────┐
   │  Authority  │  — mesh zone or static zone hit?
   │   (cache)   │    yes → answer immediately (NOERROR or NXDOMAIN)
   └──────┬──────┘    mesh records are NEVER blocked — authority wins
@@ -33,7 +39,7 @@ Security, privacy, and anonymity are first-class design constraints — not feat
   └─────────────┘    (there is no stale-answer fallback mode)
 ```
 
-**Pipeline order is an invariant.** Authority answers before blocklist; blocklist before resolver. This order must never change.
+**Pipeline order is an invariant.** Rate-limit before authority; authority before blocklist; blocklist before resolver. This order must never change. The rate limiter runs first so that a flood of malformed queries from one source IP costs only an `AHashMap` lookup + token-bucket update.
 
 ## Crate responsibilities
 

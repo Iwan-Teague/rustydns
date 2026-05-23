@@ -37,6 +37,7 @@ pub struct Metrics {
     mesh_zone_last_reload: IntGauge,
     policy_blocklist_bypass_total: IntCounter,
     policy_zone_denied_total: IntCounter,
+    policy_rate_limited_total: IntCounter,
     private_rdata_dropped_total: IntCounter,
 }
 
@@ -137,6 +138,12 @@ impl Metrics {
              DNS-rebinding defence (upstream.block_private_rdata = true). \
              Counts individual records, not queries.",
         )?;
+        let policy_rate_limited_total = register_counter(
+            &registry,
+            "rustydns_policy_rate_limited_total",
+            "Queries refused with REFUSED because the source IP exceeded \
+             the per-client token-bucket rate limit",
+        )?;
 
         Ok(Self {
             registry,
@@ -156,6 +163,7 @@ impl Metrics {
             mesh_zone_last_reload,
             policy_blocklist_bypass_total,
             policy_zone_denied_total,
+            policy_rate_limited_total,
             private_rdata_dropped_total,
         })
     }
@@ -233,6 +241,11 @@ impl Metrics {
     /// fell outside the matching `[[policy]]` entry's `zones_allowed`.
     pub fn inc_policy_zone_denied(&self) {
         self.policy_zone_denied_total.inc();
+    }
+
+    /// Increment when the per-source-IP rate limiter refused a query.
+    pub fn inc_policy_rate_limited(&self) {
+        self.policy_rate_limited_total.inc();
     }
 
     /// Add `n` to the rebinding-defence drop counter. Callers pass the

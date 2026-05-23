@@ -91,10 +91,12 @@ still serving from the previous valid `ArcSwap` snapshot.
 
 ### Policy effects
 
-| Series                                          | Type    | Meaning                                                                  |
-|-------------------------------------------------|---------|--------------------------------------------------------------------------|
-| `rustydns_policy_blocklist_bypass_total`        | counter | Queries where `blocklist_bypass=true` actually changed the outcome       |
-| `rustydns_policy_zone_denied_total`             | counter | Queries refused because they fell outside `zones_allowed`                |
+| Series                                            | Type    | Meaning                                                                  |
+|---------------------------------------------------|---------|--------------------------------------------------------------------------|
+| `rustydns_policy_blocklist_bypass_total`          | counter | Queries where `blocklist_bypass=true` actually changed the outcome       |
+| `rustydns_policy_zone_denied_total`               | counter | Queries refused because they fell outside `zones_allowed`                |
+| `rustydns_policy_rate_limited_total`              | counter | Queries refused because the source IP exceeded the per-client rate limit |
+| `rustydns_resolver_private_rdata_dropped_total`   | counter | A/AAAA records stripped by the DNS-rebinding defence (per record, not per query) |
 
 `blocklist_bypass_total` only increments when the bypass *changed
 something* — a bypass that fired against a non-blocked name doesn't

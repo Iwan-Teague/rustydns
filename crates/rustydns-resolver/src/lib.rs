@@ -1267,6 +1267,7 @@ mod tests {
             blocklist: Default::default(),
             privacy: Default::default(),
             metrics: Default::default(),
+            rate_limit: Default::default(),
             policy: Vec::new(),
         };
         cfg.upstream.resolvers.clear();

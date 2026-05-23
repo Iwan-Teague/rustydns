@@ -23,6 +23,7 @@ use rustydns_resolver::Resolver;
 
 use crate::metrics::Metrics;
 use crate::query_log::{QueryLog, ServedBy};
+use crate::rate_limiter::{LimitDecision, RateLimiter};
 
 use std::collections::HashMap;
 
@@ -48,6 +49,7 @@ pub struct DnsHandler {
     resolver: Arc<Resolver>,
     metrics: Arc<Metrics>,
     query_log: Arc<QueryLog>,
+    rate_limiter: Arc<RateLimiter>,
     sinkhole_ip: Option<IpAddr>,
     /// IP-keyed policy table. Rebuilt at startup; constant for the
     /// lifetime of the handler. SIGHUP-driven reload of policy is a
@@ -58,13 +60,14 @@ pub struct DnsHandler {
 
 impl DnsHandler {
     /// Construct a new handler with shared authority, blocklist, resolver,
-    /// and query-log ring buffer.
+    /// rate limiter, and query-log ring buffer.
     pub fn new(
         authority: Arc<Authority>,
         blocklist: Arc<BlocklistEngine>,
         resolver: Arc<Resolver>,
         metrics: Arc<Metrics>,
         query_log: Arc<QueryLog>,
+        rate_limiter: Arc<RateLimiter>,
         policies: &[NodePolicy],
     ) -> Result<Self, RustyDnsError> {
         let sinkhole_ip = if blocklist.block_response() == BlockResponse::Sinkhole {
@@ -109,6 +112,7 @@ impl DnsHandler {
             resolver,
             metrics,
             query_log,
+            rate_limiter,
             sinkhole_ip,
             policy_by_ip: Arc::new(policy_by_ip),
         })
@@ -322,6 +326,37 @@ impl RequestHandler for DnsHandler {
         // so every `log_query` call (including the early opcode and
         // class rejections) honours `log_all_queries`.
         let policy = self.resolve_policy(info.src.ip());
+
+        // Per-source-IP rate limiting. Runs BEFORE any pipeline work so
+        // a flood costs only an `AHashMap` lookup + bucket update. The
+        // limiter exempts loopback internally so local proxies aren't
+        // penalised. See `crate::rate_limiter` for the algorithm.
+        if self.rate_limiter.check(info.src.ip()) == LimitDecision::Refuse {
+            self.metrics.inc_policy_rate_limited();
+            warn!(
+                client = %client.anonymized(),
+                "policy denied: per-source-IP rate limit exceeded"
+            );
+            let builder = MessageResponseBuilder::from_message_request(request);
+            self.log_query(
+                &policy,
+                &client,
+                &qname,
+                &qtype_str,
+                ResponseCode::Refused,
+                ServedBy::Rejected,
+            );
+            return self
+                .respond(
+                    request,
+                    response_handle,
+                    builder,
+                    ResponseCode::Refused,
+                    false,
+                    Vec::new(),
+                )
+                .await;
+        }
 
         // hickory 0.26 dropped the `op_code()` accessor; it's now a
         // public field on the deref'd MessageRequest's metadata.
@@ -714,6 +749,7 @@ mod tests {
             blocklist: Default::default(),
             privacy: Default::default(),
             metrics: Default::default(),
+            rate_limit: Default::default(),
             policy: Vec::new(),
         };
         // Disable randomisation for deterministic test ordering.
@@ -727,12 +763,22 @@ mod tests {
         );
 
         let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+        // Tests exercise pipeline correctness, not rate limiting — use
+        // the default-disabled limiter so test loopback bursts never
+        // hit the cap. (Loopback is exempt anyway, but be explicit.)
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
         let handler = DnsHandler::new(
             authority,
             blocklist,
             resolver,
             metrics,
             query_log.clone(),
+            rate_limiter,
             &policies,
         )
         .expect("handler");
@@ -1153,14 +1199,29 @@ mod tests {
             blocklist: Default::default(),
             privacy: Default::default(),
             metrics: Default::default(),
+            rate_limit: Default::default(),
             policy: Vec::new(),
         };
         dns_config.privacy.randomize_upstream_selection = false;
         dns_config.upstream.dnssec_validation = false;
         let resolver = Arc::new(Resolver::new(dns_config).await.unwrap());
         let query_log = Arc::new(crate::query_log::QueryLog::new(16));
-        let handler =
-            DnsHandler::new(authority, blocklist, resolver, metrics, query_log, &[]).unwrap();
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log,
+            rate_limiter,
+            &[],
+        )
+        .unwrap();
 
         // Reuse the daemon's TLS-config loader so the test path
         // matches production.

@@ -285,6 +285,7 @@ mod tests {
             blocklist: Default::default(),
             privacy: Default::default(),
             metrics: Default::default(),
+            rate_limit: Default::default(),
             policy: Vec::new(),
         };
         dns_config.privacy.randomize_upstream_selection = false;
@@ -292,7 +293,24 @@ mod tests {
 
         let resolver = Arc::new(Resolver::new(dns_config).await.unwrap());
         let query_log = Arc::new(crate::query_log::QueryLog::new(64));
-        Arc::new(DnsHandler::new(authority, blocklist, resolver, metrics, query_log, &[]).unwrap())
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        Arc::new(
+            DnsHandler::new(
+                authority,
+                blocklist,
+                resolver,
+                metrics,
+                query_log,
+                rate_limiter,
+                &[],
+            )
+            .unwrap(),
+        )
     }
 
     /// Boot a DoH listener on a random port. Returns `(base_url, shutdown_token)`.

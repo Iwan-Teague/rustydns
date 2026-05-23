@@ -296,6 +296,38 @@ query_log_ring_size = 10000
 log_client_ips = false
 
 # ---------------------------------------------------------------------------
+[rate_limit]
+# ---------------------------------------------------------------------------
+# Per-source-IP token-bucket rate limiter. Token bucket: each non-loopback
+# client gets `burst` tokens to start; tokens refill at `qps`/sec; a query
+# that finds the bucket empty is refused with REFUSED (NOT silently dropped,
+# so operators can see throttling in logs and metrics).
+#
+# ⚠ Loopback (127.0.0.0/8, ::1) is ALWAYS exempt. Local proxies and
+#   DoH/DoT terminators aggregating many users behind one connection
+#   would hit the per-IP limit instantly otherwise.
+
+# Apply the limiter. Default: true.
+# Disable only if a single trusted proxy fronts the daemon and you handle
+# rate limiting upstream.
+enabled = true
+
+# Sustained queries-per-second permitted per source IP. Must be > 0.
+# Default 100 — well above any normal device's sustained DNS load.
+qps = 100
+
+# Burst capacity — the maximum queries one IP can fire back-to-back
+# before the per-second rate kicks in. Must be ≥ qps. Default 200
+# (two seconds of sustained-rate budget).
+burst = 200
+
+# Maximum distinct source IPs tracked at once. Bounds memory under a
+# forge-IP flood; when full the least-recently-used bucket is evicted.
+# Idle buckets are also reaped every 30s after 5 min idle. Capped at
+# 1,000,000 by validate_config. Default 10,000 (~640 KiB at 64 B/bucket).
+max_tracked_clients = 10000
+
+# ---------------------------------------------------------------------------
 [metrics]
 # ---------------------------------------------------------------------------
 

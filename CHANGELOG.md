@@ -10,6 +10,17 @@ This project does not yet follow semantic versioning — every change up to
 
 ### Daemon (`rustydnsd`)
 
+- **Per-source-IP rate limiting** (`[rate_limit]`). Default-on token
+  bucket: each non-loopback client gets `burst` tokens (default 200)
+  and refills at `qps` per second (default 100). Excess queries
+  respond `REFUSED` — not silently dropped — and increment
+  `rustydns_policy_rate_limited_total`. Loopback (`127.0.0.0/8`,
+  `::1`) is always exempt so local proxies and DoH/DoT terminators
+  aren't penalised. The bucket table is bounded by
+  `max_tracked_clients` (default 10,000, capped at 1,000,000) with
+  LRU eviction + periodic GC of buckets idle for >5 minutes, so a
+  forge-IP flood can't OOM the daemon. Runs FIRST in the query
+  pipeline, before authority / blocklist / resolver.
 - Bring up the daemon binary with UDP, TCP, and DoH (HTTP/2) listeners.
 - DNS request pipeline: Authority → Blocklist → Resolver, with
   AGENTS.md-mandated fail-closed → `SERVFAIL` on upstream failure and

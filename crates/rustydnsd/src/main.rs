@@ -51,6 +51,7 @@ mod doh;
 mod handler;
 mod metrics;
 mod query_log;
+mod rate_limiter;
 
 #[cfg(test)]
 mod test_pem;
@@ -72,6 +73,7 @@ use blocklist_loader::BlocklistLoader;
 use doh as doh_server;
 use handler::DnsHandler;
 use metrics::Metrics;
+use rate_limiter::RateLimiter;
 use rustls::ServerConfig as TlsServerConfig;
 use rustls_pemfile as pemfile;
 use rustydns_authority::Authority;
@@ -207,12 +209,25 @@ async fn main() -> Result<()> {
         "query log ring buffer initialised (in-memory only)"
     );
 
+    // Per-source-IP rate limiter. Default-on with generous limits;
+    // loopback is exempt internally so local proxies and DoH/DoT
+    // terminators are never penalised.
+    let rate_limiter = Arc::new(RateLimiter::new(&config.rate_limit));
+    info!(
+        enabled = config.rate_limit.enabled,
+        qps = config.rate_limit.qps,
+        burst = config.rate_limit.burst,
+        max_tracked = config.rate_limit.max_tracked_clients,
+        "per-source-IP rate limiter initialised"
+    );
+
     let handler = DnsHandler::new(
         authority.clone(),
         blocklist_engine.clone(),
         resolver,
         metrics.clone(),
         query_log.clone(),
+        rate_limiter,
         &config.policy,
     )?;
     let doh_handler = Arc::new(handler.clone());
