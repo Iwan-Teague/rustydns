@@ -73,6 +73,7 @@ Recursive resolver forwarding to upstream servers using DoH (default) or DoQ. Pr
 | Randomised upstream selection | — | ✓ implemented (`upstream.randomize_upstream_selection`) |
 | Fail-closed (SERVFAIL, no stale fallback) | — | ✓ implemented (`upstream.fail_closed`) |
 | Conditional forwarding (per-zone routes) | — | ✓ implemented (`[[upstream.routes]]`) |
+| DNS-rebinding defence (drop private rdata) | — | ✓ implemented (`upstream.block_private_rdata`, default off) |
 | Query Name Minimisation | RFC 7816 | ⏳ pending (hickory 0.26 still doesn't expose qmin) |
 | DoH query/response padding | RFC 8467 | ⏳ pending (hickory 0.26 still doesn't expose RFC 8467) |
 

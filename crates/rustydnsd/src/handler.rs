@@ -465,8 +465,10 @@ impl RequestHandler for DnsHandler {
 
         self.metrics.inc_resolver_queries();
         match self.resolver.resolve(&qname, &qtype_str).await {
-            Ok(records) => {
-                let answers = Self::dns_records_to_rrs(&records);
+            Ok(out) => {
+                self.metrics
+                    .inc_private_rdata_dropped(out.private_rdata_dropped);
+                let answers = Self::dns_records_to_rrs(&out.records);
                 self.log_query(
                     &policy,
                     &client,

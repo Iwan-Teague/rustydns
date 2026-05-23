@@ -45,6 +45,18 @@ This project does not yet follow semantic versioning — every change up to
 
 ### Resolver
 
+- **DNS-rebinding defence** (`upstream.block_private_rdata`). When
+  enabled (default off), strips A/AAAA records from the default
+  upstream's responses whose rdata is RFC 1918, loopback, link-local,
+  unspecified, broadcast, documentation, multicast, unique-local, or
+  unicast link-local (IPv6) — and the IPv4-mapped IPv6 forms of those.
+  Blocks attacker-controlled domains that flip from a public IP to a
+  LAN/loopback IP after TTL expiry. Conditional-forwarding route
+  responses are passed through untouched regardless of the setting,
+  since operators route to internal resolvers precisely so they can
+  return private addresses. Authority answers (mesh + static) run
+  before the resolver and are never filtered. Each dropped record is
+  counted in `rustydns_resolver_private_rdata_dropped_total`.
 - **Conditional forwarding** (`[[upstream.routes]]`). Route specific
   DNS zones to specific upstreams — e.g. `lan.` → `192.168.1.1:53`,
   `corp.internal.` → an internal DoH endpoint, public traffic →

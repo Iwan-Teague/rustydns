@@ -98,17 +98,7 @@ marker to the code or doc it relates to**, so no item lives only in one place.
 - **Doc mentions:** `crates/rustydnsd/src/main.rs` crate-level signal-handling
   doc; `spawn_sighup_reload` inline comment.
 
-### 3.3 DNS rebinding defence (`block_private_rdata`)
-
-- **What:** optionally drop upstream responses whose A/AAAA points at
-  RFC 1918, loopback, or link-local addresses. Protects browser victims from
-  attacker-controlled domains that resolve to local IPs after TTL expiry.
-- **Why not yet:** the right default behaviour depends on whether the
-  operator runs internal services that legitimately resolve to private IPs.
-  Needs a config knob and an opt-in default — not started.
-- **Doc mentions:** `docs/security.md` §"DNS Rebinding".
-
-### 3.4 Per-client rate limiting
+### 3.3 Per-client rate limiting
 
 - **What:** cap query rate per source IP / per node to prevent a rogue mesh
   device from using rustydnsd as an amplification vector.

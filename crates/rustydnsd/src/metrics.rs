@@ -37,6 +37,7 @@ pub struct Metrics {
     mesh_zone_last_reload: IntGauge,
     policy_blocklist_bypass_total: IntCounter,
     policy_zone_denied_total: IntCounter,
+    private_rdata_dropped_total: IntCounter,
 }
 
 impl Metrics {
@@ -129,6 +130,13 @@ impl Metrics {
             "Queries refused with REFUSED because they fell outside a \
              [[policy]] entry's zones_allowed list",
         )?;
+        let private_rdata_dropped_total = register_counter(
+            &registry,
+            "rustydns_resolver_private_rdata_dropped_total",
+            "A/AAAA records stripped from upstream responses by the \
+             DNS-rebinding defence (upstream.block_private_rdata = true). \
+             Counts individual records, not queries.",
+        )?;
 
         Ok(Self {
             registry,
@@ -148,6 +156,7 @@ impl Metrics {
             mesh_zone_last_reload,
             policy_blocklist_bypass_total,
             policy_zone_denied_total,
+            private_rdata_dropped_total,
         })
     }
 
@@ -224,6 +233,18 @@ impl Metrics {
     /// fell outside the matching `[[policy]]` entry's `zones_allowed`.
     pub fn inc_policy_zone_denied(&self) {
         self.policy_zone_denied_total.inc();
+    }
+
+    /// Add `n` to the rebinding-defence drop counter. Callers pass the
+    /// `ResolveOutcome::private_rdata_dropped` value from a single
+    /// resolver call (typically 0, 1, or 2 — bigger spikes indicate an
+    /// attacker, a misconfiguration, or an internal name that should be
+    /// served by authority or a route instead).
+    pub fn inc_private_rdata_dropped(&self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        self.private_rdata_dropped_total.inc_by(u64::from(n));
     }
 }
 

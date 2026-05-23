@@ -381,11 +381,22 @@ service on exit, so an abort is not a permanent denial of service.
 
 An attacker-controlled domain returns a short-TTL record pointing to `127.0.0.1` or
 a private IP. After the TTL expires the browser re-resolves and the attacker's JS can
-now make requests to the local interface. A pending mitigation (`block_private_rdata
-= true`) would optionally reject upstream responses that resolve to RFC 1918,
-loopback, or link-local addresses; see [`roadmap.md`](roadmap.md) §3.3.
-Operators on networks where internal names legitimately resolve to private IPs
-should leave the option off when it lands and rely on DNS firewall rules instead.
+now make requests to the local interface.
+
+**Mitigation:** `upstream.block_private_rdata = true` strips A/AAAA records whose
+rdata is RFC 1918, loopback, link-local, unspecified, broadcast, documentation,
+multicast, unique-local, or unicast link-local (IPv6) — as well as IPv4-mapped
+IPv6 forms of those. Filtering applies only to the **default** upstream:
+authoritative answers (mesh zone + static records) and conditional-forwarding
+route responses (`[[upstream.routes]]`) are passed through untouched, since
+operators wire those precisely to resolve internal names. Each dropped record is
+counted in `rustydns_resolver_private_rdata_dropped_total`.
+
+The option defaults to **off** because operators with internal DNS deployments
+routinely resolve names to RFC 1918 addresses on purpose. Hosts that only
+resolve public Internet names should turn it on; deployments with internal
+zones should either declare those as static records, route them via
+`[[upstream.routes]]`, or leave the defence off.
 
 ### DNS Amplification Between Mesh Nodes
 
@@ -393,7 +404,7 @@ Mesh nodes that are granted the `dns` capability can query RustyDNS. A compromis
 node could use RustyDNS as a DNS amplification vector to flood third parties. Mitigations:
 
 - The daemon binds only to local interfaces by default (`listen = "127.0.0.1:53"`).
-- Per-client rate limiting is on the roadmap; see [`roadmap.md`](roadmap.md) §3.4.
+- Per-client rate limiting is on the roadmap; see [`roadmap.md`](roadmap.md) §3.3.
 - The systemd unit sets `TasksMax=64` to limit concurrency.
 - `MemoryDenyWriteExecute` and `SystemCallFilter` limit what a compromised process
   can do even if it achieves code execution inside the daemon.

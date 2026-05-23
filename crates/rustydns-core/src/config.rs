@@ -274,6 +274,30 @@ pub struct UpstreamConfig {
     #[serde(default = "default_max_cache_entries")]
     pub max_cache_entries: usize,
 
+    /// DNS-rebinding defence — drop A/AAAA records from the default
+    /// upstream whose rdata points at a private, loopback, link-local,
+    /// unspecified, documentation, multicast, or unique-local address.
+    ///
+    /// Disabled by default because operators with internal DNS
+    /// deployments routinely resolve names to RFC 1918 addresses on
+    /// purpose. Enable on hosts that only resolve public Internet names,
+    /// or pair with `[[upstream.routes]]` so internal zones bypass the
+    /// defence by going to a routed upstream.
+    ///
+    /// Filtering rule:
+    /// - Only the **default** upstream's responses are filtered. Route
+    ///   responses (`[[upstream.routes]]`) are passed through untouched
+    ///   — operators wire those to internal resolvers precisely so they
+    ///   can return private addresses.
+    /// - Authoritative answers (mesh zone + static records) are served
+    ///   before the resolver runs and are never filtered.
+    /// - Each dropped record is counted in
+    ///   `rustydns_resolver_private_rdata_dropped_total`.
+    ///
+    /// Default: `false`.
+    #[serde(default = "default_false")]
+    pub block_private_rdata: bool,
+
     /// Conditional-forwarding routes — zones routed to specific upstreams.
     ///
     /// Each entry attaches a list of resolvers (and an upstream protocol) to
@@ -307,6 +331,7 @@ impl Default for UpstreamConfig {
             dnssec_validation: true,
             timeout_ms: default_timeout_ms(),
             max_cache_entries: default_max_cache_entries(),
+            block_private_rdata: false,
             routes: Vec::new(),
         }
     }

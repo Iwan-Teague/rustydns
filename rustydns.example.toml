@@ -100,6 +100,22 @@ timeout_ms = 5000
 # add several routes on memory-constrained hosts.
 max_cache_entries = 10000
 
+# DNS-rebinding defence (default false).
+# ⚠ SECURITY: When true, A/AAAA records returned by the DEFAULT upstream
+#   that point at private/loopback/link-local/etc. addresses are stripped
+#   from the response. Blocks "attacker pivots browser to LAN" rebinding
+#   attacks where short-TTL public DNS flips to 127.0.0.1 or 192.168.x.x.
+#   Each dropped record is counted in
+#   rustydns_resolver_private_rdata_dropped_total.
+# ⚠ Default OFF because internal-DNS deployments routinely resolve
+#   names to RFC 1918 addresses on purpose. Turn on only if this host
+#   resolves public Internet names only — OR pair with static records
+#   / [[upstream.routes]] so internal zones bypass the filter.
+# ⚠ Conditional-forwarding route responses are NEVER filtered, regardless
+#   of this setting — operators route to internal resolvers precisely so
+#   they CAN return private addresses.
+block_private_rdata = false
+
 # Conditional-forwarding routes (optional).
 # ⚠ Each route gets its own independent resolver instance. The
 #   privacy/security knobs above (fail_closed, min_tls_version,

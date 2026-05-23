@@ -17,6 +17,7 @@
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
 //! | Conditional forwarding (per-zone routes) | — | opt-in | `[[upstream.routes]]` | implemented (longest-suffix match) |
+//! | DNS-rebinding defence (drop private rdata) | — | opt-in | `upstream.block_private_rdata` | implemented (default arm only; never filters route or authority responses) |
 //! | Strip EDNS Client Subnet | RFC 7871 | ✓ | `privacy.no_edns_client_subnet = true` | implemented (we never set ECS) |
 //! | DoH query padding | RFC 8467 | ✓ | `privacy.upstream_padding = true` | **pending** — hickory 0.26 doesn't expose RFC 8467 yet; daemon warns at startup. See `docs/roadmap.md` §1.2. |
 //! | Randomise upstream selection | — | ✓ | `privacy.randomize_upstream_selection = true` | implemented (round-robin server-ordering strategy) |
@@ -49,7 +50,7 @@
 //! - `qname` may appear at `debug` / `trace` (require explicit opt-in via
 //!   `RUST_LOG=debug`); prefer hashed or truncated forms.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +70,27 @@ use rustydns_core::record::{DnsRecord, RecordData};
 
 /// Result type for resolver operations.
 pub type ResolverResult<T> = Result<T, RustyDnsError>;
+
+/// The outcome of a single [`Resolver::resolve`] call.
+///
+/// Holds the answer records plus auxiliary stats the daemon promotes to
+/// Prometheus counters. Today the only such stat is the DNS-rebinding
+/// drop count; new fields can be added without breaking the API because
+/// the struct is non-exhaustively constructed.
+#[derive(Debug, Default, Clone)]
+pub struct ResolveOutcome {
+    /// Answer records returned to the caller. May be empty (NODATA / NXDOMAIN
+    /// at the upstream, or every record dropped by the rebinding defence).
+    pub records: Vec<DnsRecord>,
+    /// Number of A/AAAA records that were dropped because their rdata
+    /// resolved to a private/loopback/link-local/etc. address while
+    /// `upstream.block_private_rdata = true`.
+    ///
+    /// Always `0` when the matched arm is a conditional-forwarding route
+    /// (operators route to internal resolvers precisely so they CAN
+    /// return private addresses), or when the rebinding defence is off.
+    pub private_rdata_dropped: u32,
+}
 
 /// A single resolver instance — one hickory `TokioResolver` plus its bound
 /// upstream URLs (kept for logging only).
@@ -255,23 +277,32 @@ impl Resolver {
     /// Resolve `name` with record type `qtype` (e.g. `"A"`, `"AAAA"`, `"MX"`).
     ///
     /// Returns:
-    /// - `Ok(records)` with zero or more records of `qtype`. An empty
-    ///   vec indicates the upstream returned NOERROR with no records
-    ///   (NODATA / authoritative empty answer) or NXDOMAIN — both
-    ///   represent "no positive answer" from the resolver's perspective.
+    /// - `Ok(ResolveOutcome)` with the answer records (possibly empty for
+    ///   NODATA / NXDOMAIN at the upstream) plus the count of records
+    ///   dropped by the rebinding defence.
     /// - `Err(RustyDnsError::AllUpstreamsFailed)` if every configured
     ///   upstream failed and `fail_closed = true`. The daemon translates
     ///   this to `SERVFAIL`.
     /// - `Err(RustyDnsError::Resolver(...))` for other resolver errors
     ///   (bad query name, protocol violation, etc.).
     ///
+    /// # Rebinding defence
+    ///
+    /// When `upstream.block_private_rdata = true` AND the query is
+    /// answered by the default arm, A/AAAA records whose rdata points
+    /// at a private/loopback/link-local/etc. address are stripped from
+    /// the answer set. See [`is_private_or_internal_v4`] /
+    /// [`is_private_or_internal_v6`] for the exact predicate, and the
+    /// config docstring on `block_private_rdata` for the rationale and
+    /// expected operator workflow.
+    ///
     /// # Log redaction
     ///
     /// `qname` is logged at `debug` only. Never promote — see module doc.
-    pub async fn resolve(&self, name: &str, qtype: &str) -> ResolverResult<Vec<DnsRecord>> {
+    pub async fn resolve(&self, name: &str, qtype: &str) -> ResolverResult<ResolveOutcome> {
         let record_type = parse_record_type(qtype)?;
 
-        let arm = self.select_arm(name);
+        let (arm, on_default) = self.select_arm(name);
 
         // PRIVACY: qname only at debug level. See module-level doc.
         // The matched zone is operator-configured (not user-controlled)
@@ -280,9 +311,21 @@ impl Resolver {
 
         match arm.inner.lookup(name, record_type).await {
             Ok(lookup) => {
-                let records = lookup_to_dns_records(lookup.answers());
-                tracing::trace!(qtype = %record_type, count = records.len(), "upstream answer");
-                Ok(records)
+                let mut records = lookup_to_dns_records(lookup.answers());
+                let mut dropped: u32 = 0;
+                if on_default && self.config.upstream.block_private_rdata {
+                    dropped = filter_private_rdata(&mut records);
+                }
+                tracing::trace!(
+                    qtype = %record_type,
+                    count = records.len(),
+                    dropped,
+                    "upstream answer"
+                );
+                Ok(ResolveOutcome {
+                    records,
+                    private_rdata_dropped: dropped,
+                })
             }
             Err(e) => self.map_resolve_error(arm, e),
         }
@@ -294,12 +337,16 @@ impl Resolver {
     /// normalised zone is a suffix of (or equal to) the normalised qname
     /// wins. If nothing matches the default arm is returned.
     ///
+    /// Returns the chosen arm AND a boolean that is `true` iff the default
+    /// arm was selected. The default-vs-route distinction matters for the
+    /// rebinding defence — only default-arm responses are filtered.
+    ///
     /// When no routes are configured this short-circuits without any
     /// allocation — the hot path for the typical operator (global DoH
     /// only) is unchanged from pre-routes.
-    fn select_arm(&self, name: &str) -> &ResolverArm {
+    fn select_arm(&self, name: &str) -> (&ResolverArm, bool) {
         if self.routes.is_empty() {
-            return &self.default;
+            return (&self.default, true);
         }
         // Normalise once per query: lowercase + trailing dot so the
         // suffix match is a single ends_with call.
@@ -309,17 +356,17 @@ impl Resolver {
         }
         for r in &self.routes {
             if lower == r.zone_with_dot || lower.ends_with(&r.dotted_suffix) {
-                return &r.arm;
+                return (&r.arm, false);
             }
         }
-        &self.default
+        (&self.default, true)
     }
 
     /// Translate a hickory `NetError` into a `RustyDnsError`.
-    fn map_resolve_error(&self, arm: &ResolverArm, e: NetError) -> ResolverResult<Vec<DnsRecord>> {
-        // No records is not an upstream failure — return empty vec.
+    fn map_resolve_error(&self, arm: &ResolverArm, e: NetError) -> ResolverResult<ResolveOutcome> {
+        // No records is not an upstream failure — return empty outcome.
         if e.is_no_records_found() {
-            return Ok(Vec::new());
+            return Ok(ResolveOutcome::default());
         }
         // qname is inside e.to_string() in some kinds; we log only the
         // error kind at warn level, never the full Display, to avoid
@@ -674,6 +721,95 @@ fn rdata_to_record_data(rdata: &RData) -> Option<RecordData> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DNS-rebinding defence
+// ---------------------------------------------------------------------------
+
+/// Strip A/AAAA records from `records` whose rdata is private/loopback/
+/// link-local/etc. Returns the count removed.
+///
+/// Records of other types (CNAME, MX, NS, …) are preserved verbatim — they
+/// can't host the rebinding attack. The defence is enforced at the IP level
+/// because that is what a browser actually binds to after following any
+/// CNAME chain.
+fn filter_private_rdata(records: &mut Vec<DnsRecord>) -> u32 {
+    let before = records.len();
+    records.retain(|r| match &r.data {
+        RecordData::A(ip) => !is_private_or_internal_v4(ip),
+        RecordData::Aaaa(ip) => !is_private_or_internal_v6(ip),
+        _ => true,
+    });
+    let dropped = (before - records.len()) as u32;
+    if dropped > 0 {
+        // info-safe: count + log, no qname, no client IP. The matched
+        // qname is available at debug via the `upstream answer` trace.
+        tracing::warn!(
+            dropped,
+            "rebinding defence: dropped upstream A/AAAA record(s) with private rdata"
+        );
+    }
+    dropped
+}
+
+/// `true` if `ip` is any IPv4 address that should never appear in an
+/// upstream public-DNS response: RFC 1918 private, loopback, link-local,
+/// unspecified (0.0.0.0/8), broadcast, documentation, or multicast.
+///
+/// CGNAT shared space (`100.64.0.0/10`) is **not** flagged — Tailscale,
+/// some ISPs, and other legitimate deployments use it, and dropping it
+/// would silently break those.
+pub fn is_private_or_internal_v4(ip: &Ipv4Addr) -> bool {
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || is_documentation_v4(ip)
+        || ip.is_multicast()
+}
+
+/// RFC 5737 documentation prefixes: `192.0.2.0/24` (TEST-NET-1),
+/// `198.51.100.0/24` (TEST-NET-2), `203.0.113.0/24` (TEST-NET-3).
+///
+/// `Ipv4Addr::is_documentation` is still gated behind the unstable
+/// `feature(ip)` flag, so we inline the check here.
+fn is_documentation_v4(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    matches!(
+        (o[0], o[1], o[2]),
+        (192, 0, 2) | (198, 51, 100) | (203, 0, 113)
+    )
+}
+
+/// `true` if `ip` is any IPv6 address that should never appear in an
+/// upstream public-DNS response: loopback (`::1`), unspecified (`::`),
+/// unique-local (`fc00::/7`), unicast link-local (`fe80::/10`),
+/// documentation (`2001:db8::/32`), or multicast.
+///
+/// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are unwrapped and
+/// classified by the IPv4 predicate — otherwise an attacker could
+/// pivot to a private IPv4 via the IPv6 record type.
+pub fn is_private_or_internal_v6(ip: &Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_private_or_internal_v4(&v4);
+    }
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || is_documentation_v6(ip)
+        || ip.is_multicast()
+}
+
+/// RFC 3849 documentation prefix: `2001:db8::/32`.
+///
+/// `Ipv6Addr::is_documentation` is gated behind the unstable
+/// `feature(ip)` flag, so we inline the check here.
+fn is_documentation_v6(ip: &Ipv6Addr) -> bool {
+    let s = ip.segments();
+    s[0] == 0x2001 && s[1] == 0x0db8
+}
+
 fn error_kind_label(e: &NetError) -> &'static str {
     // hickory 0.26 collapsed the old `ResolveErrorKind` into NetError
     // with semantic accessors. Map the common shapes back to the short
@@ -760,6 +896,164 @@ mod tests {
         assert!(zone_matches("1.1.168.192.in-addr.arpa.", zone));
         assert!(zone_matches("168.192.in-addr.arpa.", zone));
         assert!(!zone_matches("10.in-addr.arpa.", zone));
+    }
+
+    // --- DNS rebinding defence (block_private_rdata) ---------------
+
+    fn record_a(name: &str, ip: &str) -> DnsRecord {
+        DnsRecord::new(
+            name,
+            RecordData::A(ip.parse().unwrap()),
+            Duration::from_secs(60),
+        )
+    }
+    fn record_aaaa(name: &str, ip: &str) -> DnsRecord {
+        DnsRecord::new(
+            name,
+            RecordData::Aaaa(ip.parse().unwrap()),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn v4_rfc1918_classified_private() {
+        assert!(is_private_or_internal_v4(&"10.0.0.1".parse().unwrap()));
+        assert!(is_private_or_internal_v4(&"172.16.0.1".parse().unwrap()));
+        assert!(is_private_or_internal_v4(&"192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn v4_loopback_link_local_unspecified_broadcast_classified_private() {
+        assert!(is_private_or_internal_v4(&"127.0.0.1".parse().unwrap()));
+        assert!(is_private_or_internal_v4(&"169.254.1.1".parse().unwrap()));
+        assert!(is_private_or_internal_v4(&"0.0.0.0".parse().unwrap()));
+        assert!(is_private_or_internal_v4(
+            &"255.255.255.255".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn v4_documentation_and_multicast_classified_private() {
+        // RFC 5737 documentation prefixes.
+        assert!(is_private_or_internal_v4(&"192.0.2.1".parse().unwrap()));
+        assert!(is_private_or_internal_v4(&"198.51.100.1".parse().unwrap()));
+        assert!(is_private_or_internal_v4(&"203.0.113.1".parse().unwrap()));
+        // Multicast.
+        assert!(is_private_or_internal_v4(&"224.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn v4_public_ips_pass() {
+        assert!(!is_private_or_internal_v4(&"1.1.1.1".parse().unwrap()));
+        assert!(!is_private_or_internal_v4(&"8.8.8.8".parse().unwrap()));
+        // CGNAT is intentionally NOT flagged.
+        assert!(!is_private_or_internal_v4(&"100.64.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn v6_loopback_unspecified_classified_private() {
+        assert!(is_private_or_internal_v6(&"::1".parse().unwrap()));
+        assert!(is_private_or_internal_v6(&"::".parse().unwrap()));
+    }
+
+    #[test]
+    fn v6_unique_local_and_link_local_classified_private() {
+        assert!(is_private_or_internal_v6(&"fc00::1".parse().unwrap()));
+        assert!(is_private_or_internal_v6(&"fd00::1".parse().unwrap()));
+        assert!(is_private_or_internal_v6(&"fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn v6_documentation_and_multicast_classified_private() {
+        assert!(is_private_or_internal_v6(&"2001:db8::1".parse().unwrap()));
+        assert!(is_private_or_internal_v6(&"ff02::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn v6_ipv4_mapped_unwrapped_for_classification() {
+        // ::ffff:192.168.1.1 — IPv6 wire form of a private IPv4. Must
+        // be flagged so an attacker can't smuggle private IPv4 via AAAA.
+        assert!(is_private_or_internal_v6(
+            &"::ffff:192.168.1.1".parse().unwrap()
+        ));
+        // ::ffff:1.1.1.1 — public via IPv6 — must pass.
+        assert!(!is_private_or_internal_v6(
+            &"::ffff:1.1.1.1".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn v6_public_pass() {
+        assert!(!is_private_or_internal_v6(
+            &"2606:4700::1111".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn filter_strips_private_a_records_only() {
+        let mut records = vec![
+            record_a("evil.example.", "1.2.3.4"),
+            record_a("evil.example.", "192.168.1.1"),
+            record_a("evil.example.", "127.0.0.1"),
+        ];
+        let dropped = filter_private_rdata(&mut records);
+        assert_eq!(dropped, 2);
+        assert_eq!(records.len(), 1);
+        match &records[0].data {
+            RecordData::A(ip) => assert_eq!(ip.to_string(), "1.2.3.4"),
+            other => panic!("expected A 1.2.3.4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_strips_private_aaaa_records() {
+        let mut records = vec![
+            record_aaaa("evil.example.", "2606:4700::1111"),
+            record_aaaa("evil.example.", "::1"),
+            record_aaaa("evil.example.", "fe80::1"),
+        ];
+        let dropped = filter_private_rdata(&mut records);
+        assert_eq!(dropped, 2);
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn filter_preserves_non_address_records() {
+        // CNAMEs and other types are passed through verbatim — only
+        // bindable A/AAAA matter for rebinding.
+        let mut records = vec![
+            DnsRecord::new(
+                "evil.example.",
+                RecordData::Cname("cdn.example.".to_string()),
+                Duration::from_secs(60),
+            ),
+            record_a("evil.example.", "192.168.1.1"),
+        ];
+        let dropped = filter_private_rdata(&mut records);
+        assert_eq!(dropped, 1);
+        assert_eq!(records.len(), 1);
+        assert!(matches!(&records[0].data, RecordData::Cname(_)));
+    }
+
+    #[test]
+    fn filter_empty_record_set_is_noop() {
+        let mut records: Vec<DnsRecord> = Vec::new();
+        let dropped = filter_private_rdata(&mut records);
+        assert_eq!(dropped, 0);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn filter_all_public_records_keeps_all() {
+        let mut records = vec![
+            record_a("good.example.", "1.1.1.1"),
+            record_a("good.example.", "8.8.8.8"),
+            record_aaaa("good.example.", "2606:4700::1111"),
+        ];
+        let before = records.len();
+        let dropped = filter_private_rdata(&mut records);
+        assert_eq!(dropped, 0);
+        assert_eq!(records.len(), before);
     }
 
     /// Independent of any real hickory build, prove that the
