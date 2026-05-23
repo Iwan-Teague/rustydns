@@ -108,6 +108,42 @@ sidecar in the **same network namespace** so it can reach
 …and have nginx proxy `:9090` → `127.0.0.1:9153/metrics` with whatever
 authentication you want on top.
 
+## Verify it's working
+
+After `docker compose up -d`, walk through these in order — if any
+step fails, jump to the matching row in
+[Troubleshooting](#troubleshooting).
+
+```bash
+# 1. Container is up and the healthcheck has gone green.
+docker compose ps
+#   NAME         STATUS                    PORTS
+#   rustydnsd    Up 2 minutes (healthy)    0.0.0.0:53->53/udp, ...
+
+# 2. /health on the host (compose publishes :9153 only inside the
+#    container; reach it through docker exec or a sidecar in the
+#    same netns — see "Port exposure" above).
+docker compose exec rustydnsd wget -qO- http://127.0.0.1:9153/health
+#   {"status":"ok","mesh_zone":{...}}
+
+# 3. A normal name resolves through the daemon (host-side test).
+dig @127.0.0.1 example.com +short
+#   93.184.216.34
+
+# 4. A known ad/tracker domain is blocked.
+dig @127.0.0.1 doubleclick.net +short
+#   (empty — status: NXDOMAIN if you use `dig +noshort`)
+
+# 5. The blocklist hit counter increments.
+docker compose exec rustydnsd \
+    wget -qO- http://127.0.0.1:9153/metrics | grep blocklist_hits_total
+#   rustydns_blocklist_hits_total 1
+```
+
+If step 5's counter rose by 1 between steps 3 and 4, ads are being
+blocked end-to-end. Point your router or per-device DNS at the host
+running rustydnsd and the same filtering applies network-wide.
+
 ## Health checking
 
 The image has a `HEALTHCHECK` that probes
