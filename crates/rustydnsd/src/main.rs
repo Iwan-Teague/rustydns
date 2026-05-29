@@ -108,6 +108,29 @@ async fn main() -> Result<()> {
     let config =
         rustydns_core::config::load_config(&config_path).context("failed to load configuration")?;
 
+    // Warn about privacy knobs that the operator may believe are
+    // active but are not, because hickory 0.26's stub resolver
+    // doesn't yet expose them. Keeping the config keys around lets
+    // the daemon adopt them silently when hickory ships support —
+    // but until then, an operator with `upstream_padding = true`
+    // would have no signal that padding isn't actually happening.
+    // Emitted before the --validate-config / --print-config early
+    // returns so an operator validating their config sees them too.
+    if config.privacy.query_minimization {
+        warn!(
+            "privacy.query_minimization is enabled in config but hickory 0.26's stub \
+             resolver does not yet apply RFC 7816 qmin — queries are sent in full. \
+             The setting is honoured the moment hickory exposes it."
+        );
+    }
+    if config.privacy.upstream_padding {
+        warn!(
+            "privacy.upstream_padding is enabled in config but hickory 0.26 does not \
+             yet apply RFC 8467 DoH padding — encrypted query sizes still leak which \
+             domain was queried. The setting is honoured the moment hickory exposes it."
+        );
+    }
+
     // `--print-config`: emit the resolved config and exit. Implies
     // --validate-config (load_config has already run validate_config).
     // Sensitive fields render as <redacted> via the Secret Debug impl.
@@ -138,27 +161,6 @@ async fn main() -> Result<()> {
         blocklist_sources = config.blocklist.sources.len(),
         "configuration loaded"
     );
-
-    // Warn about privacy knobs that the operator may believe are
-    // active but are not, because hickory 0.26's stub resolver
-    // doesn't yet expose them. Keeping the config keys around lets
-    // the daemon adopt them silently when hickory ships support —
-    // but until then, an operator with `upstream_padding = true`
-    // would have no signal that padding isn't actually happening.
-    if config.privacy.query_minimization {
-        warn!(
-            "privacy.query_minimization is enabled in config but hickory 0.26's stub \
-             resolver does not yet apply RFC 7816 qmin — queries are sent in full. \
-             The setting is honoured the moment hickory exposes it."
-        );
-    }
-    if config.privacy.upstream_padding {
-        warn!(
-            "privacy.upstream_padding is enabled in config but hickory 0.26 does not \
-             yet apply RFC 8467 DoH padding — encrypted query sizes still leak which \
-             domain was queried. The setting is honoured the moment hickory exposes it."
-        );
-    }
 
     // Build authority (mesh integration is best-effort — failures are
     // logged at warn! inside Authority::new and the daemon continues in
@@ -979,7 +981,7 @@ mod tests {
         let err = load_tls_config(&server_with_paths(Some(cert), Some(key))).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("failed to open TLS certificate"),
+            msg.contains("failed to read TLS certificate"),
             "msg = {msg}"
         );
     }
