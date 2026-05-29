@@ -103,6 +103,23 @@ something* — a bypass that fired against a non-blocked name doesn't
 count. This makes the metric a faithful "blocklist relaxations
 served per second" signal.
 
+### On-disk query log
+
+Present only when `privacy.query_log_to_disk = true`. All four are 0 (or
+absent in scrapes filtered by value) when disk logging is disabled.
+
+| Series                                          | Type    | Meaning                                                                  |
+|-------------------------------------------------|---------|--------------------------------------------------------------------------|
+| `rustydns_query_log_disk_written_total`         | counter | Entries successfully written to the NDJSON log                           |
+| `rustydns_query_log_disk_dropped_total`         | counter | Entries dropped from the disk stream because the writer channel was full |
+| `rustydns_query_log_disk_io_errors_total`       | counter | Write/flush errors hit by the disk writer                                |
+| `rustydns_query_log_disk_rotations_total`       | counter | Size-based file rotations performed                                      |
+
+A rising `dropped_total` means the disk can't keep up with the query
+rate (common on slow SD cards) — the in-memory ring and DNS serving are
+unaffected; only the on-disk record is lossy. A rising `io_errors_total`
+means the volume is full or unwritable.
+
 ## `/queries`
 
 Snapshot of the in-memory query log ring buffer, newest entry first.

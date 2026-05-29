@@ -66,22 +66,6 @@ marker to the code or doc it relates to**, so no item lives only in one place.
 
 ## 3. Unstarted features (design + privacy review needed)
 
-### 3.1 `query_log_to_disk` implementation
-
-- **What:** opt-in, durable on-disk query log. Today the field exists but the
-  daemon refuses to write anything; it logs a startup warning and keeps the
-  ring buffer in memory only.
-- **Why not yet:** writing query history to disk has hard privacy implications
-  (see AGENTS.md §Privacy invariants). Any implementation needs explicit
-  decisions on file format (line-delimited JSON, fixed-size rotating?), file
-  permissions (always 0600), rotation policy, max-size cap, and whether
-  hashed-qname mode is mandatory. Until those are settled, the safer default
-  is to refuse.
-- **Scaffolding:** `PrivacyConfig::query_log_to_disk: bool` (default `false`)
-  is parsed. The daemon warns on `true` and ignores it. `query_log_ring_size`
-  (default 1000, max 100,000) bounds the in-memory ring buffer that is
-  already wired.
-
 ### 3.2 SIGHUP full-config reload
 
 - **What:** re-read `rustydns.toml` end-to-end on SIGHUP — including listener

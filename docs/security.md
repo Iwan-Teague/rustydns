@@ -249,12 +249,29 @@ if source IP logging is disabled, logging a node ID uniquely identifies a device
 IDs are therefore governed by the same `log_client_ips` flag. The `anonymized()` view
 of a `ClientId` omits the node ID entirely.
 
-### In-Memory Query Logs Only
+### In-Memory Query Logs by Default
 
 Query logs are held in a bounded ring buffer in memory (default size 10,000 entries,
 configurable up to 100,000). They are not written to disk by default. Disk logging must
-be explicitly enabled; doing so emits a startup warning reminding the operator that log
-files are persistent and require their own access control.
+be explicitly enabled (`privacy.query_log_to_disk = true` plus a `query_log_disk_path`);
+doing so emits a startup warning.
+
+When enabled, the on-disk log preserves the privacy invariants by construction:
+
+- **QNAME is always salted-hashed**, never written in plaintext. The raw query name
+  cannot reach the disk writer — there is no code path that carries it there.
+- **Client IP is always anonymised** (IPv4 `/16`, IPv6 `/64`). The `log_client_ips`
+  flag governs `tracing` output only; it does **not** lift anonymisation for the
+  on-disk log.
+- The file is created mode **0600**. If an existing target is group- or world-readable,
+  the daemon **refuses to write to it** and continues serving DNS with the in-memory
+  ring only — refusing is the privacy-safe failure mode.
+- Format is **NDJSON** with built-in **size-based rotation** (`query_log_max_file_bytes`
+  × `query_log_max_files` bounds the total footprint), so no external `logrotate` is
+  needed and the disk can't fill unbounded on a low-power device.
+- Writes happen on a dedicated task fed by a bounded channel; if the disk can't keep up
+  the disk stream drops entries (counted in `rustydns_query_log_disk_dropped_total`)
+  rather than stalling the resolver.
 
 ### Metrics Endpoint Binding
 

@@ -1,20 +1,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Bounded in-memory query log ring buffer.
+//! Bounded in-memory query log ring buffer, with an optional on-disk fan-out.
 //!
 //! Per `AGENTS.md §Privacy invariants`:
 //!
-//! - The ring buffer is **in-memory only**. No disk persistence.
-//! - Bounded by `privacy.query_log_ring_size` (default 1000, max 100,000).
+//! - The ring buffer is **in-memory** and bounded by
+//!   `privacy.query_log_ring_size` (default 1000, max 100,000).
 //! - Stores only **anonymised** client identifiers and **hashed** query
 //!   names. The full QNAME never enters the buffer — even an operator
 //!   with shell access on the daemon host cannot recover the queried
 //!   domain from the buffer alone.
 //! - Disk persistence (`privacy.query_log_to_disk = true`) is a separate
-//!   opt-in that emits a startup warning; that path is **not implemented
-//!   yet** and any future implementation must be reviewed against the
-//!   privacy invariants in `AGENTS.md`.
+//!   opt-in that emits a startup warning. When enabled, each recorded
+//!   entry is *also* sent over a bounded channel to the on-disk NDJSON
+//!   writer in [`crate::query_log_disk`]. The same [`QueryLogEntry`] —
+//!   hashed qname, anonymised client — is what reaches disk; there is no
+//!   path that writes a raw QNAME or full IP. See `query_log_disk.rs`.
 //!
 //! # Why hash instead of redact?
 //!
@@ -34,6 +36,8 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use prometheus::IntCounter;
 
 use rustydns_core::client::ClientId;
 
@@ -134,31 +138,93 @@ impl AnonymisedClient {
     /// View as a string slice. Never panics; falls back to "?" if the
     /// stored bytes aren't valid UTF-8 (should be unreachable in
     /// practice — `ClientId::anonymized` produces ASCII).
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("?")
     }
 }
 
+impl QueryLogEntry {
+    /// Render this entry as a single-line JSON object (no trailing
+    /// newline). Used by both the `/queries` endpoint and the on-disk
+    /// NDJSON writer so the two never drift. Every field is a primitive
+    /// or a known-ASCII string; the client string is JSON-escaped
+    /// defensively even though `ClientId::anonymized` never emits a
+    /// JSON-significant character.
+    ///
+    /// Privacy: by construction this carries only the **hashed** qname
+    /// and the **anonymised** client — never a raw QNAME or full IP.
+    pub fn to_json(self) -> String {
+        format!(
+            "{{\"ts\":{},\"client\":\"{}\",\"qname_hash\":\"{:016x}\",\"qtype\":\"{}\",\"rcode\":{},\"served_by\":\"{}\"}}",
+            self.timestamp_unix,
+            json_escape(self.client_anonymised.as_str()),
+            self.qname_hash,
+            self.qtype,
+            self.rcode,
+            self.served_by.as_str()
+        )
+    }
+}
+
+/// Escape the small set of JSON-significant characters that
+/// `ClientId::anonymized` could theoretically produce. In practice the
+/// output is `<ip>/<prefix>/anon`, which contains none of them — this is
+/// belt-and-braces against a future change to the formatter.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Bounded in-memory query log.
+///
+/// Optionally fans each recorded entry out to an on-disk NDJSON writer
+/// via a bounded channel (see [`QueryLog::with_disk_sink`]). The send is
+/// non-blocking: if the writer falls behind and the channel fills, the
+/// entry is dropped from the disk stream (counted in `disk_dropped`)
+/// rather than stalling the DNS hot path. The in-memory ring buffer is
+/// unaffected by disk back-pressure.
 #[derive(Debug)]
 pub struct QueryLog {
     capacity: usize,
     salt: u64,
     inner: Mutex<VecDeque<QueryLogEntry>>,
+    /// `Some` only when `privacy.query_log_to_disk = true` and the disk
+    /// writer started successfully.
+    disk_tx: Option<tokio::sync::mpsc::Sender<QueryLogEntry>>,
+    /// Incremented when an entry is dropped from the disk stream because
+    /// the channel was full (writer behind). Surfaced as
+    /// `rustydns_query_log_disk_dropped_total`.
+    disk_dropped: Option<IntCounter>,
 }
 
 impl QueryLog {
-    /// Create a new buffer with the given capacity. A `capacity` of 0
-    /// produces an "always-empty" log — `record()` becomes a no-op,
-    /// useful when an operator wants to disable the buffer entirely.
+    /// Create a new in-memory-only buffer with the given capacity. A
+    /// `capacity` of 0 produces an "always-empty" log — `record()`
+    /// becomes a no-op, useful when an operator wants to disable the
+    /// buffer entirely.
     pub fn new(capacity: usize) -> Self {
         let salt: u64 = rand::random();
         Self {
             capacity,
             salt,
             inner: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
+            disk_tx: None,
+            disk_dropped: None,
         }
+    }
+
+    /// Create a buffer that also fans entries out to the on-disk writer
+    /// over `disk_tx`. `disk_dropped` is incremented whenever the channel
+    /// is full and an entry is dropped from the disk stream. The
+    /// in-memory ring still works exactly as in [`QueryLog::new`].
+    pub fn with_disk_sink(
+        capacity: usize,
+        disk_tx: tokio::sync::mpsc::Sender<QueryLogEntry>,
+        disk_dropped: IntCounter,
+    ) -> Self {
+        let mut log = Self::new(capacity);
+        log.disk_tx = Some(disk_tx);
+        log.disk_dropped = Some(disk_dropped);
+        log
     }
 
     /// Hash a (lowercased) qname using the per-process salt. Operators
@@ -171,8 +237,10 @@ impl QueryLog {
         hasher.finish()
     }
 
-    /// Record a query. Evicts the oldest entry when the buffer is full.
-    /// Cheap (one Mutex acquire, one VecDeque push, one optional pop).
+    /// Record a query. Fans out to the on-disk writer (if enabled) and
+    /// pushes into the in-memory ring (if `capacity > 0`), evicting the
+    /// oldest entry when the ring is full. Cheap: one non-blocking
+    /// channel send + one Mutex acquire + one VecDeque push.
     pub fn record(
         &self,
         client: &ClientId,
@@ -181,7 +249,8 @@ impl QueryLog {
         rcode: u8,
         served_by: ServedBy,
     ) {
-        if self.capacity == 0 {
+        // Nothing to do when both sinks are off.
+        if self.capacity == 0 && self.disk_tx.is_none() {
             return;
         }
         let entry = QueryLogEntry {
@@ -195,6 +264,20 @@ impl QueryLog {
             rcode,
             served_by,
         };
+        // Fan out to the on-disk writer first (cheap, non-blocking). A
+        // full channel means the writer is behind; we drop from the disk
+        // stream rather than stall the DNS path. The in-memory ring below
+        // is never affected by disk back-pressure.
+        if let Some(tx) = &self.disk_tx
+            && tx.try_send(entry).is_err()
+            && let Some(c) = &self.disk_dropped
+        {
+            c.inc();
+        }
+
+        if self.capacity == 0 {
+            return;
+        }
         let mut buf = self.inner.lock().expect("query log lock poisoned");
         if buf.len() == self.capacity {
             buf.pop_front();

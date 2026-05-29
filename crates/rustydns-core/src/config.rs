@@ -82,6 +82,12 @@ fn default_rate_limit_max_clients() -> usize {
 fn default_ring_size() -> usize {
     1_000
 }
+fn default_query_log_max_file_bytes() -> u64 {
+    10 * 1024 * 1024 // 10 MiB — sized for low-power devices (Pi Zero class).
+}
+fn default_query_log_max_files() -> usize {
+    5
+}
 fn default_mesh_zone_max_age_secs() -> u64 {
     600
 }
@@ -647,8 +653,32 @@ pub struct PrivacyConfig {
     ///
     /// Setting this to `true` creates a permanent record of every domain
     /// resolved by every client. A startup warning is emitted.
+    ///
+    /// What lands on disk is still privacy-safe by construction: the
+    /// QNAME is **always** salted-hashed (never written in plaintext) and
+    /// the client IP is **always** anonymised (IPv4 /16, IPv6 /64) — the
+    /// `log_client_ips` flag does not lift this for the on-disk log. The
+    /// file is created mode `0600`; if an existing target is group- or
+    /// world-readable the daemon refuses to write to it (and keeps
+    /// serving DNS).
     #[serde(default = "default_false")]
     pub query_log_to_disk: bool,
+
+    /// Filesystem path for the on-disk query log (NDJSON). Required when
+    /// `query_log_to_disk = true`; ignored otherwise. Rotated files get a
+    /// `.1`, `.2`, … suffix. Default: `None`.
+    #[serde(default)]
+    pub query_log_disk_path: Option<String>,
+
+    /// Maximum size of the active on-disk query log before rotation, in
+    /// bytes. Default: 10 MiB. Must be ≥ 4096 and ≤ 1 GiB.
+    #[serde(default = "default_query_log_max_file_bytes")]
+    pub query_log_max_file_bytes: u64,
+
+    /// Maximum number of rotated query-log files to retain (including the
+    /// active file). Oldest is deleted on rotation. Default: 5. Must be ≥ 1.
+    #[serde(default = "default_query_log_max_files")]
+    pub query_log_max_files: usize,
 
     /// In-memory query log ring buffer size. Default: `1000`.
     ///
@@ -674,6 +704,9 @@ impl Default for PrivacyConfig {
             upstream_padding: true,
             randomize_upstream_selection: true,
             query_log_to_disk: false,
+            query_log_disk_path: None,
+            query_log_max_file_bytes: default_query_log_max_file_bytes(),
+            query_log_max_files: default_query_log_max_files(),
             query_log_ring_size: default_ring_size(),
             log_client_ips: false,
         }
@@ -1277,10 +1310,47 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     if cfg.privacy.query_log_to_disk {
         tracing::warn!(
             "privacy.query_log_to_disk = true — ALL DNS queries will be written to disk. \
-             This creates a permanent record of every domain resolved by every client. \
-             Ensure the log file is protected (mode 0600, owner rustydns) and has a \
-             retention/rotation policy. Consider whether this data must be held at all."
+             This creates a permanent record of every domain resolved by every client \
+             (QNAME salted-hashed, client IP anonymised — but still a durable record). \
+             The file is created mode 0600; ensure its directory and any backups are \
+             protected. Consider whether this data must be held at all."
         );
+
+        match &cfg.privacy.query_log_disk_path {
+            None => {
+                return Err(crate::RustyDnsError::Config(
+                    "privacy.query_log_to_disk = true requires privacy.query_log_disk_path \
+                     to be set to a writable file path."
+                        .to_string(),
+                ));
+            }
+            Some(p) if p.trim().is_empty() => {
+                return Err(crate::RustyDnsError::Config(
+                    "privacy.query_log_disk_path must not be empty when \
+                     query_log_to_disk = true."
+                        .to_string(),
+                ));
+            }
+            Some(_) => {}
+        }
+
+        if cfg.privacy.query_log_max_files == 0 {
+            return Err(crate::RustyDnsError::Config(
+                "privacy.query_log_max_files must be at least 1.".to_string(),
+            ));
+        }
+
+        const MIN_FILE_BYTES: u64 = 4096;
+        const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+        if cfg.privacy.query_log_max_file_bytes < MIN_FILE_BYTES
+            || cfg.privacy.query_log_max_file_bytes > MAX_FILE_BYTES
+        {
+            return Err(crate::RustyDnsError::Config(format!(
+                "privacy.query_log_max_file_bytes = {} is out of range; must be between \
+                 {MIN_FILE_BYTES} and {MAX_FILE_BYTES} bytes.",
+                cfg.privacy.query_log_max_file_bytes
+            )));
+        }
     }
 
     if cfg.privacy.log_client_ips {
@@ -1679,6 +1749,48 @@ mod tests {
         let mut cfg = baseline();
         cfg.privacy.query_log_ring_size = 100_001;
         assert_config_err(validate_config(&cfg), "100,000");
+    }
+
+    #[test]
+    fn disk_log_without_path_rejected() {
+        let mut cfg = baseline();
+        cfg.privacy.query_log_to_disk = true;
+        cfg.privacy.query_log_disk_path = None;
+        assert_config_err(validate_config(&cfg), "query_log_disk_path");
+    }
+
+    #[test]
+    fn disk_log_empty_path_rejected() {
+        let mut cfg = baseline();
+        cfg.privacy.query_log_to_disk = true;
+        cfg.privacy.query_log_disk_path = Some("   ".to_string());
+        assert_config_err(validate_config(&cfg), "must not be empty");
+    }
+
+    #[test]
+    fn disk_log_zero_max_files_rejected() {
+        let mut cfg = baseline();
+        cfg.privacy.query_log_to_disk = true;
+        cfg.privacy.query_log_disk_path = Some("/var/log/rustydns/queries.ndjson".to_string());
+        cfg.privacy.query_log_max_files = 0;
+        assert_config_err(validate_config(&cfg), "query_log_max_files");
+    }
+
+    #[test]
+    fn disk_log_tiny_max_file_bytes_rejected() {
+        let mut cfg = baseline();
+        cfg.privacy.query_log_to_disk = true;
+        cfg.privacy.query_log_disk_path = Some("/var/log/rustydns/queries.ndjson".to_string());
+        cfg.privacy.query_log_max_file_bytes = 100;
+        assert_config_err(validate_config(&cfg), "out of range");
+    }
+
+    #[test]
+    fn disk_log_valid_config_passes() {
+        let mut cfg = baseline();
+        cfg.privacy.query_log_to_disk = true;
+        cfg.privacy.query_log_disk_path = Some("/var/log/rustydns/queries.ndjson".to_string());
+        validate_config(&cfg).expect("a complete disk-log config must pass");
     }
 
     // --- rate_limit -------------------------------------------------

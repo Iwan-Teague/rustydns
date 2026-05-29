@@ -39,6 +39,10 @@ pub struct Metrics {
     policy_zone_denied_total: IntCounter,
     policy_rate_limited_total: IntCounter,
     private_rdata_dropped_total: IntCounter,
+    query_log_disk_written_total: IntCounter,
+    query_log_disk_dropped_total: IntCounter,
+    query_log_disk_io_errors_total: IntCounter,
+    query_log_disk_rotations_total: IntCounter,
 }
 
 impl Metrics {
@@ -144,6 +148,27 @@ impl Metrics {
             "Queries refused with REFUSED because the source IP exceeded \
              the per-client token-bucket rate limit",
         )?;
+        let query_log_disk_written_total = register_counter(
+            &registry,
+            "rustydns_query_log_disk_written_total",
+            "Query-log entries successfully written to the on-disk NDJSON log",
+        )?;
+        let query_log_disk_dropped_total = register_counter(
+            &registry,
+            "rustydns_query_log_disk_dropped_total",
+            "Query-log entries dropped from the on-disk stream because the \
+             writer channel was full (disk slower than query rate)",
+        )?;
+        let query_log_disk_io_errors_total = register_counter(
+            &registry,
+            "rustydns_query_log_disk_io_errors_total",
+            "Write or flush errors encountered by the on-disk query-log writer",
+        )?;
+        let query_log_disk_rotations_total = register_counter(
+            &registry,
+            "rustydns_query_log_disk_rotations_total",
+            "On-disk query-log file rotations performed",
+        )?;
 
         Ok(Self {
             registry,
@@ -165,7 +190,33 @@ impl Metrics {
             policy_zone_denied_total,
             policy_rate_limited_total,
             private_rdata_dropped_total,
+            query_log_disk_written_total,
+            query_log_disk_dropped_total,
+            query_log_disk_io_errors_total,
+            query_log_disk_rotations_total,
         })
+    }
+
+    /// Increment the on-disk query-log written counter.
+    pub fn inc_query_log_disk_written(&self) {
+        self.query_log_disk_written_total.inc();
+    }
+
+    /// Increment the on-disk query-log I/O error counter.
+    pub fn inc_query_log_disk_io_errors(&self) {
+        self.query_log_disk_io_errors_total.inc();
+    }
+
+    /// Increment the on-disk query-log rotation counter.
+    pub fn inc_query_log_disk_rotations(&self) {
+        self.query_log_disk_rotations_total.inc();
+    }
+
+    /// Clone of the "disk stream dropped" counter, handed to
+    /// [`QueryLog::with_disk_sink`](crate::query_log::QueryLog::with_disk_sink)
+    /// so the producer side increments it directly on a full channel.
+    pub fn query_log_disk_dropped_counter(&self) -> IntCounter {
+        self.query_log_disk_dropped_total.clone()
     }
 
     /// Increment total DNS queries counter.
@@ -366,15 +417,9 @@ async fn queries_handler(query_log: Arc<QueryLog>) -> Response {
         if idx > 0 {
             out.push(',');
         }
-        out.push_str(&format!(
-            "{{\"ts\":{},\"client\":\"{}\",\"qname_hash\":\"{:016x}\",\"qtype\":\"{}\",\"rcode\":{},\"served_by\":\"{}\"}}",
-            e.timestamp_unix,
-            json_escape(e.client_anonymised.as_str()),
-            e.qname_hash,
-            e.qtype,
-            e.rcode,
-            e.served_by.as_str()
-        ));
+        // Shared with the on-disk NDJSON writer so the two formats never
+        // drift. Carries only hashed qname + anonymised client.
+        out.push_str(&e.to_json());
     }
     out.push_str("]}");
 
@@ -383,15 +428,6 @@ async fn queries_handler(query_log: Arc<QueryLog>) -> Response {
         .header("Content-Type", "application/json")
         .body(Body::from(out))
         .unwrap()
-}
-
-/// Escape the small set of JSON-significant characters that
-/// `ClientId::anonymized` could theoretically produce. In practice
-/// the output is `<ip>/<prefix>/anon` which never contains any of
-/// these — this is belt-and-braces for the case where the underlying
-/// formatter changes.
-fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn register_counter(

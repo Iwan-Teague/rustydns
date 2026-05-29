@@ -170,7 +170,9 @@ Zone changes propagate to clients within one poll interval + record TTL (default
 - `#![forbid(unsafe_code)]` in all workspace crates.
 - All upstream connections use TLS (DoH/DoQ). Certificate validation is always on and is not configurable. TLS 1.3 is the default minimum.
 - No upstream plain DNS by default. Plaintext is an explicit opt-in that emits a persistent startup warning.
-- Query logs: in-memory ring buffer only by default. Nothing written to disk.
+- Query logs: in-memory ring buffer by default. Opt-in on-disk NDJSON
+  (`query_log_to_disk`) writes only hashed qnames + anonymised clients, mode 0600,
+  with size-based rotation.
 - Client IPs: anonymised by default (IPv4 /16, IPv6 /64). Full IPs require explicit opt-in.
 - Blocklist sources: HTTPS only. Plain HTTP sources rejected at startup.
 - RPZ passthru entries: honoured only from trusted sources (local files + `trusted_rpz_sources`).

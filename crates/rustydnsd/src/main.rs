@@ -51,6 +51,7 @@ mod doh;
 mod handler;
 mod metrics;
 mod query_log;
+mod query_log_disk;
 mod rate_limiter;
 
 #[cfg(test)]
@@ -153,6 +154,12 @@ async fn main() -> Result<()> {
 
     let metrics = Arc::new(Metrics::new()?);
 
+    // Single shutdown token shared by every background task (listeners,
+    // reload loops, metrics server, on-disk query-log writer). Created
+    // early so the query-log writer — spawned during handler setup — can
+    // observe it.
+    let shutdown = CancellationToken::new();
+
     info!(
         mesh_zone         = %config.server.mesh_zone,
         protocol          = ?config.upstream.protocol,
@@ -202,11 +209,39 @@ async fn main() -> Result<()> {
     let resolver = Arc::new(Resolver::new((*config).clone()).await?);
 
     // Build request handler and server.
-    // In-memory query log ring buffer (privacy invariant: never on disk).
-    let query_log = Arc::new(query_log::QueryLog::new(config.privacy.query_log_ring_size));
+    // In-memory query log ring buffer, optionally fanned out to an
+    // on-disk NDJSON writer when `privacy.query_log_to_disk = true`.
+    // Both sinks store only hashed qnames + anonymised clients.
+    let query_log = if config.privacy.query_log_to_disk {
+        // validate_config guarantees the path is Some + non-empty here.
+        let path = config
+            .privacy
+            .query_log_disk_path
+            .clone()
+            .expect("validate_config ensures query_log_disk_path is set");
+        match query_log_disk::spawn(
+            path,
+            config.privacy.query_log_max_file_bytes,
+            config.privacy.query_log_max_files,
+            metrics.clone(),
+            shutdown.clone(),
+        ) {
+            Some(handle) => Arc::new(query_log::QueryLog::with_disk_sink(
+                config.privacy.query_log_ring_size,
+                handle.sender,
+                metrics.query_log_disk_dropped_counter(),
+            )),
+            // Disk writer refused to start (bad perms / open error). It
+            // already logged why; fall back to the in-memory ring only.
+            None => Arc::new(query_log::QueryLog::new(config.privacy.query_log_ring_size)),
+        }
+    } else {
+        Arc::new(query_log::QueryLog::new(config.privacy.query_log_ring_size))
+    };
     info!(
         capacity = query_log.capacity(),
-        "query log ring buffer initialised (in-memory only)"
+        to_disk = config.privacy.query_log_to_disk,
+        "query log ring buffer initialised"
     );
 
     // Per-source-IP rate limiter. Default-on with generous limits;
@@ -276,8 +311,6 @@ async fn main() -> Result<()> {
             .with_context(|| format!("failed to register DoT listener on {dot_listen}"))?;
         info!(listen = %dot_listen, "listening for DoT");
     }
-
-    let shutdown = CancellationToken::new();
 
     if let Some(doh_listen) = &config.server.doh_listen {
         if let Ok(addr) = doh_listen.parse::<SocketAddr>() {

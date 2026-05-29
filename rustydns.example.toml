@@ -277,10 +277,28 @@ upstream_padding = true
 randomize_upstream_selection = true
 
 # Write query logs to disk (false = in-memory ring buffer only).
-# ⚠ PRIVACY: Disk logs are persistent. Ensure log rotation is configured with
-#   mode 600 (create 600 rustydns rustydns in logrotate). The daemon emits a
-#   startup warning when this is true.
+# ⚠ PRIVACY: Disk logs are persistent. What lands on disk is still privacy-safe
+#   by construction — the QNAME is always salted-hashed (never plaintext) and the
+#   client IP is always anonymised (IPv4 /16, IPv6 /64), regardless of
+#   log_client_ips. The daemon emits a startup warning when this is true.
+#   The file is created mode 0600; the daemon refuses to write to an existing
+#   target that is group/world readable (and keeps serving DNS).
+#   Format is line-delimited JSON (NDJSON), one object per query, with built-in
+#   size-based rotation — no external logrotate needed.
 query_log_to_disk = false
+
+# Path for the on-disk query log. REQUIRED when query_log_to_disk = true,
+# ignored otherwise. Rotated files get a .1, .2, … suffix.
+# query_log_disk_path = "/var/log/rustydns/queries.ndjson"
+
+# Rotate the active query-log file once it reaches this many bytes.
+# Default 10 MiB. Range: 4096 .. 1 GiB. Tuned for low-power devices.
+query_log_max_file_bytes = 10485760
+
+# How many query-log files to retain (active + rotated). Oldest is deleted on
+# rotation. Default 5. Must be ≥ 1. Total disk footprint ≈ max_file_bytes ×
+# max_files.
+query_log_max_files = 5
 
 # Size of the in-memory query log ring buffer.
 # Must be ≤ 100,000 (hard limit enforced at startup).
