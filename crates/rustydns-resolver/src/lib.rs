@@ -222,7 +222,8 @@ impl Resolver {
         // ClientConfig matching our workspace, so the configured
         // `upstream.min_tls_version` actually pins the floor (instead
         // of being a soft warning the way it was on 0.24).
-        let tls_client_config = build_tls_client_config(config.upstream.min_tls_version, test_roots)?;
+        let tls_client_config =
+            build_tls_client_config(config.upstream.min_tls_version, test_roots)?;
 
         // Default arm — the global upstream list.
         let default = build_resolver_arm(
@@ -624,7 +625,7 @@ async fn bootstrap_resolve_with_retry(host: &str, port: u16) -> ResolverResult<V
 /// owned `(*arc).clone()` into the hickory builder.
 fn build_tls_client_config(
     min_tls: TlsVersion,
-    test_roots: &[rustls_pki_types::CertificateDer<'static>]
+    test_roots: &[rustls_pki_types::CertificateDer<'static>],
 ) -> ResolverResult<Arc<rustls::ClientConfig>> {
     // Install ring as the default crypto provider (idempotent —
     // multiple installs are a no-op after the first). hickory 0.26
@@ -636,7 +637,9 @@ fn build_tls_client_config(
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for root in test_roots {
-        roots.add(root.clone()).map_err(|e| RustyDnsError::Resolver(format!("failed to add test root: {e}")))?;
+        roots
+            .add(root.clone())
+            .map_err(|e| RustyDnsError::Resolver(format!("failed to add test root: {e}")))?;
     }
 
     let versions: &[&rustls::SupportedProtocolVersion] = match min_tls {
