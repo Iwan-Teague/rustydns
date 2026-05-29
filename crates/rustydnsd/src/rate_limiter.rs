@@ -12,9 +12,10 @@
 //!
 //! # Algorithm
 //!
-//! Classic token bucket. Each tracked source IP gets a `Bucket` with
+//! Classic token bucket. Each tracked client gets a `Bucket` with
 //! `tokens` (a `f64` so partial-second refills accumulate correctly).
-//! On every query:
+//! The bucket key is the source IPv4 `/32` or IPv6 `/64` prefix — see
+//! [`bucket_key`] for why IPv6 is collapsed. On every query:
 //!
 //! 1. Compute elapsed time since the last refill.
 //! 2. Add `elapsed * qps` tokens, capped at `burst`.
@@ -53,6 +54,31 @@ use rustydns_core::config::RateLimitConfig;
 const GC_INTERVAL: Duration = Duration::from_secs(30);
 /// Buckets idle longer than this are dropped on the GC pass.
 const IDLE_THRESHOLD: Duration = Duration::from_secs(300);
+
+/// Collapse a source address to the unit we rate-limit on.
+///
+/// IPv4 is keyed on the full `/32` address. IPv6 is keyed on the `/64`
+/// **prefix** (interface identifier zeroed) — the standard end-site
+/// allocation. Keying on the full `/128` would let an attacker holding a
+/// single `/64` rotate through 2^64 source addresses, each minting a fresh
+/// bucket, and bypass the limiter entirely. Collapsing to `/64` matches the
+/// anonymisation standard in `rustydns_core::client` and means an attacker
+/// must control many distinct prefixes — not just many addresses — to evade
+/// the limit. The collateral (legitimate devices sharing one `/64` share a
+/// bucket) is acceptable given the generous burst defaults.
+fn bucket_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut segs = v6.segments();
+            segs[4] = 0;
+            segs[5] = 0;
+            segs[6] = 0;
+            segs[7] = 0;
+            IpAddr::V6(segs.into())
+        }
+    }
+}
 
 /// One client's bucket. ~48-64 bytes depending on `Instant` size.
 #[derive(Debug, Clone, Copy)]
@@ -120,13 +146,16 @@ impl RateLimiter {
     /// Otherwise consults / updates the IP's bucket and returns
     /// `LimitDecision::Refuse` if the bucket is empty.
     pub fn check(&self, ip: IpAddr) -> LimitDecision {
-        // Loopback exemption — applied even when enabled.
+        // Loopback exemption — applied even when enabled. Checked on the
+        // real address before prefix-collapsing, so `::1` stays exempt.
         if ip.is_loopback() {
             return LimitDecision::Allow;
         }
         let Some(state) = self.state.as_ref() else {
             return LimitDecision::Allow;
         };
+        // Rate-limit on the prefix, not the raw address (see `bucket_key`).
+        let ip = bucket_key(ip);
         let now = Instant::now();
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -310,6 +339,35 @@ mod tests {
         // We can't introspect the map directly, but the table must
         // still cap at max_tracked.
         assert!(limiter.tracked_clients() <= 2);
+    }
+
+    #[test]
+    fn ipv6_addresses_in_same_64_share_a_bucket() {
+        // Two distinct /128s inside the same /64 must draw from one
+        // bucket — otherwise an attacker rotates the interface id to
+        // mint unlimited fresh buckets.
+        let limiter = RateLimiter::new(&cfg(1, 2, 64));
+        let a = IpAddr::V6("2001:db8:0:1::aaaa".parse::<Ipv6Addr>().unwrap());
+        let b = IpAddr::V6("2001:db8:0:1::bbbb".parse::<Ipv6Addr>().unwrap());
+        // burst=2: a drains both tokens, b (same /64) is then refused.
+        assert_eq!(limiter.check(a), LimitDecision::Allow);
+        assert_eq!(limiter.check(b), LimitDecision::Allow);
+        assert_eq!(limiter.check(a), LimitDecision::Refuse);
+        assert_eq!(limiter.check(b), LimitDecision::Refuse);
+        // Only one bucket exists for the whole /64.
+        assert_eq!(limiter.tracked_clients(), 1);
+    }
+
+    #[test]
+    fn ipv6_distinct_64_prefixes_have_independent_buckets() {
+        let limiter = RateLimiter::new(&cfg(1, 1, 64));
+        let a = IpAddr::V6("2001:db8:0:1::1".parse::<Ipv6Addr>().unwrap());
+        let b = IpAddr::V6("2001:db8:0:2::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(limiter.check(a), LimitDecision::Allow);
+        assert_eq!(limiter.check(a), LimitDecision::Refuse);
+        // Different /64 → fresh bucket.
+        assert_eq!(limiter.check(b), LimitDecision::Allow);
+        assert_eq!(limiter.tracked_clients(), 2);
     }
 
     #[test]

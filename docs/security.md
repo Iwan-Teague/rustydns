@@ -410,7 +410,9 @@ node could use RustyDNS as a DNS amplification vector to flood third parties. Mi
   so local proxies aren't penalised. Configurable via the `[rate_limit]` block.
   The bucket table is bounded by `max_tracked_clients` (default 10,000) with LRU
   eviction + periodic GC of idle buckets so a forge-source-IP flood cannot OOM the
-  daemon.
+  daemon. IPv6 clients are keyed on their `/64` prefix, not the full `/128`, so an
+  attacker holding a single `/64` cannot rotate the interface identifier to mint
+  unlimited fresh buckets and bypass the limit; IPv4 is keyed on the full `/32`.
 - The systemd unit sets `TasksMax=64` to limit concurrency.
 - `MemoryDenyWriteExecute` and `SystemCallFilter` limit what a compromised process
   can do even if it achieves code execution inside the daemon.
