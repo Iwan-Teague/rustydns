@@ -454,6 +454,14 @@ a parsing vulnerability in `hickory-server` or `hyper`. Mitigations:
 - HTTP parsing is handled by `hyper` and `tower`, both well-fuzzed.
 - The daemon runs as an unprivileged user with a strict systemd sandbox.
 - `panic = "abort"` ensures a parsing panic kills the process cleanly.
+- Request bodies are capped at 65 535 bytes (the maximum DNS message size) by an
+  axum `DefaultBodyLimit` layer, so an oversized POST is rejected with `413` before
+  the payload is buffered into memory — axum's 2 MiB default would otherwise let a
+  client force a 2 MiB allocation per request, which matters on Pi-class hardware.
+- The DoH listener uses the TCP peer address as the client identity and does **not**
+  trust `X-Forwarded-For`/`Forwarded` headers, so a client cannot spoof its source IP
+  to evade per-client policy. (As a consequence, behind a TLS-terminating proxy all
+  DoH clients share the proxy's loopback identity — apply rate limiting at the proxy.)
 - Operators should place a reverse proxy with request size limits and rate limiting
   in front of any externally reachable DoH endpoint.
 

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
@@ -48,6 +48,13 @@ pub async fn serve(
     let state = DohState { handler };
     let app = Router::new()
         .route(DOH_PATH, get(handle_get).post(handle_post))
+        // Reject oversized POST bodies at the framework layer, before the
+        // whole payload is buffered into memory. A DNS message can't exceed
+        // 65 535 bytes, so anything larger is abuse; axum's 2 MiB default
+        // would otherwise let a client force us to buffer 2 MiB per request
+        // (matters on Pi-class hardware). The handler re-checks the length
+        // as defence-in-depth.
+        .layer(DefaultBodyLimit::max(MAX_DOH_MESSAGE_BYTES))
         .with_state(state);
 
     let listener = TcpListener::bind(listen).await.map_err(RustyDnsError::Io)?;
@@ -441,6 +448,37 @@ mod tests {
         // handle_dns_message about not synthesising a FormErr without
         // a parsed header.
         assert_eq!(resp.status(), 400);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doh_rejects_oversized_post_body() {
+        let handler = build_handler(
+            vec![],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        // One byte past the DNS message ceiling — must be rejected by the
+        // body-limit layer before the handler ever buffers it.
+        let oversized = vec![0u8; MAX_DOH_MESSAGE_BYTES + 1];
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .post(format!("{base}/dns-query"))
+            .header("content-type", "application/dns-message")
+            .body(oversized)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            413,
+            "oversized DoH POST must be rejected with 413 Payload Too Large"
+        );
 
         shutdown.cancel();
     }
