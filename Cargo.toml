@@ -22,6 +22,7 @@ repository   = "https://github.com/Iwan-Teague/rustydns"
 # Workspace-wide dependency versions — all crates pull from here.
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
+rustls-pki-types = "1"
 # Async runtime
 tokio      = { version = "1",   features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -35,7 +36,6 @@ hickory-resolver = { version = "0.26", features = ["https-ring", "quic-ring", "d
 axum              = { version = "0.7", features = ["http2"] }
 rustls            = { version = "0.23", features = ["ring"], default-features = false }
 rustls-native-certs = "0.7"
-rustls-pemfile    = "2"
 tokio-rustls      = "0.26"
 # HTTP client for blocklist fetching — HTTPS-only, rustls, no openssl
 reqwest = { version = "0.12", default-features = false, features = [

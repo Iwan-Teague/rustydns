@@ -33,9 +33,9 @@ toml               = { workspace = true }
 async-trait        = { workspace = true }
 futures-util       = { workspace = true }
 rustls             = { workspace = true }
-rustls-pemfile     = { workspace = true }
 base64             = { workspace = true }
 ahash              = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 # Capability dropping is Linux-only. On other targets `drop_capabilities`
 # in main.rs is a no-op stub.
@@ -49,6 +49,7 @@ caps = { workspace = true }
 nix = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3.27.0"
 # DoT integration test connects via TLS against the listener using
 # tokio-rustls. Workspace pin matches the runtime rustls 0.23.
 tokio-rustls = { workspace = true }

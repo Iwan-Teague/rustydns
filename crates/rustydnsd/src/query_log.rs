@@ -85,7 +85,7 @@ pub struct QueryLogEntry {
     /// See [`ClientId::anonymized`].
     pub client_anonymised: AnonymisedClient,
 
-    /// Salted hash of the lowercased FQDN. Use [`hash_qname`] to compute.
+    /// Salted hash of the lowercased FQDN. Use [`QueryLog::hash_qname`] to compute.
     pub qname_hash: u64,
 
     /// RFC 1035 query type (`A`, `AAAA`, ...). Stored as a small string

@@ -7,7 +7,7 @@
 //! - [`config`]: full daemon configuration schema, security-hardened defaults.
 //! - [`error`]: unified [`RustyDnsError`] type.
 //! - [`record`]: DNS record model wrapping hickory-proto types.
-//! - [`client`]: [`ClientId`] for per-query identity and anonymised logging.
+//! - [`client`]: [`client::ClientId`] for per-query identity and anonymised logging.
 
 pub mod client;
 pub mod config;

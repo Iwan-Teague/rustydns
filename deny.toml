@@ -21,17 +21,7 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # end up in a release either — fail CI so we notice before shipping.
 yanked = "deny"
 # Ignored advisories carry a rationale and a removal trigger.
-ignore = [
-    # rustls-pemfile 2.x is marked unmaintained but has no
-    # successor with the same streaming API surface. We use it inside
-    # `load_tls_config` (rustydnsd::main) to parse the DoT
-    # listener's certificate and private key from PEM. The
-    # `rustls-pki-types::pem` replacement is API-stable but
-    # different shape; migration is tracked separately. The exposure
-    # surface is small: we read trusted operator-provided PEM files
-    # at startup, not network input.
-    { id = "RUSTSEC-2025-0134", reason = "unmaintained-only; load_tls_config reads operator-provided PEM at startup, no network input. Migration to rustls-pki-types::pem pending." },
-]
+ignore = []
 
 # ---------------------------------------------------------------------------
 # Bans
@@ -58,14 +48,7 @@ deny = [
     { name = "trust-dns-client" },
 ]
 
-# Don't penalise the duplicate rustls 0.21 / 0.23 that hickory 0.24
-# forces on us — that's tracked as a TODO in the resolver crate and
-# will resolve when we move to hickory 0.26+. Same for the duplicate
-# tokio-rustls.
-# The hickory 0.26 upgrade aligned the rustls family on a single
-# version across the workspace, so we no longer need the skip list
-# that worked around the old hickory-0.24/rustls-0.21 split. Left
-# empty intentionally — any duplicate that appears in future will
+# Any duplicate that appears in future will
 # trip the `multiple-versions = "warn"` lint above.
 skip = []
 

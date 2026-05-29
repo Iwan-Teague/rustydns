@@ -57,7 +57,6 @@ mod rate_limiter;
 mod test_pem;
 
 use anyhow::{Context, Result, anyhow, bail};
-use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,7 +74,6 @@ use handler::DnsHandler;
 use metrics::Metrics;
 use rate_limiter::RateLimiter;
 use rustls::ServerConfig as TlsServerConfig;
-use rustls_pemfile as pemfile;
 use rustydns_authority::Authority;
 use rustydns_blocklist::BlocklistEngine;
 use rustydns_core::config::{MetricsConfig, ServerConfig};
@@ -883,6 +881,8 @@ fn drop_capabilities() {
 /// Build a rustls [`TlsServerConfig`] from the cert+key paths in
 /// `server`. Called when `dot_listen` is configured.
 fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
     let cert_path = server.tls_cert_path.as_ref().ok_or_else(|| {
         anyhow!("server.tls_cert_path must be set when server.dot_listen is enabled")
     })?;
@@ -890,22 +890,17 @@ fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
         anyhow!("server.tls_key_path must be set when server.dot_listen is enabled")
     })?;
 
-    let cert_file = std::fs::File::open(cert_path)
-        .with_context(|| format!("failed to open TLS certificate {cert_path:?}"))?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<_> = pemfile::certs(&mut cert_reader)
-        .collect::<Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to read TLS certificate {cert_path:?}"))?;
+    let certs = CertificateDer::pem_file_iter(cert_path)
+        .with_context(|| format!("failed to read TLS certificate {cert_path:?}"))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse TLS certificate {cert_path:?}"))?;
+
     if certs.is_empty() {
         bail!("TLS certificate {cert_path:?} contains no certificates");
     }
 
-    let key_file = std::fs::File::open(key_path)
-        .with_context(|| format!("failed to open TLS private key {key_path:?}"))?;
-    let mut key_reader = BufReader::new(key_file);
-    let key = pemfile::private_key(&mut key_reader)
-        .with_context(|| format!("failed to read TLS private key {key_path:?}"))?;
-    let key = key.ok_or_else(|| anyhow!("TLS private key {key_path:?} contains no key"))?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .with_context(|| format!("failed to read or parse TLS private key {key_path:?}"))?;
 
     let config = TlsServerConfig::builder()
         .with_no_client_auth()

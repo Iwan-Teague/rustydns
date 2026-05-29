@@ -133,7 +133,7 @@ struct RouteArm {
 /// (longest-suffix wins, case-insensitive); the matching arm forwards
 /// the query. Unmatched qnames go to the default arm. See the
 /// [`UpstreamConfig::routes`] doc for the model and
-/// [`Resolver::select_arm`] for the dispatch rules.
+/// `Resolver::select_arm` for the dispatch rules.
 ///
 /// [`UpstreamConfig::routes`]: rustydns_core::config::UpstreamConfig::routes
 #[derive(Debug)]
@@ -177,6 +177,23 @@ impl Resolver {
     ///   emits a `warn!` containing "UNENCRYPTED" and "leaks" so it's
     ///   visible at every service start.
     pub async fn new(config: DnsConfig) -> ResolverResult<Self> {
+        Self::new_internal(config, &[]).await
+    }
+
+    /// Construct a new `Resolver` with supplemental root CAs.
+    /// Used only during DoH integration testing to inject a mock CA.
+    #[cfg(test)]
+    pub async fn new_with_test_root_certs(
+        config: DnsConfig,
+        test_roots: &[rustls_pki_types::CertificateDer<'static>],
+    ) -> ResolverResult<Self> {
+        Self::new_internal(config, test_roots).await
+    }
+
+    async fn new_internal(
+        config: DnsConfig,
+        test_roots: &[rustls_pki_types::CertificateDer<'static>],
+    ) -> ResolverResult<Self> {
         if config.upstream.resolvers.is_empty() {
             return Err(RustyDnsError::Config(
                 "upstream.resolvers is empty — at least one resolver URL is required".to_string(),
@@ -205,7 +222,7 @@ impl Resolver {
         // ClientConfig matching our workspace, so the configured
         // `upstream.min_tls_version` actually pins the floor (instead
         // of being a soft warning the way it was on 0.24).
-        let tls_client_config = build_tls_client_config(config.upstream.min_tls_version)?;
+        let tls_client_config = build_tls_client_config(config.upstream.min_tls_version, test_roots)?;
 
         // Default arm — the global upstream list.
         let default = build_resolver_arm(
@@ -600,12 +617,15 @@ async fn bootstrap_resolve_with_retry(host: &str, port: u16) -> ResolverResult<V
     )))
 }
 
-/// Build a rustls [`ClientConfig`] honouring the configured minimum
+/// Build a rustls `ClientConfig` honouring the configured minimum
 /// TLS version. Uses the embedded Mozilla CA bundle via `webpki-roots`
 /// (deterministic; matches `CLAUDE.md` §"DoH upstream needs an
 /// explicit root-CA feature"). Returned as `Arc` so we can pass an
 /// owned `(*arc).clone()` into the hickory builder.
-fn build_tls_client_config(min_tls: TlsVersion) -> ResolverResult<Arc<rustls::ClientConfig>> {
+fn build_tls_client_config(
+    min_tls: TlsVersion,
+    test_roots: &[rustls_pki_types::CertificateDer<'static>]
+) -> ResolverResult<Arc<rustls::ClientConfig>> {
     // Install ring as the default crypto provider (idempotent —
     // multiple installs are a no-op after the first). hickory 0.26
     // with the `https-ring`/`quic-ring`/`dnssec-ring` features
@@ -615,6 +635,9 @@ fn build_tls_client_config(min_tls: TlsVersion) -> ResolverResult<Arc<rustls::Cl
 
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for root in test_roots {
+        roots.add(root.clone()).map_err(|e| RustyDnsError::Resolver(format!("failed to add test root: {e}")))?;
+    }
 
     let versions: &[&rustls::SupportedProtocolVersion] = match min_tls {
         TlsVersion::Tls13 => &[&rustls::version::TLS13],
