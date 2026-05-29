@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use hickory_proto::op::{Header, HeaderCounts, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, PTR, SRV, TXT};
@@ -42,20 +43,53 @@ struct PolicyDecision {
 }
 
 /// DNS request handler implementing Authority -> Blocklist -> Resolver.
+///
+/// `resolver`, `rate_limiter`, and `policy_by_ip` are held behind
+/// [`ArcSwap`] so a SIGHUP-driven config reload can atomically swap new
+/// values in without dropping in-flight queries (roadmap 3.2, Phase 1).
+/// A query that has already `load()`ed an `Arc` keeps using that snapshot
+/// to completion; the next query sees the new one. Listener/TLS changes
+/// are *not* hot-swappable and still require a process restart.
 #[derive(Clone)]
 pub struct DnsHandler {
     authority: Arc<Authority>,
     blocklist: Arc<BlocklistEngine>,
-    resolver: Arc<Resolver>,
+    resolver: Arc<ArcSwap<Resolver>>,
     metrics: Arc<Metrics>,
     query_log: Arc<QueryLog>,
-    rate_limiter: Arc<RateLimiter>,
+    rate_limiter: Arc<ArcSwap<RateLimiter>>,
     sinkhole_ip: Option<IpAddr>,
-    /// IP-keyed policy table. Rebuilt at startup; constant for the
-    /// lifetime of the handler. SIGHUP-driven reload of policy is a
-    /// separate TODO (would require config reload, currently only
-    /// blocklist + mesh reload on HUP).
-    policy_by_ip: Arc<HashMap<IpAddr, NodePolicy>>,
+    /// IP-keyed policy table, hot-swappable on SIGHUP.
+    policy_by_ip: Arc<ArcSwap<HashMap<IpAddr, NodePolicy>>>,
+}
+
+/// Build the IP-keyed policy lookup table from a `[[policy]]` list.
+///
+/// `validate_config` already rejected unparseable `client_ip` values, so
+/// the parse cannot fail in practice — we log and skip if it somehow does.
+fn build_policy_map(policies: &[NodePolicy]) -> HashMap<IpAddr, NodePolicy> {
+    let mut policy_by_ip: HashMap<IpAddr, NodePolicy> = HashMap::new();
+    for policy in policies {
+        if let Some(ip_str) = &policy.client_ip {
+            match ip_str.parse::<IpAddr>() {
+                Ok(ip) => {
+                    if policy_by_ip.insert(ip, policy.clone()).is_some() {
+                        warn!(
+                            client_ip = %ip,
+                            "duplicate [[policy]] entries for the same client_ip; \
+                             the later one wins — review your rustydns.toml"
+                        );
+                    }
+                }
+                Err(_) => warn!(
+                    client_ip = %ip_str,
+                    "policy.client_ip failed late parse; this should have been caught \
+                     by validate_config — ignoring this entry"
+                ),
+            }
+        }
+    }
+    policy_by_ip
 }
 
 impl DnsHandler {
@@ -81,47 +115,42 @@ impl DnsHandler {
             None
         };
 
-        // Build the IP-keyed lookup table once. validate_config already
-        // rejected unparseable client_ip values, so the parse can't fail
-        // here in practice — log and skip if it somehow does.
-        let mut policy_by_ip: HashMap<IpAddr, NodePolicy> = HashMap::new();
-        for policy in policies {
-            if let Some(ip_str) = &policy.client_ip {
-                match ip_str.parse::<IpAddr>() {
-                    Ok(ip) => {
-                        if policy_by_ip.insert(ip, policy.clone()).is_some() {
-                            warn!(
-                                client_ip = %ip,
-                                "duplicate [[policy]] entries for the same client_ip; \
-                                 the later one wins — review your rustydns.toml"
-                            );
-                        }
-                    }
-                    Err(_) => warn!(
-                        client_ip = %ip_str,
-                        "policy.client_ip failed late parse; this should have been caught \
-                         by validate_config — ignoring this entry"
-                    ),
-                }
-            }
-        }
+        let policy_by_ip = build_policy_map(policies);
 
         Ok(Self {
             authority,
             blocklist,
-            resolver,
+            resolver: Arc::new(ArcSwap::from(resolver)),
             metrics,
             query_log,
-            rate_limiter,
+            rate_limiter: Arc::new(ArcSwap::from(rate_limiter)),
             sinkhole_ip,
-            policy_by_ip: Arc::new(policy_by_ip),
+            policy_by_ip: Arc::new(ArcSwap::from_pointee(policy_by_ip)),
         })
+    }
+
+    /// Atomically replace the upstream resolver (SIGHUP reload). In-flight
+    /// queries that already loaded the old resolver finish against it.
+    pub fn swap_resolver(&self, resolver: Arc<Resolver>) {
+        self.resolver.store(resolver);
+    }
+
+    /// Atomically replace the rate limiter (SIGHUP reload). Token-bucket
+    /// state resets — acceptable on an explicit operator reload.
+    pub fn swap_rate_limiter(&self, rate_limiter: Arc<RateLimiter>) {
+        self.rate_limiter.store(rate_limiter);
+    }
+
+    /// Atomically replace the per-client policy table (SIGHUP reload).
+    pub fn swap_policies(&self, policies: &[NodePolicy]) {
+        self.policy_by_ip
+            .store(Arc::new(build_policy_map(policies)));
     }
 
     /// Resolve the per-query policy for `src_ip`. Returns the default
     /// (no restrictions) when no `[[policy]]` entry matches.
     fn resolve_policy(&self, src_ip: IpAddr) -> PolicyDecision {
-        match self.policy_by_ip.get(&src_ip) {
+        match self.policy_by_ip.load().get(&src_ip) {
             Some(p) => PolicyDecision {
                 blocklist_bypass: p.blocklist_bypass,
                 zones_allowed: p.zones_allowed.clone(),
@@ -331,7 +360,7 @@ impl RequestHandler for DnsHandler {
         // a flood costs only an `AHashMap` lookup + bucket update. The
         // limiter exempts loopback internally so local proxies aren't
         // penalised. See `crate::rate_limiter` for the algorithm.
-        if self.rate_limiter.check(info.src.ip()) == LimitDecision::Refuse {
+        if self.rate_limiter.load().check(info.src.ip()) == LimitDecision::Refuse {
             self.metrics.inc_policy_rate_limited();
             warn!(
                 client = %client.anonymized(),
@@ -499,7 +528,10 @@ impl RequestHandler for DnsHandler {
         }
 
         self.metrics.inc_resolver_queries();
-        match self.resolver.resolve(&qname, &qtype_str).await {
+        // load_full() yields an owned Arc so we don't hold the ArcSwap
+        // guard across the .await (the guard is not Send).
+        let resolver = self.resolver.load_full();
+        match resolver.resolve(&qname, &qtype_str).await {
             Ok(out) => {
                 self.metrics
                     .inc_private_rdata_dropped(out.private_rdata_dropped);
@@ -802,6 +834,127 @@ mod tests {
             query_log,
             _server: server,
         }
+    }
+
+    /// Build a bare `DnsHandler` (no sockets/server) for unit-testing the
+    /// SIGHUP hot-swap methods. Uses a bogus upstream — resolver
+    /// construction is best-effort and never touches the network here.
+    async fn bare_handler(policies: Vec<NodePolicy>) -> DnsHandler {
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: Vec::new(),
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            ..BlocklistConfig::default()
+        }));
+        let mut dns_config = DnsConfig {
+            server: Default::default(),
+            upstream: UpstreamConfig {
+                resolvers: vec!["https://192.0.2.1/dns-query".to_string()],
+                timeout_ms: 500,
+                ..UpstreamConfig::default()
+            },
+            authority: Default::default(),
+            blocklist: Default::default(),
+            privacy: Default::default(),
+            metrics: Default::default(),
+            rate_limit: Default::default(),
+            policy: Vec::new(),
+        };
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let query_log = Arc::new(crate::query_log::QueryLog::new(8));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log,
+            rate_limiter,
+            &policies,
+        )
+        .expect("handler")
+    }
+
+    fn policy_for(ip: &str, bypass: bool) -> NodePolicy {
+        NodePolicy {
+            node_id: None,
+            client_ip: Some(ip.to_string()),
+            blocklist_bypass: bypass,
+            zones_allowed: Vec::new(),
+            log_all_queries: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn swap_policies_updates_policy_decision() {
+        let ip: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        // Start with no policies → default decision (no bypass).
+        let handler = bare_handler(Vec::new()).await;
+        assert!(
+            !handler.resolve_policy(ip).blocklist_bypass,
+            "no policy ⇒ default (no bypass)"
+        );
+
+        // Hot-swap in a bypass policy for that IP.
+        handler.swap_policies(&[policy_for("10.0.0.7", true)]);
+        assert!(
+            handler.resolve_policy(ip).blocklist_bypass,
+            "after swap, the IP must resolve to the new bypass policy"
+        );
+
+        // Swap back to empty → default again.
+        handler.swap_policies(&[]);
+        assert!(
+            !handler.resolve_policy(ip).blocklist_bypass,
+            "swapping to empty policy set restores the default"
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_rate_limiter_takes_effect() {
+        let handler = bare_handler(Vec::new()).await;
+        let off_net: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        // Default limiter in bare_handler is disabled → always Allow.
+        assert_eq!(
+            handler.rate_limiter.load().check(off_net),
+            crate::rate_limiter::LimitDecision::Allow
+        );
+        // Swap in a strict limiter (1 token, no refill in this window).
+        handler.swap_rate_limiter(Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: true,
+                qps: 1,
+                burst: 1,
+                max_tracked_clients: 16,
+            },
+        )));
+        assert_eq!(
+            handler.rate_limiter.load().check(off_net),
+            crate::rate_limiter::LimitDecision::Allow,
+            "first query consumes the single token"
+        );
+        assert_eq!(
+            handler.rate_limiter.load().check(off_net),
+            crate::rate_limiter::LimitDecision::Refuse,
+            "second immediate query is refused by the swapped-in limiter"
+        );
     }
 
     /// Send a question over TCP using the standard 2-byte length prefix

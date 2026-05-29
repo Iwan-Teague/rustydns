@@ -20,12 +20,17 @@
 //!
 //! # Signal handling
 //!
-//! - `SIGHUP`  — re-read blocklist sources AND the signed mesh-zone
-//!   bundle. Does NOT re-read `rustydns.toml` itself: listener
-//!   addresses, upstream resolvers, TLS material, and per-client
-//!   policies are fixed for the lifetime of the process. Restart the
-//!   daemon (systemd `restart`, `docker compose restart`, etc.) to
-//!   change anything else.
+//! - `SIGHUP`  — re-read blocklist content from the current sources, the
+//!   signed mesh-zone bundle, AND `rustydns.toml`. Config reload hot-swaps
+//!   the parts that don't need socket rebinding (roadmap 3.2, Phase 1):
+//!   the upstream resolver (`[upstream]`), per-client policy (`[[policy]]`),
+//!   and the rate limiter (`[rate_limit]`), atomically via `ArcSwap` so
+//!   in-flight queries are never dropped. Changes to listener addresses,
+//!   DoT/DoH/TLS material, the metrics binding, blocklist *sources*, or the
+//!   on-disk query log still require a process restart — such changes are
+//!   detected on reload and logged at `warn!`, but NOT applied. A config
+//!   that fails to parse/validate aborts the swap and leaves the running
+//!   configuration untouched.
 //! - `SIGTERM` / `SIGINT` — graceful shutdown (drain in-flight queries, close listeners).
 //!
 //! # Privilege model
@@ -266,6 +271,9 @@ async fn main() -> Result<()> {
         &config.policy,
     )?;
     let doh_handler = Arc::new(handler.clone());
+    // Clone shares the handler's inner ArcSwaps, so SIGHUP swaps made
+    // through this handle are seen by the server and the DoH handler.
+    let reload_handle = handler.clone();
     let mut server = Server::new(handler);
 
     for addr in &config.server.listen {
@@ -334,6 +342,9 @@ async fn main() -> Result<()> {
         blocklist_engine,
         authority.clone(),
         metrics.clone(),
+        reload_handle,
+        config.clone(),
+        config_path.clone(),
         shutdown.clone(),
     );
     spawn_mesh_reload_loop(
@@ -603,11 +614,15 @@ fn spawn_blocklist_reload_loop(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_sighup_reload(
     loader: Arc<BlocklistLoader>,
     engine: Arc<BlocklistEngine>,
     authority: Arc<Authority>,
     metrics: Arc<Metrics>,
+    handler: DnsHandler,
+    startup_config: Arc<rustydns_core::config::DnsConfig>,
+    config_path: PathBuf,
     shutdown: CancellationToken,
 ) {
     #[cfg(unix)]
@@ -625,13 +640,9 @@ fn spawn_sighup_reload(
         loop {
             tokio::select! {
                 _ = hup.recv() => {
-                    // Reload scope is intentionally narrow: blocklists
-                    // and the mesh-zone bundle. Full-config reload
-                    // (listeners, TLS material, per-client policy,
-                    // upstreams) requires restarting the process —
-                    // socket rebinding and Resolver/Server reconstruction
-                    // are not currently driveable from a signal handler.
-                    info!("SIGHUP received — reloading blocklists and mesh-zone bundle");
+                    info!("SIGHUP received — reloading blocklists, mesh-zone bundle, and config");
+                    // 1) Blocklist content re-fetch from the *current*
+                    //    configured sources, then the mesh-zone bundle.
                     match loader.reload(&engine).await {
                         Ok(summary) => {
                             if summary.loaded_sources == 0 {
@@ -646,8 +657,6 @@ fn spawn_sighup_reload(
                             warn!(error = %e, "blocklist reload failed");
                         }
                     }
-                    // Also reload the mesh-zone bundle on SIGHUP so
-                    // operators get a single reload trigger for both.
                     match authority.reload_mesh() {
                         Ok(Some(n)) => {
                             metrics.mark_mesh_zone_reload_success(n);
@@ -659,6 +668,10 @@ fn spawn_sighup_reload(
                             warn!(error = %e, "mesh zone reload failed");
                         }
                     }
+                    // 2) Re-read the config file and hot-swap the parts
+                    //    that can change without rebinding sockets:
+                    //    upstream resolver, per-client policy, rate limit.
+                    reload_config(&handler, &startup_config, &config_path).await;
                 }
                 _ = shutdown.cancelled() => break,
             }
@@ -667,8 +680,131 @@ fn spawn_sighup_reload(
 
     #[cfg(not(unix))]
     {
-        let _ = (loader, engine, authority, metrics, shutdown);
+        let _ = (
+            loader,
+            engine,
+            authority,
+            metrics,
+            handler,
+            startup_config,
+            config_path,
+            shutdown,
+        );
     }
+}
+
+/// Re-read the config from disk and atomically swap the hot-reloadable
+/// components into the running handler (roadmap 3.2, Phase 1).
+///
+/// Hot-swappable: `[upstream]` (resolver), `[[policy]]`, `[rate_limit]`.
+/// Everything else — listener addresses, DoT/DoH/TLS material, the metrics
+/// address, blocklist *sources*, and the on-disk query log — is bound or
+/// spawned at startup and requires a process restart. Such changes are
+/// detected against the startup config and logged; they are NOT applied.
+///
+/// Failure isolation: a parse/validation error aborts the swap and leaves
+/// the daemon running on its current config. A resolver rebuild failure
+/// keeps the old resolver. We never tear down a working pipeline because a
+/// reload went wrong.
+async fn reload_config(
+    handler: &DnsHandler,
+    startup_config: &rustydns_core::config::DnsConfig,
+    config_path: &std::path::Path,
+) {
+    let new_config = match rustydns_core::config::load_config(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "SIGHUP config reload: new config failed to parse/validate — \
+                 keeping the currently running configuration"
+            );
+            return;
+        }
+    };
+
+    // Warn (but continue) about changes that need a restart to take effect.
+    let restart_required = restart_required_changes(startup_config, &new_config);
+    if !restart_required.is_empty() {
+        warn!(
+            fields = %restart_required.join(", "),
+            "SIGHUP config reload: these settings changed but require a process \
+             restart to take effect — they were NOT applied (sockets/TLS/metrics \
+             binding, blocklist sources, and the on-disk query log are fixed at startup)"
+        );
+    }
+
+    // Rebuild + swap the upstream resolver.
+    match Resolver::new(new_config.clone()).await {
+        Ok(resolver) => {
+            handler.swap_resolver(Arc::new(resolver));
+            info!(
+                protocol = ?new_config.upstream.protocol,
+                "SIGHUP config reload: upstream resolver rebuilt and swapped"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "SIGHUP config reload: resolver rebuild failed — keeping the old resolver");
+        }
+    }
+
+    // Swap the rate limiter and per-client policy (infallible builds).
+    handler.swap_rate_limiter(Arc::new(RateLimiter::new(&new_config.rate_limit)));
+    handler.swap_policies(&new_config.policy);
+    info!(
+        policies = new_config.policy.len(),
+        rate_limit_enabled = new_config.rate_limit.enabled,
+        "SIGHUP config reload: policy table and rate limiter swapped"
+    );
+}
+
+/// Names of restart-required settings that differ between the startup
+/// config and a freshly read one. These are bound or spawned once at
+/// startup; SIGHUP cannot apply them.
+fn restart_required_changes(
+    old: &rustydns_core::config::DnsConfig,
+    new: &rustydns_core::config::DnsConfig,
+) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if old.server.listen != new.server.listen {
+        changed.push("server.listen");
+    }
+    if old.server.dot_listen != new.server.dot_listen {
+        changed.push("server.dot_listen");
+    }
+    if old.server.doh_listen != new.server.doh_listen {
+        changed.push("server.doh_listen");
+    }
+    if old.server.tls_cert_path != new.server.tls_cert_path {
+        changed.push("server.tls_cert_path");
+    }
+    if old.server.tls_key_path != new.server.tls_key_path {
+        changed.push("server.tls_key_path");
+    }
+    if old.metrics.listen != new.metrics.listen {
+        changed.push("metrics.listen");
+    }
+    if old.metrics.path != new.metrics.path {
+        changed.push("metrics.path");
+    }
+    if old.blocklist.sources != new.blocklist.sources {
+        changed.push("blocklist.sources");
+    }
+    if old.blocklist.local_files != new.blocklist.local_files {
+        changed.push("blocklist.local_files");
+    }
+    if old.blocklist.block_response != new.blocklist.block_response {
+        changed.push("blocklist.block_response");
+    }
+    if old.blocklist.sinkhole_ip != new.blocklist.sinkhole_ip {
+        changed.push("blocklist.sinkhole_ip");
+    }
+    if old.privacy.query_log_to_disk != new.privacy.query_log_to_disk
+        || old.privacy.query_log_disk_path != new.privacy.query_log_disk_path
+    {
+        changed.push("privacy.query_log_to_disk/path");
+    }
+    changed
 }
 
 /// Periodically re-read the Rustynet mesh-zone bundle and atomically
@@ -1143,6 +1279,80 @@ mod tests {
         assert!(
             msg.contains("cannot stat"),
             "error must surface the stat failure: {msg}"
+        );
+    }
+
+    // ---- restart_required_changes (SIGHUP reload, roadmap 3.2) -------------
+
+    fn base_config() -> rustydns_core::config::DnsConfig {
+        rustydns_core::config::DnsConfig {
+            server: Default::default(),
+            upstream: Default::default(),
+            authority: Default::default(),
+            blocklist: Default::default(),
+            privacy: Default::default(),
+            metrics: Default::default(),
+            rate_limit: Default::default(),
+            policy: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restart_required_empty_when_identical() {
+        let a = base_config();
+        let b = base_config();
+        assert!(restart_required_changes(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn restart_required_flags_listener_change() {
+        let a = base_config();
+        let mut b = base_config();
+        b.server.listen = vec!["0.0.0.0:5353".to_string()];
+        assert_eq!(restart_required_changes(&a, &b), vec!["server.listen"]);
+    }
+
+    #[test]
+    fn restart_required_flags_metrics_and_blocklist_sources() {
+        let a = base_config();
+        let mut b = base_config();
+        b.metrics.listen = "127.0.0.1:9999".to_string();
+        b.blocklist.sources = vec!["https://example.com/list".to_string()];
+        let changed = restart_required_changes(&a, &b);
+        assert!(changed.contains(&"metrics.listen"));
+        assert!(changed.contains(&"blocklist.sources"));
+    }
+
+    #[test]
+    fn restart_required_ignores_hot_swappable_fields() {
+        // Upstream, policy, and rate_limit are hot-swappable — changing
+        // them must NOT appear in the restart-required list.
+        let a = base_config();
+        let mut b = base_config();
+        b.upstream.resolvers = vec!["https://dns.example/dns-query".to_string()];
+        b.rate_limit.qps = 1;
+        b.policy.push(rustydns_core::config::NodePolicy {
+            node_id: None,
+            client_ip: Some("10.0.0.1".to_string()),
+            blocklist_bypass: true,
+            zones_allowed: Vec::new(),
+            log_all_queries: false,
+        });
+        assert!(
+            restart_required_changes(&a, &b).is_empty(),
+            "hot-swappable changes must not be flagged restart-required"
+        );
+    }
+
+    #[test]
+    fn restart_required_flags_disk_log_toggle() {
+        let a = base_config();
+        let mut b = base_config();
+        b.privacy.query_log_to_disk = true;
+        b.privacy.query_log_disk_path = Some("/var/log/rustydns/q.ndjson".to_string());
+        assert_eq!(
+            restart_required_changes(&a, &b),
+            vec!["privacy.query_log_to_disk/path"]
         );
     }
 }

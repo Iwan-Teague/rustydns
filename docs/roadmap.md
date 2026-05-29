@@ -66,21 +66,23 @@ marker to the code or doc it relates to**, so no item lives only in one place.
 
 ## 3. Unstarted features (design + privacy review needed)
 
-### 3.2 SIGHUP full-config reload
+### 3.2 SIGHUP reload — Phase 2 (socket/TLS rebinding)
 
-- **What:** re-read `rustydns.toml` end-to-end on SIGHUP — including listener
-  addresses, TLS material, upstream resolvers, and per-client policy.
-- **Why not yet:** today SIGHUP reloads blocklists and the mesh-zone bundle,
-  which covers the high-churn surfaces. Full reload requires socket rebinding,
-  resolver reconstruction (with bootstrap retry), and atomic
-  `Server`/`DnsHandler` swap-out without dropping in-flight queries. Doable
-  but substantial — needs its own design pass.
-- **Scaffolding:** `spawn_sighup_reload` in `crates/rustydnsd/src/main.rs` is
-  the entry point; today it only delegates to `BlocklistLoader::reload` and
-  `Authority::reload_mesh`. Operator workaround: restart the process
-  (`systemctl restart rustydns`, `docker compose restart`).
-- **Doc mentions:** `crates/rustydnsd/src/main.rs` crate-level signal-handling
-  doc; `spawn_sighup_reload` inline comment.
+- **Done (Phase 1):** SIGHUP now re-reads `rustydns.toml` and hot-swaps the
+  upstream resolver (`[upstream]`), per-client policy (`[[policy]]`), and rate
+  limiter (`[rate_limit]`) atomically via `ArcSwap`, alongside the existing
+  blocklist-content and mesh-bundle reload. A bad config aborts the swap and
+  keeps the running config. See `reload_config` / `restart_required_changes`
+  in `crates/rustydnsd/src/main.rs` and `docs/design-sighup-reload.md`.
+- **What's left (Phase 2):** apply changes to listener addresses, DoT/DoH/TLS
+  material, and the metrics binding without a restart. These are detected on
+  reload and logged, but applying them requires tearing down and rebinding
+  `hickory-server` listeners (and the axum metrics server) without dropping
+  in-flight connections — a custom socket-acceptor handover. Substantial;
+  needs its own design pass. Operator workaround for these specific fields:
+  restart the process (`systemctl restart rustydns`, `docker compose restart`).
+- **Also restart-only:** blocklist *source list* changes (the loader is built
+  once at startup) and the on-disk query-log path/toggle.
 
 ---
 
