@@ -265,6 +265,36 @@ guessed domain after a restart. The salt-in-memory residual risk above
 still applies *while the daemon is running*; treat the on-disk log as
 sensitive, keep its directory `0700`, and avoid world-readable backups.
 
+## Configuration reload: live vs. restart-required
+
+`SIGHUP` re-reads `rustydns.toml` and applies what it safely can without
+dropping in-flight queries. Some settings are fixed at startup and need a full
+restart. The daemon logs a `warn!` listing any restart-required field that
+changed (see `restart_required_changes`), so a reload never *silently* ignores
+a change.
+
+| Config | On `SIGHUP` |
+|--------|-------------|
+| `[upstream]` (resolvers, protocol, `[[upstream.routes]]`, `min_tls_version`, `dnssec_validation`, `timeout_ms`, `max_cache_entries`, `block_private_rdata`) | **Live** — resolver rebuilt and swapped (`ArcSwap`) |
+| `[[policy]]` | **Live** — policy table swapped |
+| `[rate_limit]` | **Live** — limiter swapped (token-bucket state resets) |
+| `[[rewrite]]`, `[safesearch]` | **Live** — rewrite map swapped |
+| Blocklist **content** (re-fetched from the *current* sources + local files) | **Live** — atomic content swap |
+| Mesh-zone bundle | **Live** — re-read (also polled every `poll_interval_secs`) |
+| Listeners on **unprivileged** ports (DNS UDP/TCP, DoT incl. TLS cert rotation, DoH, metrics) | **Live** — zero-drop rebind via `SO_REUSEPORT` |
+| Listeners on **privileged** ports (`:53`, `:853`) | **Restart** — `CAP_NET_BIND_SERVICE` is dropped after the initial bind |
+| `blocklist.sources` / `blocklist.local_files` (the source *list*) | **Restart** |
+| `blocklist.allowlist` | **Restart** — rebuilt from the startup config on each content reload |
+| `blocklist.block_response` / `blocklist.sinkhole_ip` | **Restart** |
+| `blocklist.block_cname_cloaking` / `blocklist.response_ip_denylist` / `blocklist.regex_rules` | **Restart** — compiled into the engine at startup |
+| `privacy.query_log_to_disk` / `query_log_disk_path` and the in-memory ring size | **Restart** — the writer task and ring are bound at startup |
+
+> Why some listener changes are restart-only: the daemon drops **all** Linux
+> capabilities right after the initial bind, so it physically cannot rebind a
+> port `< 1024`. `SO_REUSEPORT` does not bypass the kernel privilege check. This
+> is the capability-discipline invariant working as intended — see
+> [`security.md`](security.md) §"Linux Capabilities".
+
 ## Authentication
 
 None of the endpoints require authentication. The privacy posture

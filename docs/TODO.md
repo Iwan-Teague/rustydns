@@ -93,19 +93,10 @@ design pass for the live-handover model. Privileged-port caveat (§4 of
 
 ## 6. Ops / CI / docs
 
-- **6.1 🟡 CI doesn't gate full clippy** — `ci.yml` enforces
-  `correctness`/`suspicious`/`perf` but not `clippy::all` as `-D`. The tree is
-  currently clean under `-D warnings`; consider tightening CI to prevent style
-  drift (or keep style as warnings deliberately — document the choice).
-- **6.2 🟡 No MSRV job** — CLAUDE.md pins MSRV 1.88 (hickory floor). Add a CI job
-  building with `1.88` to catch accidental newer-stdlib usage before it breaks
-  the documented floor.
-- **6.3 ⚪ Docker capability wording** — `docs/deployment-docker.md` says the cap
-  is needed "at runtime"; it's needed only at **startup bind** (dropped
-  immediately after). Minor precision fix; ties into the §4 capability story.
-- **6.4 ⚪ Reload-vs-restart operator matrix** — now that SIGHUP reload covers a
-  lot (Phase 1 + 2), a small table in `docs/operator-endpoints.md` mapping each
-  config section → "live reload" vs "restart required" would help operators.
+(All §6 items done: 6.1 CI gates `-D clippy::all`; 6.2 the pinned-1.88 `test`
+job is the MSRV gate plus a new `stable` job for forward coverage; 6.3 Docker
+capability wording corrected to "startup bind only"; 6.4 reload-vs-restart
+matrix added to `docs/operator-endpoints.md`.)
 
 ---
 

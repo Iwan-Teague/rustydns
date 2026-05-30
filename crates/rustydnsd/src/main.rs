@@ -1135,6 +1135,23 @@ fn restart_required_changes(
     if old.blocklist.sinkhole_ip != new.blocklist.sinkhole_ip {
         changed.push("blocklist.sinkhole_ip");
     }
+    // These are compiled into the engine at startup (the SIGHUP path re-fetches
+    // blocklist *content* but does not rebuild the engine from the new config),
+    // so a change to them needs a restart. Flag them rather than silently
+    // ignoring. `allowlist` is rebuilt from the engine's startup config on every
+    // content reload, so a config-file allowlist change is also restart-only.
+    if old.blocklist.allowlist != new.blocklist.allowlist {
+        changed.push("blocklist.allowlist");
+    }
+    if old.blocklist.block_cname_cloaking != new.blocklist.block_cname_cloaking {
+        changed.push("blocklist.block_cname_cloaking");
+    }
+    if old.blocklist.response_ip_denylist != new.blocklist.response_ip_denylist {
+        changed.push("blocklist.response_ip_denylist");
+    }
+    if old.blocklist.regex_rules != new.blocklist.regex_rules {
+        changed.push("blocklist.regex_rules");
+    }
     if old.privacy.query_log_to_disk != new.privacy.query_log_to_disk
         || old.privacy.query_log_disk_path != new.privacy.query_log_disk_path
     {
@@ -1675,5 +1692,38 @@ mod tests {
             restart_required_changes(&a, &b),
             vec!["privacy.query_log_to_disk/path"]
         );
+    }
+
+    #[test]
+    fn restart_required_ignores_rewrite_and_safesearch() {
+        // Rewrites and safe search hot-swap on SIGHUP — not restart-required.
+        let a = base_config();
+        let mut b = base_config();
+        b.rewrite.push(rustydns_core::config::RewriteRule {
+            name: "x.example.com".to_string(),
+            address: Some("10.0.0.1".to_string()),
+            target: None,
+            block: false,
+        });
+        b.safesearch.enabled = true;
+        assert!(
+            restart_required_changes(&a, &b).is_empty(),
+            "rewrite/safesearch changes hot-swap and must not be flagged restart-required"
+        );
+    }
+
+    #[test]
+    fn restart_required_flags_startup_fixed_blocklist_fields() {
+        // block_cname_cloaking / response_ip_denylist / regex_rules are
+        // compiled into the engine at startup → restart-required.
+        let a = base_config();
+        let mut b = base_config();
+        b.blocklist.block_cname_cloaking = !a.blocklist.block_cname_cloaking;
+        b.blocklist.response_ip_denylist = vec!["1.2.3.0/24".to_string()];
+        b.blocklist.regex_rules = vec!["tracker".to_string()];
+        let changed = restart_required_changes(&a, &b);
+        assert!(changed.contains(&"blocklist.block_cname_cloaking"));
+        assert!(changed.contains(&"blocklist.response_ip_denylist"));
+        assert!(changed.contains(&"blocklist.regex_rules"));
     }
 }

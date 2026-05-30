@@ -43,8 +43,16 @@ build time so the non-root `rustydns` user can still bind `:53` and
 ## Capability model
 
 The image runs as the non-root `rustydns` system user (uid/gid
-assigned by Debian). The only capability it needs at runtime is
-`CAP_NET_BIND_SERVICE`, granted two ways:
+assigned by Debian). The only capability it needs is
+`CAP_NET_BIND_SERVICE`, and only at **startup**, to bind the
+privileged listen ports (`:53`, `:853`). The daemon drops **all**
+capabilities in-process immediately after the initial bind (the
+`caps` crate clears every set, including the bounding set), so for
+the entire steady-state lifetime of the process it holds **no**
+capabilities — a later bug or compromise cannot re-bind a privileged
+port. (This is also why live SIGHUP listener handover is offered only
+for unprivileged ports — see [`docs/security.md`](security.md)
+§"Linux Capabilities".) The startup capability is granted two ways:
 
 1. **File capability** baked into the binary via `setcap` during the
    image build. Survives `--cap-drop=ALL`.

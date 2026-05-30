@@ -20,7 +20,13 @@ env:
 
 jobs:
   test:
-    name: Test (Linux)
+    # This job IS the MSRV gate: it pins the toolchain to the documented
+    # floor (1.88) and runs the FULL suite — fmt, clippy, tests, release
+    # build, and cargo-deny — on it. Compiling AND testing on 1.88 catches
+    # accidental newer-stdlib or newer-behaviour usage that would break the
+    # declared minimum. The `stable` job below adds forward coverage on the
+    # latest toolchain.
+    name: Test + MSRV (Rust 1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,15 +55,14 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        # Run clippy without `-Dwarnings` — style lints surface in the
-        # log but don't block the build. Only `clippy::correctness` and
-        # higher-severity buckets are pinned to error.
-        run: |
-          cargo clippy --workspace --all-targets --tests -- \
-            -W clippy::all \
-            -D clippy::correctness \
-            -D clippy::suspicious \
-            -D clippy::perf
+        # Gate the FULL `clippy::all` bucket as errors (TODO 6.1). The tree is
+        # kept clean under `-D clippy::all`, so this prevents style/complexity
+        # drift, not just correctness regressions. Because this job is pinned to
+        # 1.88, the clippy version is also pinned — a toolchain bump can't
+        # surprise CI with a brand-new lint. If a deliberate exception is
+        # needed, prefer a scoped `#[allow(...)]` with a comment over relaxing
+        # this gate.
+        run: cargo clippy --workspace --all-targets --tests -- -D clippy::all
 
       - name: Test
         run: cargo test --workspace --all-targets
@@ -84,6 +89,37 @@ jobs:
           cp rustydns.example.toml /tmp/rustydns-ci.toml
           chmod 600 /tmp/rustydns-ci.toml
           ./target/release/rustydnsd --config /tmp/rustydns-ci.toml --validate-config
+
+  stable:
+    # Forward coverage (TODO 6.2): the `test` job guards the 1.88 floor; this
+    # job builds and tests the workspace on the latest stable toolchain so a
+    # behaviour change or new failure on newer compilers is caught before it
+    # reaches users on a current toolchain. Kept lean (no deny/docker — those
+    # run in `test`).
+    name: Test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry, index, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-stable-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-stable-cargo-
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace --all-targets
 
   docker:
     name: Docker image smoke build
