@@ -1675,6 +1675,7 @@ mod tests {
             blocklist_bypass: true,
             zones_allowed: Vec::new(),
             log_all_queries: false,
+            block_windows: Vec::new(),
         });
         assert!(
             restart_required_changes(&a, &b).is_empty(),

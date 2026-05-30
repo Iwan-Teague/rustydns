@@ -134,7 +134,8 @@ The binary. Responsibilities:
 3.  ClientId resolved from source IP
       → if mesh peer: populate node_id from Rustynet peer table
       → if unknown: ClientId::from_ip only
-4.  Check per-node policy (blocklist_bypass, zones_allowed)
+4.  Check per-node policy (blocklist_bypass, zones_allowed, block_windows —
+      an active scheduled block window REFUSEs every query before the pipeline)
 5.  Authority checked: is qname in mesh_zone or a static zone?
     a. Yes → return record, increment authority_hits counter
     b. No  → continue

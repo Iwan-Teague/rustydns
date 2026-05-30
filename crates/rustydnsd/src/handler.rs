@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -17,6 +18,7 @@ use tracing::{debug, warn};
 
 use rustydns_authority::Authority;
 use rustydns_blocklist::BlocklistEngine;
+use rustydns_core::BlockSchedule;
 use rustydns_core::RustyDnsError;
 use rustydns_core::client::ClientId;
 use rustydns_core::config::{BlockResponse, NodePolicy, RewriteRule};
@@ -44,6 +46,14 @@ fn empty_zones() -> Arc<[String]> {
     EMPTY.get_or_init(|| Vec::<String>::new().into()).clone()
 }
 
+/// Current Unix time in seconds. Used to evaluate per-client block schedules.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Resolved per-client policy decision for one query.
 ///
 /// Built once per query from the source IP. The default value is "no
@@ -58,6 +68,9 @@ struct PolicyDecision {
     blocklist_bypass: bool,
     zones_allowed: Arc<[String]>,
     log_all_queries: bool,
+    /// `true` if a `[[policy.block_windows]]` window is active for this client
+    /// right now — every query is refused before the pipeline runs.
+    schedule_blocked: bool,
 }
 
 impl Default for PolicyDecision {
@@ -66,18 +79,21 @@ impl Default for PolicyDecision {
             blocklist_bypass: false,
             zones_allowed: empty_zones(),
             log_all_queries: false,
+            schedule_blocked: false,
         }
     }
 }
 
 /// A `[[policy]]` entry compiled for fast per-query lookup: the zone list is
-/// pre-interned into an `Arc<[String]>` once at map-build time so
-/// [`DnsHandler::resolve_policy`] only clones an `Arc`.
+/// pre-interned into an `Arc<[String]>` and the block schedule is pre-compiled
+/// once at map-build time so [`DnsHandler::resolve_policy`] only does cheap
+/// per-query work (an `Arc` clone and a timestamp check).
 #[derive(Debug, Clone)]
 struct CompiledPolicy {
     blocklist_bypass: bool,
     zones_allowed: Arc<[String]>,
     log_all_queries: bool,
+    schedule: BlockSchedule,
 }
 
 /// DNS request handler implementing Authority -> Blocklist -> Resolver.
@@ -117,6 +133,10 @@ fn build_policy_map(policies: &[NodePolicy]) -> HashMap<IpAddr, CompiledPolicy> 
                         blocklist_bypass: policy.blocklist_bypass,
                         zones_allowed: Arc::from(policy.zones_allowed.as_slice()),
                         log_all_queries: policy.log_all_queries,
+                        // validate_config already checked these compile; fall
+                        // back to an empty (never-blocking) schedule on the
+                        // can't-happen error rather than panicking.
+                        schedule: BlockSchedule::compile(&policy.block_windows).unwrap_or_default(),
                     };
                     if policy_by_ip.insert(ip, compiled).is_some() {
                         warn!(
@@ -219,6 +239,9 @@ impl DnsHandler {
                 // Arc clone — O(1), no per-element String copy.
                 zones_allowed: Arc::clone(&p.zones_allowed),
                 log_all_queries: p.log_all_queries,
+                // Evaluate the (pre-compiled) block schedule against now. Cheap
+                // when no windows are configured (empty schedule → false).
+                schedule_blocked: !p.schedule.is_empty() && p.schedule.is_blocked_at(now_unix()),
             },
             None => PolicyDecision::default(),
         }
@@ -557,6 +580,35 @@ impl RequestHandler for DnsHandler {
         debug!(client = %client.anonymized(), qname = %qname, qtype = %qtype, "query received");
 
         let builder = MessageResponseBuilder::from_message_request(request);
+
+        // Scheduled block window (TODO 8.5): if this client is inside an active
+        // `[[policy.block_windows]]` window right now, refuse every query
+        // BEFORE consulting the pipeline (e.g. "kids' devices off after 22:00").
+        if policy.schedule_blocked {
+            self.metrics.inc_policy_schedule_blocked();
+            warn!(
+                client = %client.anonymized(),
+                "policy denied: client is within a scheduled block window"
+            );
+            self.log_query(
+                &policy,
+                &client,
+                &qname_canon,
+                qtype_label,
+                ResponseCode::Refused,
+                ServedBy::Rejected,
+            );
+            return self
+                .respond(
+                    request,
+                    response_handle,
+                    builder,
+                    ResponseCode::Refused,
+                    false,
+                    Vec::new(),
+                )
+                .await;
+        }
 
         // Zone allowlist: if the policy restricts this client to a set
         // of zones, refuse anything outside that set BEFORE consulting
@@ -1454,6 +1506,7 @@ mod tests {
             blocklist_bypass: true,
             zones_allowed: Vec::new(),
             log_all_queries: false,
+            block_windows: Vec::new(),
         };
         let port = spawn_cname_mock("c.tracker-adnetwork.net.").await;
         let harness = build_cname_harness(
@@ -1672,6 +1725,7 @@ mod tests {
             blocklist_bypass: bypass,
             zones_allowed: Vec::new(),
             log_all_queries: false,
+            block_windows: Vec::new(),
         }
     }
 
@@ -2248,6 +2302,7 @@ mod tests {
             blocklist_bypass: true,
             zones_allowed: Vec::new(),
             log_all_queries: false,
+            block_windows: Vec::new(),
         };
         let harness = build_harness_with_policies(
             vec![],
@@ -2274,6 +2329,7 @@ mod tests {
             blocklist_bypass: false,
             zones_allowed: vec!["mesh.".to_string()],
             log_all_queries: false,
+            block_windows: Vec::new(),
         };
         let harness = build_harness_with_policies(
             vec![static_a("router.mesh", "100.64.0.1")],
@@ -2308,6 +2364,7 @@ mod tests {
             blocklist_bypass: false,
             zones_allowed: Vec::new(),
             log_all_queries: true,
+            block_windows: Vec::new(),
         };
         let harness = build_harness_with_policies(
             vec![static_a("router.mesh", "100.64.0.1")],
@@ -2329,6 +2386,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn policy_block_window_refuses_during_active_window() {
+        // An all-day, every-day block window is active at any wall-clock time,
+        // so the client (loopback 127.0.0.1) must be REFUSED — even for a name
+        // the authority would otherwise answer (the schedule gate runs first).
+        let policy = NodePolicy {
+            node_id: None,
+            client_ip: Some("127.0.0.1".to_string()),
+            blocklist_bypass: false,
+            zones_allowed: Vec::new(),
+            log_all_queries: false,
+            block_windows: vec![rustydns_core::config::BlockWindow {
+                days: Vec::new(), // every day
+                start: None,      // all-day
+                end: None,
+                utc_offset_minutes: 0,
+            }],
+        };
+        let harness = build_harness_with_policies(
+            vec![static_a("router.mesh", "100.64.0.1")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+            vec![policy],
+        )
+        .await;
+        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::Refused,
+            "an active all-day block window must REFUSE every query, even authority hits"
+        );
+        assert!(resp.answers.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn policy_does_not_match_other_clients() {
         // Policy keyed to 10.0.0.5 — must NOT affect 127.0.0.1.
         let policy = NodePolicy {
@@ -2337,6 +2429,7 @@ mod tests {
             blocklist_bypass: true,
             zones_allowed: Vec::new(),
             log_all_queries: false,
+            block_windows: Vec::new(),
         };
         let harness = build_harness_with_policies(
             vec![],

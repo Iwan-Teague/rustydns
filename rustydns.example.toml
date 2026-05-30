@@ -426,6 +426,22 @@ path   = "/metrics"
 # node_id          = "ed25519:AbCdEf..."
 # blocklist_bypass = false
 
+# Example: scheduled block windows. While a window is active, EVERY query from
+# this client is refused (REFUSED) before the pipeline runs — "kids' devices
+# off after 22:00", "guest network blocked overnight". Set both `start` and
+# `end` (HH:MM, 24h) for a timed window, or neither for an all-day window.
+# `end <= start` wraps past midnight. `days` lists weekdays (mon..sun); empty =
+# every day. `utc_offset_minutes` interprets the times locally (DST not applied
+# — set the offset for the period that matters).
+# [[policy]]
+# client_ip = "10.0.0.50"
+#   [[policy.block_windows]]
+#   start = "22:00"
+#   end   = "07:00"
+#   utc_offset_minutes = -300       # UTC-5
+#   [[policy.block_windows]]
+#   days = ["sat", "sun"]           # all day on weekends
+
 # ---------------------------------------------------------------------------
 # DNS rewrites / local cloaking map
 # ---------------------------------------------------------------------------

@@ -215,17 +215,12 @@ NXDOMAIN/sinkhole/REFUSED responses, HTTPS-only sources, auto-reload),
 conditional forwarding, bounded LRU caching, DNSSEC, DoH/DoQ upstream + DoT/DoH
 inbound, randomised upstream selection, ECS stripping, per-client (IP) policy,
 rate limiting, rebinding defence, CNAME-cloaking defence (§8.1, done), DNS
-rewrites / local cloaking (§8.2, done), response-IP denylists (§8.3, done), and
-Safe Search (§8.4, done). The items below are what those projects have that we
-**don't**.
+rewrites / local cloaking (§8.2, done), response-IP denylists (§8.3, done),
+Safe Search (§8.4, done), scheduled block windows (§8.5, done), and regex rules
+(§8.7, done). The items below are what those projects have that we **don't**.
 
 ### Worth adding (fits the constraints)
 
-- **8.5 🟡 Scheduled / time-window rules — M.** Per-client or per-domain block
-  schedules ("block social media 09:00–17:00", "kids' devices off after 22:00").
-  AdGuard has access schedules. Novel for a config-file resolver; extend
-  `[[policy]]` with optional `block_windows`. Keep it timezone-explicit. Files:
-  `config.rs` (`NodePolicy`), `handler.rs` (`resolve_policy`).
 - **8.6 🟡 Per-client blocklist groups — M.** Today `[[policy]]` toggles
   bypass/zones per IP. blocky/AdGuard let you assign clients to named groups,
   each with its own set of blocklists ("iot can only reach vendor domains",
@@ -262,8 +257,8 @@ Safe Search (§8.4, done). The items below are what those projects have that we
   on-disk log).
 
 > Done: 8.1 (CNAME blocking), 8.2 (DNS rewrite map), 8.3 (response-IP
-> blocklists), 8.4 (safe search), 8.7 (regex rules). Remaining: 8.5 (scheduled
-> rules), 8.6 (per-client groups).
+> blocklists), 8.4 (safe search), 8.5 (scheduled block windows), 8.7 (regex
+> rules). Remaining: 8.6 (per-client groups).
 
 ---
 

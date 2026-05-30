@@ -39,6 +39,7 @@ pub struct Metrics {
     mesh_zone_last_reload: IntGauge,
     policy_blocklist_bypass_total: IntCounter,
     policy_zone_denied_total: IntCounter,
+    policy_schedule_blocked_total: IntCounter,
     policy_rate_limited_total: IntCounter,
     private_rdata_dropped_total: IntCounter,
     query_log_disk_written_total: IntCounter,
@@ -152,6 +153,12 @@ impl Metrics {
             "Queries refused with REFUSED because they fell outside a \
              [[policy]] entry's zones_allowed list",
         )?;
+        let policy_schedule_blocked_total = register_counter(
+            &registry,
+            "rustydns_policy_schedule_blocked_total",
+            "Queries refused with REFUSED because the client was inside an active \
+             [[policy.block_windows]] scheduled block window",
+        )?;
         let private_rdata_dropped_total = register_counter(
             &registry,
             "rustydns_resolver_private_rdata_dropped_total",
@@ -208,6 +215,7 @@ impl Metrics {
             mesh_zone_last_reload,
             policy_blocklist_bypass_total,
             policy_zone_denied_total,
+            policy_schedule_blocked_total,
             policy_rate_limited_total,
             private_rdata_dropped_total,
             query_log_disk_written_total,
@@ -329,6 +337,12 @@ impl Metrics {
     /// fell outside the matching `[[policy]]` entry's `zones_allowed`.
     pub fn inc_policy_zone_denied(&self) {
         self.policy_zone_denied_total.inc();
+    }
+
+    /// Increment when a query was refused because the client was inside an
+    /// active `[[policy.block_windows]]` scheduled block window.
+    pub fn inc_policy_schedule_blocked(&self) {
+        self.policy_schedule_blocked_total.inc();
     }
 
     /// Increment when the per-source-IP rate limiter refused a query.

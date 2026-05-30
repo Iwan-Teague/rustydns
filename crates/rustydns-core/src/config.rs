@@ -1140,6 +1140,63 @@ pub struct NodePolicy {
     /// Subject to the same anonymisation rules as global query logging.
     #[serde(default = "default_false")]
     pub log_all_queries: bool,
+
+    /// Scheduled block windows — time ranges during which **every** query from
+    /// this client is refused. Declared as `[[policy.block_windows]]`. Default:
+    /// none. See [`BlockWindow`].
+    #[serde(default)]
+    pub block_windows: Vec<BlockWindow>,
+}
+
+/// One scheduled block window for a `[[policy]]` (TODO 8.5).
+///
+/// During an active window, every query from the policy's client is refused
+/// (`REFUSED`) before the pipeline runs — useful for "kids' devices off after
+/// 22:00" or "guest network blocked overnight".
+///
+/// ```toml
+/// [[policy]]
+/// client_ip = "10.0.0.50"
+///
+/// # Overnight, every night, in UTC-5:
+/// [[policy.block_windows]]
+/// start = "22:00"
+/// end   = "07:00"            # end <= start wraps past midnight
+/// utc_offset_minutes = -300
+///
+/// # All day on weekends:
+/// [[policy.block_windows]]
+/// days = ["sat", "sun"]      # omit start/end for an all-day window
+/// ```
+///
+/// # Time model
+///
+/// Matching is against the local wall clock obtained by adding
+/// `utc_offset_minutes` to the Unix time — **DST is not applied** (set the
+/// offset for the period that matters, or split the window). The schema is
+/// kept timezone-*explicit* rather than pulling in a timezone database.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BlockWindow {
+    /// Weekdays the window applies to: any of `mon tue wed thu fri sat sun`
+    /// (long names also accepted). Empty = every day.
+    #[serde(default)]
+    pub days: Vec<String>,
+
+    /// Window start `"HH:MM"` (24-hour, inclusive). Set **both** `start` and
+    /// `end` for a timed window, or **neither** for an all-day window.
+    #[serde(default)]
+    pub start: Option<String>,
+
+    /// Window end `"HH:MM"` (24-hour, exclusive). If `end <= start` the window
+    /// wraps past midnight (e.g. `22:00`–`07:00`).
+    #[serde(default)]
+    pub end: Option<String>,
+
+    /// Fixed UTC offset in minutes for interpreting `days`/`start`/`end`
+    /// (e.g. `-300` for UTC-5). Range -1440..=1440. Default: `0` (UTC).
+    #[serde(default)]
+    pub utc_offset_minutes: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,6 +1827,12 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                  Add `client_ip` to enforce it today."
             );
         }
+        // Scheduled block windows must compile (valid days/times/offset).
+        if let Err(e) = crate::schedule::BlockSchedule::compile(&policy.block_windows) {
+            return Err(crate::RustyDnsError::Config(format!(
+                "policy[{idx}] has an invalid block window: {e}"
+            )));
+        }
     }
 
     // --- DNS rewrites ------------------------------------------------------------
@@ -2335,6 +2398,7 @@ mod tests {
             blocklist_bypass: false,
             zones_allowed: Vec::new(),
             log_all_queries: false,
+            block_windows: Vec::new(),
         }
     }
 
@@ -2394,6 +2458,44 @@ mod tests {
         p.client_ip = Some("10.0.0.5".to_string());
         cfg.policy = vec![p];
         validate_config(&cfg).expect("both identifiers set must validate");
+    }
+
+    #[test]
+    fn policy_valid_block_windows_pass() {
+        let mut cfg = baseline();
+        let mut p = empty_policy();
+        p.client_ip = Some("10.0.0.5".to_string());
+        p.block_windows = vec![
+            BlockWindow {
+                days: vec![],
+                start: Some("22:00".to_string()),
+                end: Some("07:00".to_string()),
+                utc_offset_minutes: -300,
+            },
+            BlockWindow {
+                days: vec!["sat".to_string(), "sun".to_string()],
+                start: None,
+                end: None,
+                utc_offset_minutes: 0,
+            },
+        ];
+        cfg.policy = vec![p];
+        validate_config(&cfg).expect("valid block windows must pass");
+    }
+
+    #[test]
+    fn policy_invalid_block_window_rejected() {
+        let mut cfg = baseline();
+        let mut p = empty_policy();
+        p.client_ip = Some("10.0.0.5".to_string());
+        p.block_windows = vec![BlockWindow {
+            days: vec!["funday".to_string()],
+            start: None,
+            end: None,
+            utc_offset_minutes: 0,
+        }];
+        cfg.policy = vec![p];
+        assert_config_err(validate_config(&cfg), "invalid block window");
     }
 
     // --- rewrites ---------------------------------------------------
