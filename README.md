@@ -22,6 +22,9 @@ built in Rust. RustyDNS acts as a local DNS proxy that:
   ed25519 verification + atomic hot-reload, IP-keyed per-client policy
 - **Listens on UDP, TCP, DNS-over-TLS, and DNS-over-HTTPS** out of the box;
   exposes a loopback-only `/metrics`, `/health`, `/queries` for operators
+- **Reloads live on `SIGHUP`** — upstream resolver, per-client policy, rate
+  limiter, blocklist content, and listeners on unprivileged ports (incl. DoT
+  cert rotation) swap in with zero dropped queries (`systemctl reload`)
 
 Security, privacy, and anonymity are first-class design constraints. All other
 trade-offs — performance, convenience, feature completeness — are secondary.
@@ -112,13 +115,22 @@ sources = [
 ]
 ```
 
-Then validate the config and restart the daemon:
+Then validate the config and apply it. Most changes apply live via
+`systemctl reload` (which sends `SIGHUP`) without dropping a single query —
+the upstream resolver, per-client policy, rate limiter, blocklist content,
+and listeners on unprivileged ports are all hot-reloaded:
 
 ```sh
 sudo /usr/local/bin/rustydnsd --config /etc/rustydns/rustydns.toml --validate-config
-sudo systemctl restart rustydns
+sudo systemctl reload rustydns      # live reload, no downtime
 sudo systemctl status rustydns
 ```
+
+A few changes still need a full `systemctl restart`: moving a listener on a
+**privileged** port (`:53`, `:853` — the daemon drops `CAP_NET_BIND_SERVICE`
+after startup and can't rebind them), changing the blocklist **source list**,
+or toggling the on-disk query log. The daemon logs a clear "needs a process
+restart" warning when a reload encounters one of these.
 
 `--validate-config` parses the file and runs every check the daemon would
 run at startup, without binding any sockets — use it before every

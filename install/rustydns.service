@@ -24,6 +24,11 @@ Group=rustydns
 # never reaches ExecStart with a bad config.
 ExecStartPre=/usr/local/bin/rustydnsd --config /etc/rustydns/rustydns.toml --validate-config
 ExecStart=/usr/local/bin/rustydnsd --config /etc/rustydns/rustydns.toml
+# `systemctl reload` sends SIGHUP: re-reads rustydns.toml and hot-swaps the
+# upstream resolver, per-client policy, rate limiter, blocklist content, and
+# listeners on unprivileged ports (zero-drop) — no restart needed. Privileged
+# ports (:53/:853), blocklist sources, and the on-disk query log still need a
+# full restart and are logged as such on reload.
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=on-failure
