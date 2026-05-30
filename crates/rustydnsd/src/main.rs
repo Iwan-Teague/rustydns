@@ -21,16 +21,21 @@
 //! # Signal handling
 //!
 //! - `SIGHUP`  — re-read blocklist content from the current sources, the
-//!   signed mesh-zone bundle, AND `rustydns.toml`. Config reload hot-swaps
-//!   the parts that don't need socket rebinding (roadmap 3.2, Phase 1):
-//!   the upstream resolver (`[upstream]`), per-client policy (`[[policy]]`),
-//!   and the rate limiter (`[rate_limit]`), atomically via `ArcSwap` so
-//!   in-flight queries are never dropped. Changes to listener addresses,
-//!   DoT/DoH/TLS material, the metrics binding, blocklist *sources*, or the
-//!   on-disk query log still require a process restart — such changes are
-//!   detected on reload and logged at `warn!`, but NOT applied. A config
-//!   that fails to parse/validate aborts the swap and leaves the running
-//!   configuration untouched.
+//!   signed mesh-zone bundle, AND `rustydns.toml`. Config reload applies:
+//!   - **Phase 1 (hot-swap):** the upstream resolver (`[upstream]`),
+//!     per-client policy (`[[policy]]`), and rate limiter (`[rate_limit]`)
+//!     are swapped atomically via `ArcSwap` — in-flight queries are never
+//!     dropped.
+//!   - **Phase 2 (live listener handover):** changed listeners (DNS UDP/TCP,
+//!     DoT incl. TLS cert rotation, DoH, metrics) on **unprivileged** ports
+//!     are rebound zero-drop via `SO_REUSEPORT` — the new generation serves
+//!     before the old drains. Listeners on **privileged** ports (<1024)
+//!     cannot be rebound after the startup capability drop, so a change to
+//!     one is logged as restart-required, not applied (see [`listeners`]).
+//!   - Blocklist *sources* and the on-disk query log are still bound at
+//!     startup and need a restart; such changes are logged at `warn!`.
+//!   - A config that fails to parse/validate aborts the reload and leaves
+//!     the running configuration untouched.
 //! - `SIGTERM` / `SIGINT` — graceful shutdown (drain in-flight queries, close listeners).
 //!
 //! # Privilege model
@@ -54,6 +59,7 @@
 mod blocklist_loader;
 mod doh;
 mod handler;
+mod listeners;
 mod metrics;
 mod query_log;
 mod query_log_disk;
@@ -68,7 +74,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, UdpSocket};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -270,27 +275,39 @@ async fn main() -> Result<()> {
         rate_limiter,
         &config.policy,
     )?;
-    let doh_handler = Arc::new(handler.clone());
-    // Clone shares the handler's inner ArcSwaps, so SIGHUP swaps made
-    // through this handle are seen by the server and the DoH handler.
+    // An owning handler clone, used to build new listener generations and
+    // to perform SIGHUP hot-swaps. Every generation/DoH server gets its
+    // own clone — they all share the handler's inner ArcSwaps.
     let reload_handle = handler.clone();
-    let mut server = Server::new(handler);
 
-    for addr in &config.server.listen {
-        let udp = UdpSocket::bind(addr)
-            .await
-            .with_context(|| format!("failed to bind UDP socket on {addr}"))?;
-        server.register_socket(udp);
+    // Parse + validate listen addresses up front so a bad address fails
+    // startup rather than mid-bind.
+    let listen_addrs =
+        parse_socket_addrs(&config.server.listen).context("invalid server.listen address")?;
+    let dot_addr =
+        match &config.server.dot_listen {
+            Some(s) => Some(s.parse::<SocketAddr>().with_context(|| {
+                format!("server.dot_listen `{s}` is not a valid socket address")
+            })?),
+            None => None,
+        };
 
-        let tcp = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("failed to bind TCP listener on {addr}"))?;
-        // hickory 0.26 added a response-buffer-size param to
-        // register_listener. 4096 is the hickory default elsewhere
-        // in the crate.
-        server.register_listener(tcp, Duration::from_secs(5), 4096);
-
-        info!(listen = %addr, "listening for DNS queries");
+    // Build + start the initial DNS server (UDP/TCP + optional DoT). This
+    // binds the privileged ports (53/853) while we STILL hold
+    // CAP_NET_BIND_SERVICE — see the capability drop immediately below.
+    let initial_tls = if dot_addr.is_some() {
+        Some(load_tls_config(&config.server)?)
+    } else {
+        None
+    };
+    let dns_server =
+        listeners::build_dns_server(handler.clone(), &listen_addrs, dot_addr, initial_tls)
+            .context("failed to bind DNS listeners")?;
+    for addr in &listen_addrs {
+        info!(listen = %addr, "listening for DNS queries (UDP+TCP)");
+    }
+    if let Some(dot) = dot_addr {
+        info!(listen = %dot, "listening for DoT");
     }
 
     // --- Capability discipline -------------------------------------------
@@ -298,6 +315,11 @@ async fn main() -> Result<()> {
     // CAP_NET_BIND_SERVICE or any other capability for the lifetime of
     // the daemon. Drop everything so a future bug or compromise can't
     // re-bind privileged ports or escalate privileges.
+    //
+    // This is also why live SIGHUP listener handover (roadmap 3.2 Phase 2)
+    // is offered only for UNPRIVILEGED ports: rebinding a port < 1024
+    // needs this capability, which is gone. A privileged-port listener
+    // change is detected on reload and logged as restart-required.
     //
     // Under systemd this is belt-and-braces (the unit already pins the
     // capability bounding set). For non-systemd deployments (Docker,
@@ -309,42 +331,31 @@ async fn main() -> Result<()> {
     // capability dropping failed.
     drop_capabilities();
 
-    if let Some(dot_listen) = &config.server.dot_listen {
-        let tls_config = load_tls_config(&config.server)?;
-        let dot = TcpListener::bind(dot_listen)
-            .await
-            .with_context(|| format!("failed to bind DoT listener on {dot_listen}"))?;
-        server
-            .register_tls_listener_with_tls_config(dot, Duration::from_secs(5), tls_config)
-            .with_context(|| format!("failed to register DoT listener on {dot_listen}"))?;
-        info!(listen = %dot_listen, "listening for DoT");
-    }
+    // Assemble the active listener generation and spawn the independent
+    // axum servers (DoH + metrics), each under its own child token so a
+    // reload can replace one without touching the others.
+    let mut active = ActiveListeners::new(
+        reload_handle.clone(),
+        metrics.clone(),
+        query_log.clone(),
+        shutdown.clone(),
+        dns_server,
+        listen_addrs,
+        dot_addr,
+        (
+            config.server.tls_cert_path.clone(),
+            config.server.tls_key_path.clone(),
+        ),
+    );
+    active.start_doh(&config)?;
+    active.start_metrics(&config)?;
 
-    if let Some(doh_listen) = &config.server.doh_listen {
-        if let Ok(addr) = doh_listen.parse::<SocketAddr>() {
-            if !addr.ip().is_loopback() {
-                warn!(listen = %doh_listen, "DoH listener is not loopback; ensure a TLS reverse proxy and access controls are in place");
-            }
-            spawn_doh_server(doh_handler, addr, shutdown.clone());
-        } else {
-            bail!("server.doh_listen `{doh_listen}` is not a valid socket address");
-        }
-    }
+    // Periodic (non-signal) reload loops.
     spawn_blocklist_reload_loop(
         blocklist_loader.clone(),
         blocklist_engine.clone(),
         metrics.clone(),
         config.blocklist.reload_interval_secs,
-        shutdown.clone(),
-    );
-    spawn_sighup_reload(
-        blocklist_loader,
-        blocklist_engine,
-        authority.clone(),
-        metrics.clone(),
-        reload_handle,
-        config.clone(),
-        config_path.clone(),
         shutdown.clone(),
     );
     spawn_mesh_reload_loop(
@@ -354,43 +365,25 @@ async fn main() -> Result<()> {
         shutdown.clone(),
     );
 
-    let metrics_addr = metrics_listen_addr(&config.metrics)?;
-    let metrics_path = normalize_metrics_path(&config.metrics.path);
-    spawn_metrics_server(
-        metrics.clone(),
-        query_log.clone(),
-        metrics_addr,
-        metrics_path,
-        shutdown.clone(),
-    );
+    // Unified signal loop: SIGHUP reloads (blocklist + mesh + config hot
+    // swaps + listener handover); SIGTERM/SIGINT ends the loop.
+    run_signal_loop(
+        &mut active,
+        &reload_handle,
+        config.as_ref(),
+        &blocklist_loader,
+        &blocklist_engine,
+        &authority,
+        &metrics,
+        &config_path,
+    )
+    .await;
 
-    wait_for_shutdown_signal().await?;
     info!("shutdown signal received");
     shutdown.cancel();
 
-    // Bounded graceful shutdown. If hickory's `shutdown_gracefully`
-    // hasn't drained within SHUTDOWN_TIMEOUT we force-exit by dropping
-    // the future — better to abandon a stuck in-flight query than to
-    // sit unresponsive while systemd / Docker / k8s wait on us.
-    //
-    // A second SIGTERM/SIGINT during the drain window collapses the
-    // timeout to zero (operator wants out now).
     let shutdown_timeout = shutdown_timeout_from_env();
-    tokio::select! {
-        result = tokio::time::timeout(shutdown_timeout, server.shutdown_gracefully()) => {
-            match result {
-                Ok(Ok(())) => info!("server drained cleanly"),
-                Ok(Err(e)) => warn!(error = %e, "server reported error during graceful shutdown"),
-                Err(_) => warn!(
-                    timeout_secs = shutdown_timeout.as_secs(),
-                    "graceful shutdown timed out — forcing exit"
-                ),
-            }
-        }
-        _ = wait_for_shutdown_signal() => {
-            warn!("second shutdown signal received — forcing exit");
-        }
-    }
+    active.drain(shutdown_timeout).await;
 
     info!("shutting down");
     Ok(())
@@ -615,102 +608,436 @@ fn spawn_blocklist_reload_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_sighup_reload(
-    loader: Arc<BlocklistLoader>,
-    engine: Arc<BlocklistEngine>,
-    authority: Arc<Authority>,
-    metrics: Arc<Metrics>,
-    handler: DnsHandler,
-    startup_config: Arc<rustydns_core::config::DnsConfig>,
-    config_path: PathBuf,
-    shutdown: CancellationToken,
-) {
-    #[cfg(unix)]
-    tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
+/// Parse a list of `host:port` strings into [`SocketAddr`]s.
+fn parse_socket_addrs(addrs: &[String]) -> Result<Vec<SocketAddr>> {
+    addrs
+        .iter()
+        .map(|s| {
+            s.parse::<SocketAddr>()
+                .with_context(|| format!("`{s}` is not a valid socket address"))
+        })
+        .collect()
+}
 
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(sig) => sig,
+/// The currently-bound generation of network listeners plus the state
+/// needed for a live SIGHUP handover (roadmap 3.2, Phase 2).
+///
+/// The hickory `Server` (UDP/TCP/DoT) and the two axum servers (DoH,
+/// metrics) are each replaceable independently. Replacement is **zero-drop**:
+/// the new generation binds with `SO_REUSEPORT` and starts serving before
+/// the old one is drained/cancelled. Listeners on privileged ports (<1024)
+/// cannot be rebound after the startup capability drop, so a change to one
+/// is detected and logged as restart-required rather than applied.
+struct ActiveListeners {
+    /// Template handler cloned into each new generation (shares ArcSwaps).
+    handler: DnsHandler,
+    metrics: Arc<Metrics>,
+    query_log: Arc<query_log::QueryLog>,
+    /// Parent token; child tokens for DoH/metrics derive from it so a
+    /// global shutdown cancels them all.
+    parent_shutdown: CancellationToken,
+
+    dns_server: Option<Server<DnsHandler>>,
+    doh_token: Option<CancellationToken>,
+    metrics_token: Option<CancellationToken>,
+
+    // What is actually bound right now (drives reload diffing).
+    live_listen: Vec<SocketAddr>,
+    live_dot: Option<SocketAddr>,
+    live_tls_paths: (Option<PathBuf>, Option<PathBuf>),
+    live_doh: Option<SocketAddr>,
+    live_metrics: Option<SocketAddr>,
+    live_metrics_path: String,
+}
+
+impl ActiveListeners {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        handler: DnsHandler,
+        metrics: Arc<Metrics>,
+        query_log: Arc<query_log::QueryLog>,
+        parent_shutdown: CancellationToken,
+        dns_server: Server<DnsHandler>,
+        live_listen: Vec<SocketAddr>,
+        live_dot: Option<SocketAddr>,
+        live_tls_paths: (Option<PathBuf>, Option<PathBuf>),
+    ) -> Self {
+        Self {
+            handler,
+            metrics,
+            query_log,
+            parent_shutdown,
+            dns_server: Some(dns_server),
+            doh_token: None,
+            metrics_token: None,
+            live_listen,
+            live_dot,
+            live_tls_paths,
+            live_doh: None,
+            live_metrics: None,
+            live_metrics_path: String::new(),
+        }
+    }
+
+    /// Spawn the DoH server if configured. Startup variant: a bind failure
+    /// is fatal (propagated).
+    fn start_doh(&mut self, cfg: &rustydns_core::config::DnsConfig) -> Result<()> {
+        if let Some(s) = &cfg.server.doh_listen {
+            let addr = s.parse::<SocketAddr>().with_context(|| {
+                format!("server.doh_listen `{s}` is not a valid socket address")
+            })?;
+            self.install_doh(addr)?;
+        }
+        Ok(())
+    }
+
+    /// Spawn the metrics server (always present). Startup variant.
+    fn start_metrics(&mut self, cfg: &rustydns_core::config::DnsConfig) -> Result<()> {
+        let addr = metrics_listen_addr(&cfg.metrics)?;
+        let path = normalize_metrics_path(&cfg.metrics.path);
+        self.install_metrics(addr, path)
+    }
+
+    /// Bind + spawn a DoH server on `addr`, then cancel any prior one
+    /// (zero-drop). On bind failure the old server is left untouched.
+    fn install_doh(&mut self, addr: SocketAddr) -> Result<()> {
+        if !addr.ip().is_loopback() {
+            warn!(listen = %addr, "DoH listener is not loopback; ensure a TLS reverse proxy and access controls are in place");
+        }
+        let listener = listeners::bind_tcp(addr)
+            .with_context(|| format!("failed to bind DoH listener on {addr}"))?;
+        let token = self.parent_shutdown.child_token();
+        let handler = Arc::new(self.handler.clone());
+        let task_token = token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = doh_server::serve(handler, listener, task_token).await {
+                warn!(error = %e, "DoH server failed");
+            }
+        });
+        if let Some(old) = self.doh_token.replace(token) {
+            old.cancel();
+        }
+        self.live_doh = Some(addr);
+        info!(listen = %addr, "DoH listener started");
+        Ok(())
+    }
+
+    /// Bind + spawn the metrics server on `addr`, then cancel any prior one
+    /// (zero-drop). On bind failure the old server is left untouched.
+    fn install_metrics(&mut self, addr: SocketAddr, path: String) -> Result<()> {
+        let listener = listeners::bind_tcp(addr)
+            .with_context(|| format!("failed to bind metrics listener on {addr}"))?;
+        let token = self.parent_shutdown.child_token();
+        let metrics = self.metrics.clone();
+        let query_log = self.query_log.clone();
+        let path_for_task = path.clone();
+        let task_token = token.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                metrics::serve(metrics, query_log, listener, path_for_task, task_token).await
+            {
+                warn!(error = %e, "metrics server failed");
+            }
+        });
+        if let Some(old) = self.metrics_token.replace(token) {
+            old.cancel();
+        }
+        self.live_metrics = Some(addr);
+        self.live_metrics_path = path;
+        Ok(())
+    }
+
+    /// Reconcile all three listener groups to `cfg`. Each group is handled
+    /// independently; a failure or restart-required field in one never
+    /// blocks the others.
+    fn reload_listeners(&mut self, cfg: &rustydns_core::config::DnsConfig) {
+        self.reload_dns_group(cfg);
+        self.reload_doh_group(cfg);
+        self.reload_metrics_group(cfg);
+    }
+
+    fn reload_dns_group(&mut self, cfg: &rustydns_core::config::DnsConfig) {
+        let new_listen = match parse_socket_addrs(&cfg.server.listen) {
+            Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "failed to register SIGHUP handler");
+                warn!(error = %e, "SIGHUP: server.listen unparseable; DNS listeners unchanged");
                 return;
             }
         };
+        let new_dot = match cfg
+            .server
+            .dot_listen
+            .as_deref()
+            .map(|s| s.parse::<SocketAddr>())
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(_) => {
+                warn!("SIGHUP: server.dot_listen unparseable; DNS listeners unchanged");
+                return;
+            }
+        };
+        let new_tls = (
+            cfg.server.tls_cert_path.clone(),
+            cfg.server.tls_key_path.clone(),
+        );
+        if new_listen == self.live_listen
+            && new_dot == self.live_dot
+            && new_tls == self.live_tls_paths
+        {
+            return; // nothing changed
+        }
+
+        let mut group = new_listen.clone();
+        if let Some(d) = new_dot {
+            group.push(d);
+        }
+        if !listeners::all_unprivileged(&group) {
+            warn!(
+                "SIGHUP: DNS/DoT listener change needs a process restart — the new config \
+                 binds a privileged port (<1024) and CAP_NET_BIND_SERVICE was dropped at \
+                 startup. NOT applied; the previous listeners keep serving."
+            );
+            return;
+        }
+
+        let tls = if new_dot.is_some() {
+            match load_tls_config(&cfg.server) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    warn!(error = %e, "SIGHUP: TLS reload failed; keeping current DNS/DoT listeners");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        match listeners::build_dns_server(self.handler.clone(), &new_listen, new_dot, tls) {
+            Ok(new_server) => {
+                let old = self.dns_server.replace(new_server);
+                self.live_listen = new_listen.clone();
+                self.live_dot = new_dot;
+                self.live_tls_paths = new_tls;
+                info!(
+                    listen = ?new_listen,
+                    dot = ?new_dot,
+                    "SIGHUP: DNS listeners rebound live (zero-drop via SO_REUSEPORT)"
+                );
+                if let Some(old) = old {
+                    drain_server_in_background(old);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "SIGHUP: DNS rebind failed; keeping current listeners");
+            }
+        }
+    }
+
+    fn reload_doh_group(&mut self, cfg: &rustydns_core::config::DnsConfig) {
+        let new_doh = match cfg
+            .server
+            .doh_listen
+            .as_deref()
+            .map(|s| s.parse::<SocketAddr>())
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(_) => {
+                warn!("SIGHUP: server.doh_listen unparseable; DoH listener unchanged");
+                return;
+            }
+        };
+        if new_doh == self.live_doh {
+            return;
+        }
+        match new_doh {
+            None => {
+                if let Some(old) = self.doh_token.take() {
+                    old.cancel();
+                }
+                self.live_doh = None;
+                info!("SIGHUP: DoH listener removed");
+            }
+            Some(addr) if listeners::is_privileged(&addr) => {
+                warn!(listen = %addr, "SIGHUP: DoH listener change needs a restart — privileged port (<1024), capabilities dropped; NOT applied");
+            }
+            Some(addr) => {
+                if let Err(e) = self.install_doh(addr) {
+                    warn!(error = %e, "SIGHUP: DoH rebind failed; keeping current DoH listener");
+                } else {
+                    info!(listen = %addr, "SIGHUP: DoH listener rebound live");
+                }
+            }
+        }
+    }
+
+    fn reload_metrics_group(&mut self, cfg: &rustydns_core::config::DnsConfig) {
+        let new_addr = match metrics_listen_addr(&cfg.metrics) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "SIGHUP: metrics.listen invalid; metrics listener unchanged");
+                return;
+            }
+        };
+        let new_path = normalize_metrics_path(&cfg.metrics.path);
+        if Some(new_addr) == self.live_metrics && new_path == self.live_metrics_path {
+            return;
+        }
+        if listeners::is_privileged(&new_addr) {
+            warn!(listen = %new_addr, "SIGHUP: metrics listener change needs a restart — privileged port (<1024), capabilities dropped; NOT applied");
+            return;
+        }
+        if let Err(e) = self.install_metrics(new_addr, new_path) {
+            warn!(error = %e, "SIGHUP: metrics rebind failed; keeping current metrics listener");
+        } else {
+            info!(listen = %new_addr, "SIGHUP: metrics listener rebound live");
+        }
+    }
+
+    /// Bounded graceful shutdown of the active generation. The DoH/metrics
+    /// child tokens are already cancelled by the global shutdown; we drain
+    /// the hickory server here, collapsing the timeout on a second signal.
+    async fn drain(&mut self, timeout: Duration) {
+        if let Some(old) = self.doh_token.take() {
+            old.cancel();
+        }
+        if let Some(old) = self.metrics_token.take() {
+            old.cancel();
+        }
+        if let Some(mut server) = self.dns_server.take() {
+            tokio::select! {
+                result = tokio::time::timeout(timeout, server.shutdown_gracefully()) => {
+                    match result {
+                        Ok(Ok(())) => info!("server drained cleanly"),
+                        Ok(Err(e)) => warn!(error = %e, "server reported error during graceful shutdown"),
+                        Err(_) => warn!(
+                            timeout_secs = timeout.as_secs(),
+                            "graceful shutdown timed out — forcing exit"
+                        ),
+                    }
+                }
+                _ = wait_for_shutdown_signal() => {
+                    warn!("second shutdown signal received — forcing exit");
+                }
+            }
+        }
+    }
+}
+
+/// Drain a retired hickory `Server` generation in the background so the
+/// SIGHUP handler returns promptly. Bounded by the same shutdown timeout.
+fn drain_server_in_background(mut server: Server<DnsHandler>) {
+    let timeout = shutdown_timeout_from_env();
+    tokio::spawn(async move {
+        match tokio::time::timeout(timeout, server.shutdown_gracefully()).await {
+            Ok(Ok(())) => info!("retired DNS listener generation drained cleanly"),
+            Ok(Err(e)) => warn!(error = %e, "retired DNS generation reported a drain error"),
+            Err(_) => warn!("retired DNS generation drain timed out; dropping it"),
+        }
+    });
+}
+
+/// Unified signal loop: handle SIGHUP reloads until SIGTERM/SIGINT.
+#[allow(clippy::too_many_arguments)]
+async fn run_signal_loop(
+    active: &mut ActiveListeners,
+    handler: &DnsHandler,
+    startup_config: &rustydns_core::config::DnsConfig,
+    loader: &Arc<BlocklistLoader>,
+    engine: &Arc<BlocklistEngine>,
+    authority: &Arc<Authority>,
+    metrics: &Arc<Metrics>,
+    config_path: &std::path::Path,
+) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to register SIGHUP handler; config reload disabled");
+                let _ = wait_for_shutdown_signal().await;
+                return;
+            }
+        };
+        let mut term = signal(SignalKind::terminate()).ok();
 
         loop {
             tokio::select! {
                 _ = hup.recv() => {
-                    info!("SIGHUP received — reloading blocklists, mesh-zone bundle, and config");
-                    // 1) Blocklist content re-fetch from the *current*
-                    //    configured sources, then the mesh-zone bundle.
-                    match loader.reload(&engine).await {
-                        Ok(summary) => {
-                            if summary.loaded_sources == 0 {
-                                metrics.mark_blocklist_reload_failure();
-                            } else {
-                                metrics.mark_blocklist_reload_success();
-                            }
-                            metrics.set_blocklist_state(engine.entry_count(), engine.heap_bytes());
-                        }
-                        Err(e) => {
-                            metrics.mark_blocklist_reload_failure();
-                            warn!(error = %e, "blocklist reload failed");
-                        }
-                    }
-                    match authority.reload_mesh() {
-                        Ok(Some(n)) => {
-                            metrics.mark_mesh_zone_reload_success(n);
-                            info!(mesh_records = n, "mesh zone reloaded on SIGHUP");
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            metrics.mark_mesh_zone_reload_failure();
-                            warn!(error = %e, "mesh zone reload failed");
-                        }
-                    }
-                    // 2) Re-read the config file and hot-swap the parts
-                    //    that can change without rebinding sockets:
-                    //    upstream resolver, per-client policy, rate limit.
-                    reload_config(&handler, &startup_config, &config_path).await;
+                    handle_sighup(active, handler, startup_config, loader, engine, authority, metrics, config_path).await;
                 }
-                _ = shutdown.cancelled() => break,
+                _ = tokio::signal::ctrl_c() => break,
+                _ = async {
+                    match term.as_mut() {
+                        Some(t) => { t.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => break,
             }
         }
-    });
+    }
 
     #[cfg(not(unix))]
     {
         let _ = (
+            active,
+            handler,
+            startup_config,
             loader,
             engine,
             authority,
             metrics,
-            handler,
-            startup_config,
             config_path,
-            shutdown,
         );
+        let _ = wait_for_shutdown_signal().await;
     }
 }
 
-/// Re-read the config from disk and atomically swap the hot-reloadable
-/// components into the running handler (roadmap 3.2, Phase 1).
-///
-/// Hot-swappable: `[upstream]` (resolver), `[[policy]]`, `[rate_limit]`.
-/// Everything else — listener addresses, DoT/DoH/TLS material, the metrics
-/// address, blocklist *sources*, and the on-disk query log — is bound or
-/// spawned at startup and requires a process restart. Such changes are
-/// detected against the startup config and logged; they are NOT applied.
-///
-/// Failure isolation: a parse/validation error aborts the swap and leaves
-/// the daemon running on its current config. A resolver rebuild failure
-/// keeps the old resolver. We never tear down a working pipeline because a
-/// reload went wrong.
-async fn reload_config(
+/// Handle one SIGHUP: reload blocklist content + mesh bundle, then re-read
+/// the config and apply it — hot-swapping the resolver/policy/rate-limit
+/// (Phase 1) and reconciling the listeners (Phase 2).
+#[allow(clippy::too_many_arguments)]
+async fn handle_sighup(
+    active: &mut ActiveListeners,
     handler: &DnsHandler,
     startup_config: &rustydns_core::config::DnsConfig,
+    loader: &Arc<BlocklistLoader>,
+    engine: &Arc<BlocklistEngine>,
+    authority: &Arc<Authority>,
+    metrics: &Arc<Metrics>,
     config_path: &std::path::Path,
 ) {
+    info!("SIGHUP received — reloading blocklists, mesh-zone bundle, and config");
+
+    match loader.reload(engine).await {
+        Ok(summary) => {
+            if summary.loaded_sources == 0 {
+                metrics.mark_blocklist_reload_failure();
+            } else {
+                metrics.mark_blocklist_reload_success();
+            }
+            metrics.set_blocklist_state(engine.entry_count(), engine.heap_bytes());
+        }
+        Err(e) => {
+            metrics.mark_blocklist_reload_failure();
+            warn!(error = %e, "blocklist reload failed");
+        }
+    }
+    match authority.reload_mesh() {
+        Ok(Some(n)) => {
+            metrics.mark_mesh_zone_reload_success(n);
+            info!(mesh_records = n, "mesh zone reloaded on SIGHUP");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            metrics.mark_mesh_zone_reload_failure();
+            warn!(error = %e, "mesh zone reload failed");
+        }
+    }
+
     let new_config = match rustydns_core::config::load_config(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -723,18 +1050,29 @@ async fn reload_config(
         }
     };
 
-    // Warn (but continue) about changes that need a restart to take effect.
+    // Phase 1: hot-swap resolver / policy / rate limiter.
+    apply_hot_swaps(handler, &new_config).await;
+
+    // Phase 2: reconcile listeners (live rebind where possible).
+    active.reload_listeners(&new_config);
+
+    // Warn about the handful of fields that still need a restart and that
+    // the listener reconciler does not own.
     let restart_required = restart_required_changes(startup_config, &new_config);
     if !restart_required.is_empty() {
         warn!(
             fields = %restart_required.join(", "),
-            "SIGHUP config reload: these settings changed but require a process \
-             restart to take effect — they were NOT applied (sockets/TLS/metrics \
-             binding, blocklist sources, and the on-disk query log are fixed at startup)"
+            "SIGHUP config reload: these settings changed but require a process restart \
+             to take effect — they were NOT applied (blocklist sources/response and the \
+             on-disk query log are fixed at startup)"
         );
     }
+}
 
-    // Rebuild + swap the upstream resolver.
+/// Atomically swap the hot-reloadable components into the running handler
+/// (roadmap 3.2, Phase 1). A resolver rebuild failure keeps the old
+/// resolver; policy and rate-limit builds are infallible.
+async fn apply_hot_swaps(handler: &DnsHandler, new_config: &rustydns_core::config::DnsConfig) {
     match Resolver::new(new_config.clone()).await {
         Ok(resolver) => {
             handler.swap_resolver(Arc::new(resolver));
@@ -747,8 +1085,6 @@ async fn reload_config(
             warn!(error = %e, "SIGHUP config reload: resolver rebuild failed — keeping the old resolver");
         }
     }
-
-    // Swap the rate limiter and per-client policy (infallible builds).
     handler.swap_rate_limiter(Arc::new(RateLimiter::new(&new_config.rate_limit)));
     handler.swap_policies(&new_config.policy);
     info!(
@@ -759,34 +1095,17 @@ async fn reload_config(
 }
 
 /// Names of restart-required settings that differ between the startup
-/// config and a freshly read one. These are bound or spawned once at
-/// startup; SIGHUP cannot apply them.
+/// config and a freshly read one — limited to fields the listener
+/// reconciler does NOT own. Listener/TLS/metrics changes are handled live
+/// (or warned per-group) by [`ActiveListeners::reload_listeners`]; here we
+/// only flag the blocklist source/response settings (loader + engine are
+/// built once) and the on-disk query log (writer + file handle are bound
+/// at startup).
 fn restart_required_changes(
     old: &rustydns_core::config::DnsConfig,
     new: &rustydns_core::config::DnsConfig,
 ) -> Vec<&'static str> {
     let mut changed = Vec::new();
-    if old.server.listen != new.server.listen {
-        changed.push("server.listen");
-    }
-    if old.server.dot_listen != new.server.dot_listen {
-        changed.push("server.dot_listen");
-    }
-    if old.server.doh_listen != new.server.doh_listen {
-        changed.push("server.doh_listen");
-    }
-    if old.server.tls_cert_path != new.server.tls_cert_path {
-        changed.push("server.tls_cert_path");
-    }
-    if old.server.tls_key_path != new.server.tls_key_path {
-        changed.push("server.tls_key_path");
-    }
-    if old.metrics.listen != new.metrics.listen {
-        changed.push("metrics.listen");
-    }
-    if old.metrics.path != new.metrics.path {
-        changed.push("metrics.path");
-    }
     if old.blocklist.sources != new.blocklist.sources {
         changed.push("blocklist.sources");
     }
@@ -845,28 +1164,6 @@ fn spawn_mesh_reload_loop(
                 }
                 _ = shutdown.cancelled() => break,
             }
-        }
-    });
-}
-
-fn spawn_metrics_server(
-    metrics: Arc<Metrics>,
-    query_log: Arc<query_log::QueryLog>,
-    listen: SocketAddr,
-    path: String,
-    shutdown: CancellationToken,
-) {
-    tokio::spawn(async move {
-        if let Err(e) = metrics::serve(metrics, query_log, listen, path, shutdown).await {
-            warn!(error = %e, "metrics server failed");
-        }
-    });
-}
-
-fn spawn_doh_server(handler: Arc<DnsHandler>, listen: SocketAddr, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        if let Err(e) = doh_server::serve(handler, listen, shutdown).await {
-            warn!(error = %e, "DoH server failed");
         }
     });
 }
@@ -1305,22 +1602,27 @@ mod tests {
     }
 
     #[test]
-    fn restart_required_flags_listener_change() {
+    fn restart_required_ignores_listener_and_metrics_changes() {
+        // Listener / DoH / metrics changes are reconciled live by
+        // ActiveListeners, NOT flagged restart-required here.
         let a = base_config();
         let mut b = base_config();
         b.server.listen = vec!["0.0.0.0:5353".to_string()];
-        assert_eq!(restart_required_changes(&a, &b), vec!["server.listen"]);
+        b.server.doh_listen = Some("127.0.0.1:8053".to_string());
+        b.metrics.listen = "127.0.0.1:9999".to_string();
+        b.metrics.path = "/m".to_string();
+        assert!(
+            restart_required_changes(&a, &b).is_empty(),
+            "listener/metrics changes are handled by the reconciler, not restart-required"
+        );
     }
 
     #[test]
-    fn restart_required_flags_metrics_and_blocklist_sources() {
+    fn restart_required_flags_blocklist_sources() {
         let a = base_config();
         let mut b = base_config();
-        b.metrics.listen = "127.0.0.1:9999".to_string();
         b.blocklist.sources = vec!["https://example.com/list".to_string()];
-        let changed = restart_required_changes(&a, &b);
-        assert!(changed.contains(&"metrics.listen"));
-        assert!(changed.contains(&"blocklist.sources"));
+        assert_eq!(restart_required_changes(&a, &b), vec!["blocklist.sources"]);
     }
 
     #[test]

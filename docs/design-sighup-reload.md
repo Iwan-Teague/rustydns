@@ -41,11 +41,57 @@ Phase 1 shipped. On SIGHUP the daemon (`reload_config` in
 In-flight queries that already `load()`ed an `Arc` finish against that
 snapshot; the next query sees the new one — no dropped queries.
 
-`restart_required_changes` compares the new config against the startup config
-and logs (at `warn!`) any changed field that Phase 1 cannot apply — listener
-addresses, DoT/DoH/TLS paths, the metrics binding, blocklist sources, and the
-on-disk query-log toggle/path. Those are **not** applied; they need Phase 2
-(socket/TLS handover) or a restart. See roadmap.md §3.2.
-
 The handler reads `resolver` via `load_full()` (owned `Arc`) so the `ArcSwap`
 guard is never held across the `.await` in the resolve path.
+
+## Status: Phase 2 IMPLEMENTED (with a capability-bound caveat)
+
+Phase 2 (live listener handover) shipped, scoped by a hard constraint
+discovered during implementation.
+
+### The capability conflict
+
+The daemon drops **all** capabilities — including the bounding set, so
+`CAP_NET_BIND_SERVICE` can never be regained — immediately after the initial
+port binds (AGENTS.md §Capability discipline; the whole point is that "a future
+bug or compromise can't re-bind privileged ports"). Binding any port < 1024
+requires that capability, and `SO_REUSEPORT` does **not** bypass the privilege
+check. Therefore a running, post-drop daemon **physically cannot rebind a
+privileged port** (`:53`, `:853`) — not even the same port it already holds.
+
+Retaining the capability to enable rebinding was rejected: it would directly
+re-enable the port-hijack the invariant exists to prevent, and AGENTS.md
+forbids adding such a path "even if the operator explicitly requests it."
+
+### What shipped
+
+Live, **zero-drop** handover for listeners on **unprivileged** ports (≥ 1024):
+
+- Each listener group is independently replaceable: the hickory `Server`
+  (UDP/TCP/DoT), the DoH axum server, and the metrics axum server.
+- New generations bind with `SO_REUSEADDR` + `SO_REUSEPORT`
+  (`listeners::bind_udp` / `bind_tcp`) so the new socket binds the same port
+  while the old one is still draining — no query is lost.
+- `ActiveListeners::reload_listeners` diffs each group against what is actually
+  bound and, on change: builds the new generation, swaps it in, then drains the
+  old (the hickory generation drains in the background, bounded by the shutdown
+  timeout; DoH/metrics tasks are cancelled via their per-generation child
+  token). On a bind/TLS failure the old generation is kept and the error logged
+  — the daemon never goes dark.
+- **DoT TLS cert rotation** works this way when DoT is on an unprivileged port:
+  changing `tls_cert_path`/`tls_key_path` rebuilds the DoT listener with the new
+  material.
+
+A change to a listener on a privileged port, or to blocklist *sources* / the
+on-disk query log, is detected and logged as restart-required
+(`restart_required_changes` covers the latter two). See roadmap.md §3.
+
+### Tests
+
+- `listeners.rs`: `is_privileged` / `all_unprivileged` classification, and
+  `SO_REUSEPORT` proving two binds on the same live port succeed (TCP + UDP).
+- `main.rs`: `restart_required_changes` now only flags blocklist/query-log
+  fields (listener/metrics handled by the reconciler).
+- Verified end-to-end: a SIGHUP that moves the DNS + metrics ports rebinds the
+  new ports, drains the old generation cleanly, and refuses (with a clear warn)
+  a change to a privileged port while keeping the old listeners serving.

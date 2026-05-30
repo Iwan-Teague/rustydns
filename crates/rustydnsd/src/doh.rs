@@ -39,10 +39,15 @@ const MAX_DOH_MESSAGE_BYTES: usize = 65_535;
 const DOH_TIMEOUT: Duration = Duration::from_secs(5);
 const DOH_PATH: &str = "/dns-query";
 
-/// Start the DoH listener (HTTP, no TLS) until shutdown.
+/// Start the DoH listener (HTTP, no TLS) on a pre-bound listener until
+/// shutdown.
+///
+/// The caller binds the `TcpListener` (with `SO_REUSEPORT`, see
+/// [`crate::listeners::bind_tcp`]) so a live SIGHUP handover can stand up a
+/// new generation on the same port before draining the old one.
 pub async fn serve(
     handler: Arc<DnsHandler>,
-    listen: SocketAddr,
+    listener: TcpListener,
     shutdown: CancellationToken,
 ) -> Result<(), RustyDnsError> {
     let state = DohState { handler };
@@ -57,8 +62,10 @@ pub async fn serve(
         .layer(DefaultBodyLimit::max(MAX_DOH_MESSAGE_BYTES))
         .with_state(state);
 
-    let listener = TcpListener::bind(listen).await.map_err(RustyDnsError::Io)?;
-
+    let listen = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
     info!(listen = %listen, path = DOH_PATH, "DoH listener started");
 
     // `with_graceful_shutdown` requires a 'static future. The
@@ -323,15 +330,14 @@ mod tests {
     /// Boot a DoH listener on a random port. Returns `(base_url, shutdown_token)`.
     /// Drop the token (or call .cancel()) to stop the listener.
     async fn spawn_doh(handler: Arc<DnsHandler>) -> (String, CancellationToken) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::listeners::bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener); // free the port — serve() will rebind it
 
         let shutdown = CancellationToken::new();
         let shutdown_for_task = shutdown.clone();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         tokio::spawn(async move {
-            let _ = serve(handler, addr, shutdown_for_task).await;
+            let _ = serve(handler, listener, shutdown_for_task).await;
         });
 
         // Wait for the listener to come up. axum binds inside serve()

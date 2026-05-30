@@ -295,9 +295,17 @@ available to the process, and runs the daemon as an unprivileged `rustydns` user
 
 For deployments without systemd, the binary drops capabilities in-process after
 binding its sockets via the `caps` crate (Linux-only; no-op on other targets).
-The runtime call clears every non-network capability inherited from the parent
-process and the bounding set, leaving only `CAP_NET_BIND_SERVICE` if it was
-present at bind time.
+The runtime call clears **every** capability set — Effective, Permitted,
+Inheritable, Ambient, and Bounding — so the process holds **no** capabilities
+afterward, including `CAP_NET_BIND_SERVICE`. A later bug or compromise therefore
+cannot re-bind a privileged port or escalate.
+
+This is also why live SIGHUP listener handover (roadmap 3.2 Phase 2) is offered
+only for listeners on **unprivileged** ports (≥ 1024): rebinding a port < 1024
+needs `CAP_NET_BIND_SERVICE`, which is gone, and `SO_REUSEPORT` does not bypass
+the privilege check. A change to a privileged listener (`:53`, `:853`) is
+detected on reload and logged as restart-required rather than applied — the
+capability posture is never weakened to enable reload.
 
 The Docker image ships the same posture two ways: a `setcap
 cap_net_bind_service=+ep` file capability baked onto the binary, plus

@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -333,7 +332,7 @@ fn now_unix_secs() -> i64 {
 pub async fn serve(
     metrics: Arc<Metrics>,
     query_log: Arc<QueryLog>,
-    listen: SocketAddr,
+    listener: TcpListener,
     path: String,
     shutdown: CancellationToken,
 ) -> Result<(), RustyDnsError> {
@@ -354,8 +353,10 @@ pub async fn serve(
             get(move || queries_handler(query_log_clone.clone())),
         );
 
-    let listener = TcpListener::bind(listen).await.map_err(RustyDnsError::Io)?;
-
+    let listen = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
     info!(
         listen = %listen,
         metrics_path = %path,

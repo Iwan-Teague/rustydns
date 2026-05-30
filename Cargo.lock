@@ -1856,6 +1856,7 @@ dependencies = [
  "rustydns-core",
  "rustydns-resolver",
  "serde",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-rustls",

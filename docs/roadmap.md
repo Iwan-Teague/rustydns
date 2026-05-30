@@ -64,25 +64,32 @@ marker to the code or doc it relates to**, so no item lives only in one place.
 
 ---
 
-## 3. Unstarted features (design + privacy review needed)
+## 3. Remaining restart-only configuration
 
-### 3.2 SIGHUP reload — Phase 2 (socket/TLS rebinding)
+SIGHUP reload (roadmap 3.2) is **done** — both phases shipped:
 
-- **Done (Phase 1):** SIGHUP now re-reads `rustydns.toml` and hot-swaps the
-  upstream resolver (`[upstream]`), per-client policy (`[[policy]]`), and rate
-  limiter (`[rate_limit]`) atomically via `ArcSwap`, alongside the existing
-  blocklist-content and mesh-bundle reload. A bad config aborts the swap and
-  keeps the running config. See `reload_config` / `restart_required_changes`
-  in `crates/rustydnsd/src/main.rs` and `docs/design-sighup-reload.md`.
-- **What's left (Phase 2):** apply changes to listener addresses, DoT/DoH/TLS
-  material, and the metrics binding without a restart. These are detected on
-  reload and logged, but applying them requires tearing down and rebinding
-  `hickory-server` listeners (and the axum metrics server) without dropping
-  in-flight connections — a custom socket-acceptor handover. Substantial;
-  needs its own design pass. Operator workaround for these specific fields:
-  restart the process (`systemctl restart rustydns`, `docker compose restart`).
-- **Also restart-only:** blocklist *source list* changes (the loader is built
-  once at startup) and the on-disk query-log path/toggle.
+- **Phase 1 (hot-swap):** `[upstream]` resolver, `[[policy]]`, and
+  `[rate_limit]` swap atomically via `ArcSwap`.
+- **Phase 2 (live listener handover):** changed listeners on **unprivileged**
+  ports (DNS UDP/TCP, DoT incl. TLS cert rotation, DoH, metrics) rebind
+  zero-drop via `SO_REUSEPORT`. See `ActiveListeners` in
+  `crates/rustydnsd/src/main.rs`, `crates/rustydnsd/src/listeners.rs`, and
+  `docs/design-sighup-reload.md`.
+
+A few fields remain restart-only **by design**, not for lack of work:
+
+- **Listeners on privileged ports (<1024)** — DNS `:53`, DoT `:853`. The
+  daemon drops `CAP_NET_BIND_SERVICE` (and the whole bounding set) right
+  after the initial bind, so it physically cannot rebind a privileged port;
+  `SO_REUSEPORT` does not bypass the privilege check. This is the
+  capability-discipline invariant working as intended (AGENTS.md). A change
+  to such a listener is detected on reload and logged as restart-required.
+  Deployments that need live DNS/DoT listener changes can bind unprivileged
+  ports and port-map at the orchestrator/firewall layer.
+- **Blocklist *source list*** — the loader + engine are built once at startup
+  (SIGHUP still re-fetches content from the *current* sources).
+- **On-disk query log** path/toggle — the writer task + file handle are bound
+  at startup.
 
 ---
 

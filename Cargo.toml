@@ -63,6 +63,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Lock-free hot-reload of blocklist state
 arc-swap = "1"
 
+# Low-level socket options (SO_REUSEPORT) for zero-drop listener handover
+socket2 = { version = "0.6", features = ["all"] }
+
 # Fast, DoS-resistant hashing (randomised seed per process)
 ahash = "0.8"
 
