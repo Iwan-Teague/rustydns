@@ -107,19 +107,27 @@ A few fields remain restart-only **by design**, not for lack of work:
   **target** resolver and relay it through an **oblivious proxy**, so the proxy
   sees the client IP but not the query, and the target sees the query but not
   the client IP. No single party can correlate "who asked what."
-- **Blocker:** *not* upstream-blocked (Cloudflare's `odoh-rs` implements RFC
-  9230 and the DNS wire format stays `hickory-proto`). It needs a design pass +
-  full verification because it is a **parallel upstream arm bypassing
-  `hickory-resolver`**: DNSSEC validation, fail-closed → SERVFAIL (never a plain
-  DoH fallback), ECS stripping, and the rebinding-defence rdata filter must all
-  be re-applied on the ODoH arm. A half-implementation that silently falls back
-  de-anonymises the operator, so it is gated behind that verification.
-- **Scaffolding (shipped):** `UpstreamProtocol::Odoh` + `upstream.odoh_proxy`
-  are reserved in the schema so a config written today is forward-compatible.
-  Enabling `protocol = "odoh"` is **rejected fail-closed** at both
-  `validate_config` and `Resolver::new` — the daemon refuses to start rather
-  than resolve over plain DoH. `odoh-rs`/`hpke` are deliberately **not** added
-  as dependencies until the arm is implemented (no unused attack surface).
+- **Status: SHIPPED.** Implemented in `crates/rustydns-resolver/src/odoh.rs` as
+  a **parallel upstream arm bypassing `hickory-resolver`** (`DefaultArm::Odoh`).
+  The arm re-applies the rustydns invariants itself: **fail-closed → SERVFAIL**
+  (never a plain-DoH or direct-target fallback), **no ECS**, and the
+  **rebinding-defence rdata filter**. HPKE is `odoh-rs` (Cloudflare, BSD-2,
+  `hpke` 0.13); the DNS wire stays `hickory-proto`; the relay hop is `reqwest`
+  with the TLS-version floor + `https_only`. The target's `ObliviousDoHConfig`
+  is fetched lazily from `/.well-known/odohconfigs` and cached (refreshed on a
+  decrypt failure → key rotation).
+- **DNSSEC caveat:** the oblivious arm does **not** perform *client-side* DNSSEC
+  validation (that lives in hickory-resolver). `validate_config` and
+  `Resolver::new` reject `protocol = "odoh"` + `dnssec_validation = true`;
+  operators set `dnssec_validation = false` and rely on a validating target. A
+  one-time startup `warn!` discloses this and the proxy-independence requirement.
+- **Verification:** the real HPKE round-trip is exercised offline against an
+  in-process mock target (`odoh.rs` tests): success, NXDOMAIN, target-SERVFAIL →
+  error, relay-failure → error, undecodable → error, rebinding filter, config
+  caching. `cargo deny` is clean for the new crypto deps.
+- **Future enhancements (not blocking):** client-side DNSSEC over the oblivious
+  arm; multiple independent proxies / rotation; padding the oblivious query when
+  `privacy.upstream_padding` is set; pinning the target config in `[upstream]`.
 - **Doc mentions:** `docs/security.md` §"Oblivious DoH"; `docs/architecture.md`
   resolver table; `crates/rustydns-resolver/src/lib.rs` crate-level table;
   `rustydns.example.toml` `[upstream]` block; `docs/TODO.md` §7.3.

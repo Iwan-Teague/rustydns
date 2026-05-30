@@ -158,67 +158,43 @@ matrix added to `docs/operator-endpoints.md`.)
   Unit-tested in `metrics.rs` (increment + bounded series count) and `handler.rs`
   (rcode bucketing); documented in `docs/operator-endpoints.md`.
 
-- **7.3 🟠 Oblivious DoH (ODoH, RFC 9230) upstream transport — L. SCAFFOLDED,
-  arm not yet implemented (flagged).** The config schema is reserved
-  (`UpstreamProtocol::Odoh` + `upstream.odoh_proxy`) so a config written today
-  is forward-compatible, and enabling `protocol = "odoh"` is **rejected
-  fail-closed** at both `validate_config` and `Resolver::new` — rustydns refuses
-  to start rather than silently resolve over plain DoH (which would
-  de-anonymise). The crypto deps (`odoh-rs`/`hpke`) are deliberately NOT added
-  yet (no unused attack surface). **Remaining (the actual arm):** HPKE
-  encode/decode via `odoh-rs`, `reqwest` POST to the proxy, and re-applying
-  DNSSEC validation + fail-closed + ECS strip + rebinding filter on the parallel
-  arm — plus end-to-end verification against a real target+proxy (could not be
-  done this session offline). Tracked in `docs/roadmap.md` §ODoH and
-  `docs/security.md` §"Oblivious DoH".
-  **The single highest-leverage *anonymity* feature** for rustydns, and a direct
-  fit for the project's #1 design goal ("Security, privacy, and anonymity are the
-  highest-priority design goals"). With plain DoH/DoQ, the upstream resolver
-  sees *both* the query content **and** the client's IP. ODoH breaks that link:
-  the query is HPKE-encrypted to the **target** resolver and relayed through an
-  **oblivious proxy**, so the proxy sees the client IP but not the query, and the
-  target sees the query but not the client IP. No single party can correlate
-  "who asked what." This is dnscrypt-proxy's flagship privacy mode (also called
-  𝜇ODNS in the literature).
-
-  **Implementable now — NOT upstream-blocked.** Cloudflare's `odoh-rs`
-  (RFC 9230, BSD-2, HPKE via the `hpke` crate; `odoh-client-rs` is a working
-  reference) provides the oblivious-message encryption/decryption. The DNS wire
-  format stays `hickory-proto` (so "hickory only" still holds — that rule is
-  about the DNS library, not the crypto), and the HTTP POST to the proxy uses the
-  existing `reqwest`. Flow: fetch the target's ODoH config (public key) →
-  `hickory-proto` encodes the query → `odoh-rs` HPKE-encrypts it → `reqwest`
-  POSTs `application/oblivious-dns-message` to the proxy (`?targethost=&targetpath=`)
-  → decrypt the response → `hickory-proto` parses it.
-
-  **Why it's "L" / needs a design pass — the hard parts:**
-  - It's a *parallel* upstream arm that bypasses `hickory-resolver`. The
-    invariants currently delivered by hickory-resolver — **DNSSEC validation**,
-    **fail-closed → SERVFAIL**, ECS stripping, randomised selection,
-    rebinding-defence rdata filtering — must be re-applied to the ODoH arm
-    (DNSSEC validation in particular: do it with `hickory-proto`'s validator over
-    the decrypted message, and keep fail-closed — never fall back to plain DoH on
-    ODoH failure, which would silently de-anonymise).
-  - **Config surface:** target resolver URL, one or more proxy URLs, and the
-    target's `ODoHConfig` (fetch from `/.well-known/odohconfigs` or pin in
-    config), plus key-rotation handling. Choose proxies that are operationally
-    independent from the target, or the anonymity guarantee collapses.
-  - **Dependency vetting:** adds `odoh-rs` + `hpke` (and transitive crypto) to
-    the audit surface. `odoh-rs` is Cloudflare-maintained but low-traffic
-    (~hundreds of downloads/mo) — run it through `cargo deny` (advisories +
-    license: BSD-2 is fine) and pin it like everything else in
-    `[workspace.dependencies]`. The minimal-attack-surface ethos means this
-    dependency choice deserves explicit sign-off.
-  - **Scaffolding suggestion:** add `upstream.protocol = "odoh"` (alongside
-    `doh`/`doq`/`plain`) + `upstream.odoh_proxy` so a config written today is
-    forward-compatible, and emit a startup warning until the arm is wired (same
-    pattern as the qmin/padding knobs).
-
-  Files: new `crates/rustydns-resolver` ODoH arm, `crates/rustydns-core/src/config.rs`
-  (`UpstreamConfig`), `deny.toml`, `Cargo.toml` workspace deps. Docs:
-  `docs/security.md` (new threat-model entry), `docs/architecture.md`,
-  `rustydns.example.toml`. Supersedes the (inaccurate) "upstream-blocked" framing
-  of §8.8.
+- **7.3 ✅ Oblivious DoH (ODoH, RFC 9230) upstream transport — DONE.** The
+  flagship anonymity feature: the query is HPKE-encrypted to the **target**
+  resolver and relayed through an **oblivious proxy** (`upstream.odoh_proxy`),
+  so the proxy sees the client IP but not the query and the target sees the
+  query but not the client IP — no single party can correlate "who asked what."
+  - **Where:** new `crates/rustydns-resolver/src/odoh.rs` (the `OdohArm`:
+    lazy-fetched + cached `ObliviousDoHConfig`, `odoh-rs` HPKE encrypt → `reqwest`
+    POST to the proxy with `?targethost=&targetpath=` and
+    `application/oblivious-dns-message` → decrypt → `hickory-proto` parse). Wired
+    into `Resolver` via a `DefaultArm::{Hickory,Odoh}` split; ODoH is the global
+    default only (rejected on routes).
+  - **Invariants re-applied on the parallel arm:** **fail-closed** (every
+    failure — config fetch, encrypt, relay, decrypt, DNS parse, target
+    SERVFAIL/REFUSED — returns SERVFAIL; **never** falls back to plain DoH or the
+    target directly); **no ECS**; **rebinding defence** (private rdata stripped);
+    NXDOMAIN vs NODATA from the decrypted rcode. Key rotation is handled by
+    clearing the cached config and retrying once on a decrypt failure.
+  - **DNSSEC:** the oblivious arm does **not** do *client-side* DNSSEC
+    validation (that lives in hickory-resolver, which this arm bypasses). Rather
+    than let the flag mean nothing, `validate_config` **and** `Resolver::new`
+    reject `protocol = "odoh"` + `dnssec_validation = true`; operators set
+    `dnssec_validation = false` and rely on a validating target. A one-time
+    startup `warn!` discloses this + the proxy-independence requirement.
+  - **Deps:** `odoh-rs` (Cloudflare, BSD-2) + `hpke` 0.13, pinned in workspace
+    deps, `cargo deny` clean (advisories/licenses/bans/sources ok). `rand 0.9`
+    pinned locally in the resolver (hpke needs a rand_core-0.9 CSPRNG).
+  - **Verified offline:** `odoh.rs` tests drive the **real** HPKE round-trip
+    against an in-process mock target (genuine `odoh-rs` server side) — success,
+    NXDOMAIN, target-SERVFAIL→error, relay-failure→error, garbage→error,
+    rebinding filter, and config caching. What is *not* covered (reqwest's HTTPS
+    transport + TLS floor) is third-party code configured in
+    `odoh::build_http_client`. Docs: `docs/security.md`, `docs/architecture.md`,
+    `docs/roadmap.md`, `rustydns.example.toml`. Supersedes §8.8.
+  - **Future enhancements (not blocking):** client-side DNSSEC over the
+    oblivious arm; multiple independent proxies / proxy rotation; honouring
+    `privacy.upstream_padding` by padding the oblivious query; pinning the
+    target `ODoHConfig` in config instead of fetching `/.well-known`.
 
 ---
 
@@ -246,14 +222,12 @@ blocklist groups shipped — `[[blocklist.groups]]` named sets + a
 
 ### High anonymity value — promoted to its own item
 
-- **8.8 → see §7.3 🟠 Oblivious DoH (ODoH, RFC 9230).** The flagship anonymity
-  feature: the target resolver never learns the client IP and the relay never
-  learns the query. Originally filed here as "likely upstream-blocked" — that was
-  **wrong**: Cloudflare's `odoh-rs` implements RFC 9230 today, and the DNS wire
-  format stays `hickory-proto`, so it's implementable now (not blocked on
-  hickory). Promoted to **§7.3** with full design notes (DNSSEC/fail-closed
-  re-application, config surface, dependency vetting) because it directly serves
-  rustydns's #1 goal.
+- **8.8 → see §7.3 ✅ Oblivious DoH (ODoH, RFC 9230) — DONE.** The flagship
+  anonymity feature: the target resolver never learns the client IP and the
+  relay never learns the query. Originally filed here as "likely
+  upstream-blocked" — that was **wrong** (Cloudflare's `odoh-rs` implements RFC
+  9230 and the DNS wire format stays `hickory-proto`), so it was promoted to
+  **§7.3** and is now implemented and tested. See §7.3 for the full write-up.
 
 ### Deliberately out of scope (note the reason)
 

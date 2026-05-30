@@ -103,6 +103,16 @@ rand = "0.8"
 # Base64 for DoH query decoding
 base64 = "0.22"
 
+# Oblivious DoH (RFC 9230) upstream transport. `odoh-rs` is Cloudflare's
+# reference implementation (BSD-2) — HPKE-encrypts the DNS query to the target
+# and relays it through an oblivious proxy, so the target never sees the client
+# IP and the proxy never sees the query. `bytes` is its (de)serialisation
+# buffer type. NOTE: hpke 0.13 (pulled by odoh-rs) requires a rand_core-0.9
+# RNG, so the resolver pins `rand = "0.9"` locally rather than the workspace's
+# rand 0.8 (a different, incompatible major).
+odoh-rs = "1"
+bytes   = "1"
+
 # Unix-only: call umask() at startup so files the daemon creates
 # default to mode 0o600 (group/other have no access). Replaces
 # systemd's `UMask=0077` in the service unit for non-systemd

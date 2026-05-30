@@ -103,7 +103,7 @@ When multiple upstream resolvers are configured, RustyDNS selects among them ran
 per query. No single resolver builds a complete query history. Operators should configure
 resolvers from different jurisdictions and operators.
 
-### Oblivious DoH (ODoH, RFC 9230) — scaffolded, not yet implemented
+### Oblivious DoH (ODoH, RFC 9230) — implemented
 
 With plain DoH/DoQ the upstream resolver sees **both** the query content **and** the
 client's IP, so it can build a per-client profile. ODoH breaks that link: the query is
@@ -112,20 +112,31 @@ the proxy sees the client IP but not the query, and the target sees the query bu
 client IP — no single party can correlate "who asked what." This is the highest-leverage
 *anonymity* upgrade for rustydns and a direct fit for its #1 design goal.
 
-**Status: the configuration schema is reserved, but the resolver arm is not wired yet.**
-`upstream.protocol = "odoh"` and `upstream.odoh_proxy` exist so a config written today is
-forward-compatible, but enabling ODoH is **rejected at startup with a hard error** — in
-two places (config validation and the resolver constructor). This is deliberate and
-fail-closed: a half-implemented ODoH arm that silently fell back to plain DoH on any error
-would de-anonymise the very operator who asked for anonymity, which is worse than not
-offering it. rustydns will **never** resolve over plain DoH when ODoH was requested.
+Enable it with `upstream.protocol = "odoh"`, `upstream.resolvers = ["https://<target>/dns-query"]`,
+and `upstream.odoh_proxy = "https://<proxy>/"`. The arm lives in
+`crates/rustydns-resolver/src/odoh.rs` as a *parallel* upstream that bypasses
+`hickory-resolver`, and re-applies the rustydns invariants itself:
 
-When the arm is implemented it will be a *parallel* upstream that bypasses
-`hickory-resolver`, so it must re-apply every invariant hickory-resolver provides today:
-DNSSEC validation over the decrypted message, fail-closed → SERVFAIL (never a DoH
-fallback), ECS stripping, and the rebinding-defence rdata filter. The `odoh-rs` + `hpke`
-crates would then enter the dependency-audit surface and be pinned + run through
-`cargo deny`. Tracked in [`roadmap.md`](roadmap.md) §"ODoH" and `docs/TODO.md` §7.3.
+- **Fail-closed.** Every failure — config fetch, HPKE encrypt, the relay POST, decrypt,
+  DNS parse, or a target SERVFAIL/REFUSED — returns `SERVFAIL`. rustydns **never** falls
+  back to plain DoH or to querying the target directly; either would de-anonymise the very
+  operator who asked for anonymity.
+- **No ECS**, and the **rebinding-defence rdata filter** applies just as on the doh/doq
+  default arm.
+- **No client-side DNSSEC.** Chain validation lives inside hickory-resolver, which this
+  arm bypasses. Rather than let `dnssec_validation = true` silently mean nothing, both
+  `validate_config` and `Resolver::new` **reject** `odoh` + `dnssec_validation = true`.
+  Set `dnssec_validation = false` (you then rely on a validating *target*) or use
+  `doh`/`doq` for client-side DNSSEC. A one-time startup `warn!` discloses this.
+
+**Trust model the operator must honour:** the anonymity holds only if the proxy is operated
+**independently** of the target — if one party controls both, it can correlate IP with
+query. Fetching the target's `ObliviousDoHConfig` (`/.well-known/odohconfigs`) happens
+directly to the target, so the target learns you *use* ODoH (not *what* you query).
+
+The `odoh-rs` (Cloudflare, BSD-2) + `hpke` 0.13 crates are pinned in workspace deps and
+pass `cargo deny`. The real HPKE round-trip is verified offline against an in-process mock
+target. Tracked in [`roadmap.md`](roadmap.md) §"ODoH" and `docs/TODO.md` §7.3.
 
 ### DNSSEC Validation
 

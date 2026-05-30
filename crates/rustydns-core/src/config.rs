@@ -394,20 +394,23 @@ pub enum UpstreamProtocol {
     /// in production. A persistent `tracing::warn!` is emitted on every startup
     /// when this is configured.
     Plain,
-    /// Oblivious DNS-over-HTTPS (ODoH, RFC 9230) — **reserved, not yet
-    /// implemented.**
+    /// Oblivious DNS-over-HTTPS (ODoH, RFC 9230).
     ///
     /// ODoH HPKE-encrypts the query to the *target* resolver and relays it
     /// through an *oblivious proxy* (`upstream.odoh_proxy`), so the proxy sees
     /// the client IP but not the query, and the target sees the query but not
-    /// the client IP — no single party can correlate "who asked what."
+    /// the client IP — no single party can correlate "who asked what." The
+    /// proxy MUST be operated independently of the target or the guarantee
+    /// collapses.
     ///
-    /// The schema is reserved here so a config written today is forward-
-    /// compatible, but the resolver arm is not wired yet. Setting
-    /// `protocol = "odoh"` is **rejected at startup** (a hard error): enabling
-    /// it would not provide the anonymity it implies, and rustydns will never
-    /// silently fall back to plain DoH (that would de-anonymise you). Tracked
-    /// in `docs/roadmap.md` / `docs/TODO.md` §7.3.
+    /// Requirements (enforced by `validate_config`): every target in
+    /// `upstream.resolvers` is an `https://` URL, `upstream.odoh_proxy` is set
+    /// (`https://`), and `upstream.dnssec_validation = false` — the oblivious
+    /// arm does not perform *client-side* DNSSEC validation (that bypasses
+    /// hickory-resolver), so integrity rests on choosing a validating target.
+    /// On any failure the arm fails closed (SERVFAIL); it never falls back to
+    /// plain DoH or the target directly, which would de-anonymise the operator.
+    /// Not available on conditional-forwarding routes.
     Odoh,
 }
 
@@ -1390,12 +1393,10 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         ));
     }
 
-    // ODoH (RFC 9230) scaffolding (TODO 7.3): the schema is reserved so a
-    // config written today is forward-compatible, but the resolver arm is not
-    // wired yet. We reject `protocol = "odoh"` at startup rather than silently
-    // resolving over plain DoH — falling back would de-anonymise the operator,
-    // which is exactly what ODoH exists to prevent. Validate the forward-compat
-    // shape first (so a future config is known-good), then fail closed.
+    // ODoH (RFC 9230): the oblivious upstream arm is implemented (TODO 7.3).
+    // The query is HPKE-encrypted to the target and relayed through an
+    // independent oblivious proxy, so the target never sees the client IP and
+    // the proxy never sees the query. Validate the ODoH-specific shape here.
     if cfg.upstream.protocol == UpstreamProtocol::Odoh {
         for url in &cfg.upstream.resolvers {
             if !url.starts_with("https://") {
@@ -1409,7 +1410,9 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
             None => {
                 return Err(crate::RustyDnsError::Config(
                     "upstream.protocol = \"odoh\" requires upstream.odoh_proxy (the oblivious \
-                     proxy URL that relays the encrypted query to the target)."
+                     proxy URL that relays the encrypted query to the target). For the anonymity \
+                     guarantee to hold, the proxy MUST be operated independently of the target — \
+                     if one party controls both, it can correlate client IP with query."
                         .to_string(),
                 ));
             }
@@ -1420,12 +1423,32 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
             }
             Some(_) => {}
         }
+        // ODoH does NOT perform CLIENT-SIDE DNSSEC validation: the oblivious
+        // arm bypasses hickory-resolver (which is what validates on the
+        // doh/doq arms), and re-implementing chain validation over the
+        // oblivious transport is a separate, larger piece of work. Rather than
+        // let `dnssec_validation = true` silently mean nothing on this arm, we
+        // reject the combination — refusing to imply a guarantee we don't
+        // provide. Operators who want ODoH set `dnssec_validation = false`,
+        // acknowledging that integrity then rests on a validating target
+        // resolver (server-side) rather than on client-side checks.
+        if cfg.upstream.dnssec_validation {
+            return Err(crate::RustyDnsError::Config(
+                "upstream.protocol = \"odoh\" with upstream.dnssec_validation = true is not \
+                 supported: the oblivious arm does not perform client-side DNSSEC validation \
+                 (a future enhancement). Set dnssec_validation = false to use ODoH — you then \
+                 rely on a validating target resolver — or use \"doh\"/\"doq\" for client-side \
+                 DNSSEC validation."
+                    .to_string(),
+            ));
+        }
+    } else if cfg.upstream.odoh_proxy.is_some() {
+        // An odoh_proxy set without protocol = "odoh" would be silently
+        // ignored; the operator almost certainly meant to enable ODoH. Reject
+        // rather than quietly drop the proxy (and the anonymity it implies).
         return Err(crate::RustyDnsError::Config(
-            "upstream.protocol = \"odoh\" (Oblivious DoH, RFC 9230) is not yet implemented in \
-             this build. The schema is reserved so a future config is forward-compatible, but \
-             enabling it today would NOT provide the anonymity it implies — and rustydns will \
-             never silently fall back to plain DoH (that would de-anonymise you). Use \"doh\" or \
-             \"doq\" until ODoH ships. Tracked in docs/roadmap.md §7.3."
+            "upstream.odoh_proxy is set but upstream.protocol is not \"odoh\". The oblivious \
+             proxy is only used by the ODoH arm; set protocol = \"odoh\" or remove odoh_proxy."
                 .to_string(),
         ));
     }
@@ -1589,8 +1612,7 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                     return Err(crate::RustyDnsError::Config(format!(
                         "upstream.routes[{idx}].protocol = \"odoh\" is not supported — ODoH (RFC \
                          9230) applies only to the global upstream (it needs upstream.odoh_proxy), \
-                         not to a conditional-forwarding route. (Also, ODoH is not yet \
-                         implemented — see docs/roadmap.md §7.3.)"
+                         not to a conditional-forwarding route."
                     )));
                 }
             }
@@ -2109,7 +2131,7 @@ mod tests {
         validate_config(&cfg).expect("bare host:port with plain protocol must validate");
     }
 
-    // --- ODoH scaffolding (TODO 7.3) — reserved schema, fail-closed -----
+    // --- ODoH (RFC 9230) — implemented oblivious upstream arm (TODO 7.3) ----
 
     #[test]
     fn protocol_odoh_without_proxy_rejected() {
@@ -2139,14 +2161,40 @@ mod tests {
     }
 
     #[test]
-    fn protocol_odoh_well_formed_still_rejected_not_implemented() {
-        // Even a perfectly-shaped ODoH config is rejected fail-closed: the arm
-        // is not wired and we must never fall back to plain DoH.
+    fn protocol_odoh_with_dnssec_validation_rejected() {
+        // ODoH does not do client-side DNSSEC validation; we refuse to imply a
+        // guarantee we don't provide rather than silently ignore the flag.
         let mut cfg = baseline();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
         cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
-        assert_config_err(validate_config(&cfg), "not yet implemented");
+        cfg.upstream.dnssec_validation = true;
+        assert_config_err(
+            validate_config(&cfg),
+            "dnssec_validation = true is not supported",
+        );
+    }
+
+    #[test]
+    fn protocol_odoh_well_formed_accepted() {
+        // A correctly-shaped ODoH config (https target + https proxy +
+        // dnssec_validation off) now validates — the oblivious arm is wired.
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Odoh;
+        cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
+        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        cfg.upstream.dnssec_validation = false;
+        validate_config(&cfg).expect("well-formed ODoH config must validate");
+    }
+
+    #[test]
+    fn odoh_proxy_without_odoh_protocol_rejected() {
+        // A stray odoh_proxy on a doh/doq config is a misconfig — the proxy
+        // would be silently ignored. Reject so the operator notices.
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Doh;
+        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        assert_config_err(validate_config(&cfg), "odoh_proxy is set but");
     }
 
     #[test]

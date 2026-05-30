@@ -13,7 +13,7 @@
 //! |---------|-----|---------|------------|--------|
 //! | DNS-over-HTTPS upstream | RFC 8484 | ✓ | `upstream.protocol = "doh"` | implemented |
 //! | DNS-over-QUIC upstream | RFC 9250 | opt-in | `upstream.protocol = "doq"` | implemented (via hickory `quic-ring` feature → `NameServerConfig::quic`) |
-//! | Oblivious DoH upstream | RFC 9230 | opt-in | `upstream.protocol = "odoh"` | **scaffolded** — schema reserved (`+ upstream.odoh_proxy`); rejected at startup (fail-closed, never plain-DoH fallback). See `docs/roadmap.md` §ODoH. |
+//! | Oblivious DoH upstream | RFC 9230 | opt-in | `upstream.protocol = "odoh"` | implemented — HPKE via `odoh-rs`, relayed through `upstream.odoh_proxy`; fail-closed, no client-side DNSSEC. See the [`odoh`] module. |
 //! | TLS 1.3 minimum | RFC 8446 | ✓ | `upstream.min_tls_version = "1.3"` | implemented |
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
@@ -68,6 +68,8 @@ use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use rustydns_core::RustyDnsError;
 use rustydns_core::config::{DnsConfig, TlsVersion, UpstreamProtocol};
 use rustydns_core::record::{DnsRecord, RecordData};
+
+mod odoh;
 
 /// Result type for resolver operations.
 pub type ResolverResult<T> = Result<T, RustyDnsError>;
@@ -141,17 +143,32 @@ struct RouteArm {
 /// (longest-suffix wins, case-insensitive); the matching arm forwards
 /// the query. Unmatched qnames go to the default arm. See the
 /// [`UpstreamConfig::routes`] doc for the model and
-/// `Resolver::select_arm` for the dispatch rules.
+/// `Resolver::match_route` for the dispatch rules.
 ///
 /// [`UpstreamConfig::routes`]: rustydns_core::config::UpstreamConfig::routes
 #[derive(Debug)]
 pub struct Resolver {
     config: DnsConfig,
-    default: ResolverArm,
+    default: DefaultArm,
     /// Routes, sorted longest-zone-first so first-match-wins is also
     /// longest-match-wins (`foo.corp.internal.` prefers a `corp.internal.`
     /// route over a `internal.` route).
+    ///
+    /// Routes are always hickory arms — ODoH is offered only on the global
+    /// default (it needs `upstream.odoh_proxy`), never on a route.
     routes: Vec<RouteArm>,
+}
+
+/// The global default upstream arm. Either a standard hickory-resolver arm
+/// (doh/doq/plain) or the oblivious ODoH arm. Routes are never ODoH.
+///
+/// Both variants are boxed: a `TokioResolver` and an `OdohArm` differ a lot in
+/// size, and boxing keeps the enum (stored once in [`Resolver`]) pointer-sized.
+/// The extra indirection is a one-time allocation at startup, not per query.
+#[derive(Debug)]
+enum DefaultArm {
+    Hickory(Box<ResolverArm>),
+    Odoh(Box<odoh::OdohArm>),
 }
 
 impl Resolver {
@@ -208,24 +225,23 @@ impl Resolver {
             ));
         }
 
-        // ODoH (RFC 9230) is scaffolded but NOT implemented (TODO 7.3).
-        // Fail closed here as a second line of defence behind validate_config:
-        // building any arm for protocol=odoh would resolve over plain DoH and
-        // silently de-anonymise the operator. Never do that.
-        if config.upstream.protocol == UpstreamProtocol::Odoh {
-            return Err(RustyDnsError::Config(
-                "upstream.protocol = \"odoh\" (Oblivious DoH, RFC 9230) is not yet implemented. \
-                 Refusing to start rather than fall back to plain DoH, which would de-anonymise \
-                 you. Use \"doh\" or \"doq\". See docs/roadmap.md §7.3."
-                    .to_string(),
-            ));
-        }
-
         if config.upstream.protocol == UpstreamProtocol::Plain {
             tracing::warn!(
                 "upstream.protocol = \"plain\" — DNS queries will be sent UNENCRYPTED over UDP/TCP \
                  port 53. Every resolved domain name leaks to any observer on the network path. \
                  Switch to \"doh\" or \"doq\" for any deployment where privacy matters."
+            );
+        }
+        if config.upstream.protocol == UpstreamProtocol::Odoh {
+            // Honest, one-time disclosure of the ODoH posture: the anonymity is
+            // real, but it hinges on proxy/target independence, and this arm
+            // does NOT do client-side DNSSEC validation.
+            tracing::warn!(
+                "upstream.protocol = \"odoh\" — queries are oblivious (the target never sees your \
+                 client IP, the proxy never sees your query). Two caveats: this arm does NOT \
+                 perform client-side DNSSEC validation (integrity rests on a validating target), \
+                 and the anonymity guarantee holds ONLY if upstream.odoh_proxy is operated \
+                 independently of the target."
             );
         }
         for r in &config.upstream.routes {
@@ -246,15 +262,37 @@ impl Resolver {
         let tls_client_config =
             build_tls_client_config(config.upstream.min_tls_version, test_roots)?;
 
-        // Default arm — the global upstream list.
-        let default = build_resolver_arm(
-            "default",
-            &config.upstream.resolvers,
-            config.upstream.protocol,
-            tls_client_config.clone(),
-            &config,
-        )
-        .await?;
+        // Default arm — ODoH gets the oblivious arm; everything else a hickory
+        // arm over the global upstream list. The ODoH arm fetches the target
+        // config lazily on first query (no startup network dependency on the
+        // target), so construction is synchronous and cannot block boot.
+        let default = if config.upstream.protocol == UpstreamProtocol::Odoh {
+            // Defence in depth behind validate_config: the oblivious arm does no
+            // client-side DNSSEC validation, so refuse to build it with
+            // dnssec_validation on rather than silently ignore the flag.
+            if config.upstream.dnssec_validation {
+                return Err(RustyDnsError::Config(
+                    "upstream.protocol = \"odoh\" requires upstream.dnssec_validation = false — \
+                     the oblivious arm does not perform client-side DNSSEC validation."
+                        .to_string(),
+                ));
+            }
+            DefaultArm::Odoh(Box::new(
+                odoh::OdohArm::new(&config, test_roots)
+                    .map_err(|e| RustyDnsError::Config(e.to_string()))?,
+            ))
+        } else {
+            DefaultArm::Hickory(Box::new(
+                build_resolver_arm(
+                    "default",
+                    &config.upstream.resolvers,
+                    config.upstream.protocol,
+                    tls_client_config.clone(),
+                    &config,
+                )
+                .await?,
+            ))
+        };
 
         // Per-route arms. A route that fails to bootstrap any upstream
         // aborts startup: silent fallback to the default arm would let
@@ -341,13 +379,35 @@ impl Resolver {
     pub async fn resolve(&self, name: &str, qtype: &str) -> ResolverResult<ResolveOutcome> {
         let record_type = parse_record_type(qtype)?;
 
-        let (arm, on_default) = self.select_arm(name);
-
         // PRIVACY: qname only at debug level. See module-level doc.
         // The matched zone is operator-configured (not user-controlled)
         // and therefore safe to log at debug too.
         tracing::debug!(qname = name, qtype = %record_type, "resolving via upstream");
 
+        // Conditional-forwarding routes (always hickory arms) take precedence.
+        if let Some(route) = self.match_route(name) {
+            return self
+                .resolve_via_hickory(&route.arm, name, record_type, false)
+                .await;
+        }
+        // Otherwise the global default — a hickory arm or the oblivious ODoH arm.
+        match &self.default {
+            DefaultArm::Hickory(arm) => {
+                self.resolve_via_hickory(arm, name, record_type, true).await
+            }
+            DefaultArm::Odoh(arm) => self.resolve_via_odoh(arm, name, record_type).await,
+        }
+    }
+
+    /// The hickory-arm resolution path (default or a route). `on_default` gates
+    /// the rebinding defence — only default-arm answers are rdata-filtered.
+    async fn resolve_via_hickory(
+        &self,
+        arm: &ResolverArm,
+        name: &str,
+        record_type: RecordType,
+        on_default: bool,
+    ) -> ResolverResult<ResolveOutcome> {
         match arm.inner.lookup(name, record_type).await {
             Ok(lookup) => {
                 let mut records = lookup_to_dns_records(lookup.answers());
@@ -372,35 +432,59 @@ impl Resolver {
         }
     }
 
-    /// Pick the [`ResolverArm`] that should handle `name`.
+    /// The oblivious ODoH resolution path (global default only). On any ODoH
+    /// failure we fail closed exactly like the hickory arm — never falling back
+    /// to a less-private transport, which would de-anonymise the operator.
+    async fn resolve_via_odoh(
+        &self,
+        arm: &odoh::OdohArm,
+        name: &str,
+        record_type: RecordType,
+    ) -> ResolverResult<ResolveOutcome> {
+        match arm
+            .resolve(name, record_type, self.config.upstream.block_private_rdata)
+            .await
+        {
+            Ok(outcome) => {
+                tracing::trace!(
+                    qtype = %record_type,
+                    count = outcome.records.len(),
+                    dropped = outcome.private_rdata_dropped,
+                    "ODoH answer"
+                );
+                Ok(outcome)
+            }
+            Err(e) => {
+                tracing::warn!(kind = e.kind_label(), "ODoH upstream resolution failed");
+                tracing::debug!(error = %e, "ODoH upstream resolution failed (full)");
+                if self.config.upstream.fail_closed {
+                    Err(RustyDnsError::AllUpstreamsFailed)
+                } else {
+                    Err(RustyDnsError::Resolver(format!("odoh:{}", e.kind_label())))
+                }
+            }
+        }
+    }
+
+    /// Find the conditional-forwarding route for `name`, if any.
     ///
     /// Routes are pre-sorted longest-zone-first; the first route whose
-    /// normalised zone is a suffix of (or equal to) the normalised qname
-    /// wins. If nothing matches the default arm is returned.
-    ///
-    /// Returns the chosen arm AND a boolean that is `true` iff the default
-    /// arm was selected. The default-vs-route distinction matters for the
-    /// rebinding defence — only default-arm responses are filtered.
-    ///
-    /// When no routes are configured this short-circuits without any
-    /// allocation — the hot path for the typical operator (global DoH
-    /// only) is unchanged from pre-routes.
-    fn select_arm(&self, name: &str) -> (&ResolverArm, bool) {
+    /// normalised zone is a suffix of (or equal to) the normalised qname wins.
+    /// Returns `None` when no routes are configured (the common case — global
+    /// upstream only) without allocating.
+    fn match_route(&self, name: &str) -> Option<&RouteArm> {
         if self.routes.is_empty() {
-            return (&self.default, true);
+            return None;
         }
-        // Normalise once per query: lowercase + trailing dot so the
-        // suffix match is a single ends_with call.
+        // Normalise once per query: lowercase + trailing dot so the suffix
+        // match is a single ends_with call.
         let mut lower = name.to_ascii_lowercase();
         if !lower.ends_with('.') {
             lower.push('.');
         }
-        for r in &self.routes {
-            if lower == r.zone_with_dot || lower.ends_with(&r.dotted_suffix) {
-                return (&r.arm, false);
-            }
-        }
-        (&self.default, true)
+        self.routes
+            .iter()
+            .find(|r| lower == r.zone_with_dot || lower.ends_with(&r.dotted_suffix))
     }
 
     /// Translate a hickory `NetError` into a `RustyDnsError`.
@@ -590,8 +674,9 @@ fn default_port(scheme: &str, protocol: UpstreamProtocol) -> u16 {
             UpstreamProtocol::Doh => 443,
             UpstreamProtocol::Doq => 853,
             UpstreamProtocol::Plain => 53,
-            // ODoH targets are https — but ODoH is rejected before we get
-            // here (see `Resolver::new_internal`); this is for exhaustiveness.
+            // ODoH targets are https (443). The global ODoH arm parses its own
+            // URLs in `odoh::OdohTarget`; this is only reached on the rejected
+            // odoh-on-route path, kept for exhaustiveness.
             UpstreamProtocol::Odoh => 443,
         },
     }
@@ -720,13 +805,16 @@ async fn build_name_servers(
             ),
             UpstreamProtocol::Doq => NameServerConfig::quic(ip, server_name.clone()),
             UpstreamProtocol::Plain => NameServerConfig::udp_and_tcp(ip),
-            // Fail-closed: ODoH is a parallel arm that does NOT go through
-            // hickory's NameServerConfig. It must never be coerced into a
-            // plain DoH NameServerConfig (that would de-anonymise). Reject.
+            // Fail-closed: ODoH is a parallel arm ([`odoh::OdohArm`]) that does
+            // NOT go through hickory's NameServerConfig. It is only ever the
+            // global default; reaching here means protocol=odoh on a *route*,
+            // which `validate_config` rejects. Never coerce it into a plain DoH
+            // NameServerConfig (that would de-anonymise).
             UpstreamProtocol::Odoh => {
                 return Err(RustyDnsError::Resolver(
-                    "ODoH (RFC 9230) is not yet implemented; protocol=odoh must not build an \
-                     upstream arm. This should have been rejected by validate_config."
+                    "protocol = \"odoh\" is only supported on the global upstream, not on a \
+                     conditional-forwarding route. This should have been rejected by \
+                     validate_config."
                         .to_string(),
                 ));
             }
@@ -755,7 +843,7 @@ fn parse_record_type(qtype: &str) -> ResolverResult<RecordType> {
         .map_err(|_| RustyDnsError::Resolver(format!("unsupported record type `{qtype}`")))
 }
 
-fn lookup_to_dns_records(records: &[Record]) -> Vec<DnsRecord> {
+pub(crate) fn lookup_to_dns_records(records: &[Record]) -> Vec<DnsRecord> {
     records.iter().filter_map(record_to_dns_record).collect()
 }
 
@@ -806,7 +894,7 @@ fn rdata_to_record_data(rdata: &RData) -> Option<RecordData> {
 /// can't host the rebinding attack. The defence is enforced at the IP level
 /// because that is what a browser actually binds to after following any
 /// CNAME chain.
-fn filter_private_rdata(records: &mut Vec<DnsRecord>) -> u32 {
+pub(crate) fn filter_private_rdata(records: &mut Vec<DnsRecord>) -> u32 {
     let before = records.len();
     records.retain(|r| match &r.data {
         RecordData::A(ip) => !is_private_or_internal_v4(ip),
@@ -937,7 +1025,7 @@ mod tests {
     // without standing up real hickory resolvers, so they're fast and
     // don't need network.
 
-    /// Mirror the matching logic from `Resolver::select_arm` for unit
+    /// Mirror the matching logic from `Resolver::match_route` for unit
     /// testing. Keep this in sync with that function — if either drifts
     /// the routing behaviour drifts with it.
     fn zone_matches(qname: &str, zone_with_dot: &str) -> bool {
@@ -1152,7 +1240,7 @@ mod tests {
 
     /// Independent of any real hickory build, prove that the
     /// longest-zone-first sort order produces the expected dispatch.
-    /// We model what `select_arm` does after the sort.
+    /// We model what `match_route` does after the sort.
     #[test]
     fn longest_zone_wins() {
         // Two routes — the more specific zone must win.
@@ -1400,20 +1488,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn odoh_protocol_rejected_at_new() {
-        // Fail-closed: even a well-shaped ODoH config must not build a resolver
-        // (it would otherwise resolve over plain DoH and de-anonymise).
+    async fn odoh_with_dnssec_validation_rejected_at_new() {
+        // Defence in depth behind validate_config: an ODoH config that also asks
+        // for client-side DNSSEC is refused at construction — the oblivious arm
+        // does not validate, and we never silently ignore the flag.
         let mut cfg = DnsConfig::default();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
         cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        cfg.upstream.dnssec_validation = true;
         let err = Resolver::new(cfg).await.unwrap_err();
         match err {
             RustyDnsError::Config(msg) => {
-                assert!(msg.contains("not yet implemented"), "msg={msg}")
+                assert!(msg.contains("dnssec_validation = false"), "msg={msg}")
             }
             other => panic!("expected Config, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn odoh_well_formed_builds_without_network() {
+        // A correctly-shaped ODoH config builds the oblivious arm. Construction
+        // is synchronous and fetches no config (that is lazy on first query),
+        // so this succeeds offline with an unreachable target/proxy.
+        let mut cfg = DnsConfig::default();
+        cfg.upstream.protocol = UpstreamProtocol::Odoh;
+        cfg.upstream.resolvers = vec!["https://odoh.invalid/dns-query".to_string()];
+        cfg.upstream.odoh_proxy = Some("https://proxy.invalid/".to_string());
+        cfg.upstream.dnssec_validation = false;
+        Resolver::new(cfg)
+            .await
+            .expect("well-formed ODoH config must build the oblivious arm");
     }
 
     #[tokio::test]

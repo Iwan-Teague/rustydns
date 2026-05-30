@@ -21,6 +21,16 @@ thiserror        = { workspace = true }
 rustls           = { workspace = true }
 webpki-roots     = "1"
 rustls-pki-types.workspace = true
+# Oblivious DoH (RFC 9230) upstream arm: HPKE via odoh-rs, the HTTPS relay
+# hop via reqwest (rustls, TLS floor honoured), bytes for odoh-rs (de)serialise,
+# arc-swap for the lazily-fetched-and-refreshable ODoHConfig cache.
+odoh-rs          = { workspace = true }
+bytes            = { workspace = true }
+reqwest          = { workspace = true }
+arc-swap         = { workspace = true }
+# hpke 0.13 (via odoh-rs) needs a rand_core-0.9 CSPRNG; the workspace pins
+# rand 0.8 (a different, incompatible major) for other crates, so pin 0.9 here.
+rand             = "0.9"
 
 [dev-dependencies]
 tokio        = { workspace = true }

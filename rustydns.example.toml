@@ -61,7 +61,7 @@ resolvers = [
     "https://cloudflare-dns.com/dns-query",       # Cloudflare 1.1.1.1
 ]
 
-# Upstream protocol: "doh" (default), "doq", or "plain".
+# Upstream protocol: "doh" (default), "doq", "odoh", or "plain".
 # ⚠ SECURITY: "plain" sends DNS over unencrypted UDP/TCP. This leaks every
 #   resolved domain name to network observers (ISPs, on-path attackers).
 #   Using "plain" emits a startup warning and will become a hard error in a
@@ -69,18 +69,25 @@ resolvers = [
 # ⚠ The `protocol` value MUST match the scheme of every URL in `resolvers`:
 #   - "doh"   → all resolvers must start with `https://`
 #   - "doq"   → all resolvers must start with `quic://`  (e.g. "quic://dns.adguard-dns.com:853")
+#   - "odoh"  → all resolvers (the ODoH *targets*) must start with `https://`
 #   - "plain" → all resolvers must be bare `host:port` (no scheme), e.g. "1.1.1.1:53"
 #   The daemon refuses to start on a mismatch — caught at validate_config.
 #
-# "odoh" (Oblivious DoH, RFC 9230) is RESERVED but NOT yet implemented. The
-# schema below (protocol = "odoh" + odoh_proxy) is accepted so a future config
-# is forward-compatible, but setting protocol = "odoh" today is REJECTED at
-# startup — rustydns will not silently fall back to plain DoH, which would
-# de-anonymise you. Leave it on "doh"/"doq" until ODoH ships.
+# "odoh" (Oblivious DoH, RFC 9230) is the strongest anonymity option: the query
+# is HPKE-encrypted to the target resolver and relayed through an oblivious
+# proxy (odoh_proxy below), so the target never learns your client IP and the
+# proxy never learns your query. Requirements when protocol = "odoh":
+#   - set odoh_proxy to an https:// proxy operated INDEPENDENTLY of the target
+#     (if one party runs both, it can correlate IP with query);
+#   - set dnssec_validation = false — the oblivious arm does NOT do client-side
+#     DNSSEC validation (you rely on a validating target instead). Use "doh"/"doq"
+#     if you want client-side DNSSEC.
+# On any failure the ODoH arm returns SERVFAIL; it never falls back to plain DoH.
 protocol = "doh"
 
-# Oblivious proxy URL for ODoH (reserved; only used once protocol = "odoh" is
-# implemented). Choose a proxy operationally independent from the target.
+# Oblivious proxy URL for ODoH. Required when protocol = "odoh"; ignored
+# otherwise (and rejected if set without protocol = "odoh"). Choose a proxy
+# operationally independent from the target resolver.
 # odoh_proxy = "https://odoh-proxy.example/proxy"
 
 # Return SERVFAIL when all upstreams fail.
