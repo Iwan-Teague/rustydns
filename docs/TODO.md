@@ -45,9 +45,21 @@ These live in `roadmap.md` too; repeated here for completeness. **Do not start**
 
 DoQ is supported **upstream** only; the daemon listens on UDP/TCP/DoT/DoH. An
 inbound DoQ server would round out the encrypted-transport story for clients
-that prefer QUIC. Gated on hickory exposing a server-side DoQ acceptor and a
-design pass for the live-handover model. Privileged-port caveat (§4 of
-`roadmap.md`) applies.
+that prefer QUIC.
+
+**Premise update (verified this session):** this is **no longer
+upstream-blocked**. `hickory-server 0.26` exposes
+`Server::register_quic_listener` / `register_quic_listener_and_tls_config`
+(behind the `quic-ring` feature, which the workspace currently enables only for
+`hickory-resolver`, not `hickory-server`). So it is now *implementable*, just
+unstarted. Remaining work: add `quic-ring` to the `hickory-server` dep (binary-
+size cost on Pi targets), a `server.doq_listen` config field requiring
+`tls_cert_path`/`tls_key_path` (mirror `dot_listen` validation), register the
+QUIC listener in `main.rs`, and a `quinn`-based DoQ handshake integration test
+(more plumbing than the tokio-rustls DoT test). DoQ runs on `:853` (privileged)
+so it is **restart-only** — the live-handover caveat (roadmap §3) applies. Left
+unstarted deliberately: it is a ⚪ feature whose binary-size cost + QUIC-client
+test burden aren't justified yet, not a blocked one.
 
 ---
 
@@ -120,7 +132,11 @@ matrix added to `docs/operator-endpoints.md`.)
   privileged sockets and pass the fds in, so the daemon never needs
   `CAP_NET_BIND_SERVICE` *and* could receive fresh fds on reload — closing the
   gap without weakening the capability posture. Needs a design pass + a
-  non-systemd story. See `docs/design-sighup-reload.md`.
+  non-systemd story. See `docs/design-sighup-reload.md`. **Left flagged (no
+  clean drop-in):** this is a from-scratch implementation (parse
+  `LISTEN_FDS`/`LISTEN_PID`, adopt pre-bound fds into the listener setup, ship a
+  `.socket` unit, and design a non-systemd fallback) — not a library feature
+  that can be wired in safely without that design pass. Deferred deliberately.
 - **7.2 ⚪ Per-qtype / per-rcode metrics** — useful for operators, but label
   cardinality + the privacy posture need care (never label by qname/client).
   Bounded label sets only.
