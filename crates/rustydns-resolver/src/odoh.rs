@@ -263,6 +263,11 @@ pub(crate) struct OdohArm {
     proxy_url: String,
     http: OdohHttp,
     randomize: bool,
+    /// Pad the oblivious query plaintext to a fixed block (RFC 8467 style) when
+    /// `privacy.upstream_padding` is set, so the encrypted query size no longer
+    /// leaks the exact query length. Unlike the doh/doq arms — where hickory
+    /// 0.26 can't pad — ODoH can, because odoh-rs pads the plaintext directly.
+    pad_queries: bool,
 }
 
 impl OdohArm {
@@ -294,6 +299,7 @@ impl OdohArm {
             proxy_url,
             http,
             randomize: config.privacy.randomize_upstream_selection,
+            pad_queries: config.privacy.upstream_padding,
         })
     }
 
@@ -354,7 +360,10 @@ impl OdohArm {
         let mut last_decrypt_err: Option<String> = None;
         for attempt in 0..2u8 {
             let config = self.config_for(target).await?;
-            let query = ObliviousDoHMessagePlaintext::new(query_wire, 0);
+            let query = ObliviousDoHMessagePlaintext::new(
+                query_wire,
+                query_padding(query_wire.len(), self.pad_queries),
+            );
             // Scope the (non-Send) ThreadRng so it is dropped before the
             // `.await` below — otherwise the resolve future would be !Send and
             // hickory's RequestHandler could not drive it.
@@ -471,6 +480,20 @@ fn build_http_client(
 /// Build the DNS query wire for `name`/`qtype`: recursion desired, a random
 /// 16-bit id, and crucially **no** EDNS Client Subnet and **no** DNSSEC `DO`
 /// bit (the oblivious arm does not do client-side validation).
+/// Number of zero pad bytes to append to the oblivious query plaintext so its
+/// length rounds up to the next 128-byte block (RFC 8467's recommended query
+/// block size). Returns 0 when padding is off or the length already lands on a
+/// block boundary. Quantising the plaintext length quantises the ciphertext
+/// length, so an observer can no longer read the exact query size off the wire.
+fn query_padding(msg_len: usize, pad: bool) -> usize {
+    const BLOCK: usize = 128;
+    if pad {
+        (BLOCK - (msg_len % BLOCK)) % BLOCK
+    } else {
+        0
+    }
+}
+
 fn build_query_wire(name: &str, qtype: RecordType) -> Result<Vec<u8>, OdohError> {
     let id: u16 = rand::random();
     let mut msg = Message::new(id, MessageType::Query, OpCode::Query);

@@ -123,12 +123,46 @@ impl MockRelay {
 
 /// Build an `OdohArm` wired to a mock target (no reqwest, no TLS).
 fn arm_with_mock(mode: MockMode) -> OdohArm {
+    arm_with_mock_opts(mode, false)
+}
+
+fn arm_with_mock_opts(mode: MockMode, pad_queries: bool) -> OdohArm {
     let target = OdohTarget::parse("https://target.test/dns-query").expect("parse target");
     OdohArm {
         targets: vec![target],
         proxy_url: "https://proxy.test/".to_string(),
         http: OdohHttp::Mock(Arc::new(MockRelay::new(mode))),
         randomize: false,
+        pad_queries,
+    }
+}
+
+#[test]
+fn query_padding_rounds_up_to_128_byte_blocks() {
+    assert_eq!(query_padding(0, true), 0);
+    assert_eq!(query_padding(1, true), 127);
+    assert_eq!(query_padding(100, true), 28);
+    assert_eq!(query_padding(128, true), 0);
+    assert_eq!(query_padding(129, true), 127);
+    // Off → never pads, regardless of length.
+    assert_eq!(query_padding(1, false), 0);
+    assert_eq!(query_padding(200, false), 0);
+}
+
+#[tokio::test]
+async fn odoh_padded_query_still_round_trips() {
+    // With upstream_padding on, the query plaintext is padded to a 128-byte
+    // block; the target must still decrypt it and answer correctly (odoh-rs
+    // strips the zero padding on the server side).
+    let arm = arm_with_mock_opts(MockMode::AnswerA(Ipv4Addr::new(203, 0, 113, 11)), true);
+    let outcome = arm
+        .resolve("padded.example.", RecordType::A, false)
+        .await
+        .expect("padded oblivious round-trip should succeed");
+    assert_eq!(outcome.records.len(), 1);
+    match &outcome.records[0].data {
+        RecordData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 11)),
+        other => panic!("expected an A record, got {other:?}"),
     }
 }
 

@@ -135,11 +135,17 @@ async fn main() -> Result<()> {
              The setting is honoured the moment hickory exposes it."
         );
     }
-    if config.privacy.upstream_padding {
+    // ODoH pads the oblivious query itself (odoh-rs pads the plaintext), so the
+    // "not applied" caveat is true only for the doh/doq/plain arms, where
+    // hickory 0.26 can't yet pad.
+    if config.privacy.upstream_padding
+        && config.upstream.protocol != rustydns_core::config::UpstreamProtocol::Odoh
+    {
         warn!(
             "privacy.upstream_padding is enabled in config but hickory 0.26 does not \
              yet apply RFC 8467 DoH padding — encrypted query sizes still leak which \
-             domain was queried. The setting is honoured the moment hickory exposes it."
+             domain was queried. The setting is honoured the moment hickory exposes it \
+             (it IS already applied on the \"odoh\" arm)."
         );
     }
 

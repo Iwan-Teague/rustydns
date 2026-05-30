@@ -41,9 +41,13 @@ marker to the code or doc it relates to**, so no item lives only in one place.
 
 - **What:** pad encrypted query payloads to 128-byte blocks so packet size
   doesn't leak the domain.
-- **Blocker:** hickory 0.26 does not apply RFC 8467 padding to DoH bodies.
+- **Blocker:** hickory 0.26 does not apply RFC 8467 padding to DoH/DoQ bodies.
+  **Already done on the ODoH arm**, though — `privacy.upstream_padding` pads the
+  oblivious query plaintext directly via odoh-rs (see §ODoH). This item now
+  tracks only the doh/doq arms.
 - **Scaffolding:** `PrivacyConfig::upstream_padding` (default `true`) — same
-  startup-warn pattern as qmin.
+  startup-warn pattern as qmin (the warning is suppressed when `protocol =
+  "odoh"`, where padding is actually applied).
 - **Doc mentions:** `docs/architecture.md` resolver table; `docs/security.md`
   §"Query Padding (RFC 8467) — pending"; resolver crate doc; `example.toml`.
 
@@ -110,8 +114,11 @@ A few fields remain restart-only **by design**, not for lack of work:
 - **Status: SHIPPED.** Implemented in `crates/rustydns-resolver/src/odoh.rs` as
   a **parallel upstream arm bypassing `hickory-resolver`** (`DefaultArm::Odoh`).
   The arm re-applies the rustydns invariants itself: **fail-closed → SERVFAIL**
-  (never a plain-DoH or direct-target fallback), **no ECS**, and the
-  **rebinding-defence rdata filter**. HPKE is `odoh-rs` (Cloudflare, BSD-2,
+  (never a plain-DoH or direct-target fallback), **no ECS**, the
+  **rebinding-defence rdata filter**, and **RFC 8467 query padding** (honours
+  `privacy.upstream_padding`, padding the plaintext to 128-byte blocks — the one
+  arm where that knob applies, since hickory can't pad doh/doq). HPKE is
+  `odoh-rs` (Cloudflare, BSD-2,
   `hpke` 0.13); the DNS wire stays `hickory-proto`; the relay hop is `reqwest`
   with the TLS-version floor + `https_only`. The target's `ObliviousDoHConfig`
   is fetched lazily from `/.well-known/odohconfigs` and cached (refreshed on a
@@ -126,8 +133,8 @@ A few fields remain restart-only **by design**, not for lack of work:
   error, relay-failure → error, undecodable → error, rebinding filter, config
   caching. `cargo deny` is clean for the new crypto deps.
 - **Future enhancements (not blocking):** client-side DNSSEC over the oblivious
-  arm; multiple independent proxies / rotation; padding the oblivious query when
-  `privacy.upstream_padding` is set; pinning the target config in `[upstream]`.
+  arm; multiple independent proxies / rotation; pinning the target config in
+  `[upstream]` instead of fetching `/.well-known`.
 - **Doc mentions:** `docs/security.md` §"Oblivious DoH"; `docs/architecture.md`
   resolver table; `crates/rustydns-resolver/src/lib.rs` crate-level table;
   `rustydns.example.toml` `[upstream]` block; `docs/TODO.md` §7.3.

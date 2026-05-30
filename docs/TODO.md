@@ -31,7 +31,9 @@ These live in `roadmap.md` too; repeated here for completeness. **Do not start**
   already in place. Adopt when hickory ships it. Files:
   `crates/rustydns-resolver/src/lib.rs`, `crates/rustydnsd/src/main.rs`.
 - **1.2 🟠 RFC 8467 DoH/DoQ padding** — same situation; hickory doesn't pad
-  bodies. Scaffolding (`upstream_padding` + warning) present.
+  doh/doq bodies. Scaffolding (`upstream_padding` + warning) present. **Now
+  applied on the ODoH arm** (§7.3) — odoh-rs pads the oblivious plaintext to
+  128-byte blocks; this item tracks only the remaining doh/doq arms.
 - **2.1 🟠 NodeId-keyed `[[policy]]` matching** — needs `rustynetd` to expose a
   `SocketAddr → NodeId` peer-table lookup at query time. `NodePolicy::node_id`
   is parsed/validated and a startup warning fires for inert entries. Files:
@@ -173,6 +175,9 @@ matrix added to `docs/operator-endpoints.md`.)
     failure — config fetch, encrypt, relay, decrypt, DNS parse, target
     SERVFAIL/REFUSED — returns SERVFAIL; **never** falls back to plain DoH or the
     target directly); **no ECS**; **rebinding defence** (private rdata stripped);
+    **RFC 8467 query padding** (honours `privacy.upstream_padding` — odoh-rs pads
+    the plaintext to 128-byte blocks, so the ciphertext size no longer leaks the
+    query length; this is the one arm where the padding knob actually applies);
     NXDOMAIN vs NODATA from the decrypted rcode. Key rotation is handled by
     clearing the cached config and retrying once on a decrypt failure.
   - **DNSSEC:** the oblivious arm does **not** do *client-side* DNSSEC
@@ -192,8 +197,7 @@ matrix added to `docs/operator-endpoints.md`.)
     `odoh::build_http_client`. Docs: `docs/security.md`, `docs/architecture.md`,
     `docs/roadmap.md`, `rustydns.example.toml`. Supersedes §8.8.
   - **Future enhancements (not blocking):** client-side DNSSEC over the
-    oblivious arm; multiple independent proxies / proxy rotation; honouring
-    `privacy.upstream_padding` by padding the oblivious query; pinning the
+    oblivious arm; multiple independent proxies / proxy rotation; pinning the
     target `ODoHConfig` in config instead of fetching `/.well-known`.
 
 ---
