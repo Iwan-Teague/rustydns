@@ -103,10 +103,13 @@ test burden aren't justified yet, not a blocked one.
   named helpers for readability and unit-testability of each stage.
 - **5.2 🟡 `free_port()` race in integration tests** — `tests/sighup_reload.rs`
   binds `:0`, reads the port, drops, then lets the daemon rebind. Tiny TOCTOU;
-  acceptable on loopback but could flake under heavy parallelism. **Observed**
-  flaking once this session when a `cargo test --workspace` raced a concurrent
-  release build (passed in isolation). Could pass the bound listener fd via
-  systemd-style activation, or retry on bind failure.
+  acceptable on loopback but could flake under heavy parallelism. The *bigger*
+  flake — the daemon doing real network I/O at startup (default StevenBlack
+  fetch + DoH bootstrap) and `dns_responds` resolving a public name with a 1.5s
+  timeout — is now **fixed**: the test runs the daemon fully offline (empty
+  blocklist, plain bare-IP upstream, a local `probe.mesh` static record), so it
+  is deterministic and ~7× faster. The residual `free_port` TOCTOU itself
+  remains (could pass the bound fd via socket activation, or retry on bind).
 
 (5.3 done: systematic `unwrap()/expect()` audit across all network/parser paths
 — no reachable panic on attacker-controlled input; query-log mutex locks now
