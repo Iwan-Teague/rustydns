@@ -107,7 +107,8 @@ fn dns_responds(port: u16) -> bool {
     let Ok(sock) = UdpSocket::bind("127.0.0.1:0") else {
         return false;
     };
-    sock.set_read_timeout(Some(Duration::from_millis(1500))).ok();
+    sock.set_read_timeout(Some(Duration::from_millis(1500)))
+        .ok();
     if sock.send_to(&bytes, ("127.0.0.1", port)).is_err() {
         return false;
     }
