@@ -90,6 +90,13 @@ pub struct ResolveOutcome {
     /// (operators route to internal resolvers precisely so they CAN
     /// return private addresses), or when the rebinding defence is off.
     pub private_rdata_dropped: u32,
+    /// `true` iff the upstream signalled that the name does **not exist**
+    /// (`NXDOMAIN`), as opposed to existing with no records of the requested
+    /// type (`NODATA`). The handler emits `NXDomain` vs `NoError`
+    /// accordingly. Only ever set on the empty-answer path — a successful
+    /// lookup with records, or one where the rebinding defence stripped every
+    /// record (the name *does* exist), leaves this `false`.
+    pub nxdomain: bool,
 }
 
 /// A single resolver instance — one hickory `TokioResolver` plus its bound
@@ -343,6 +350,8 @@ impl Resolver {
                 Ok(ResolveOutcome {
                     records,
                     private_rdata_dropped: dropped,
+                    // A successful lookup is NoError/NODATA — never NXDOMAIN.
+                    nxdomain: false,
                 })
             }
             Err(e) => self.map_resolve_error(arm, e),
@@ -382,9 +391,12 @@ impl Resolver {
 
     /// Translate a hickory `NetError` into a `RustyDnsError`.
     fn map_resolve_error(&self, arm: &ResolverArm, e: NetError) -> ResolverResult<ResolveOutcome> {
-        // No records is not an upstream failure — return empty outcome.
-        if e.is_no_records_found() {
-            return Ok(ResolveOutcome::default());
+        // "No records" is not an upstream failure — return an empty outcome,
+        // distinguishing genuine NXDOMAIN (name does not exist) from NODATA
+        // (name exists, no records of this type) so the handler can emit the
+        // correct response code instead of collapsing both to NODATA.
+        if let Some(outcome) = no_records_outcome(&e) {
+            return Ok(outcome);
         }
         // qname is inside e.to_string() in some kinds; we log only the
         // error kind at warn level, never the full Display, to avoid
@@ -845,6 +857,26 @@ fn is_documentation_v6(ip: &Ipv6Addr) -> bool {
     s[0] == 0x2001 && s[1] == 0x0db8
 }
 
+/// Classify a hickory `NetError`: if it represents an upstream "no records"
+/// result, return an empty [`ResolveOutcome`] with `nxdomain` set to reflect
+/// whether the upstream said the name does **not exist** (`NXDOMAIN`) or
+/// exists with no records of the requested type (`NODATA`). Returns `None`
+/// for genuine upstream failures, which the caller maps to SERVFAIL under
+/// fail-closed.
+///
+/// This keeps the NODATA/NXDOMAIN decision in one pure, unit-testable place.
+fn no_records_outcome(e: &NetError) -> Option<ResolveOutcome> {
+    if e.is_no_records_found() {
+        Some(ResolveOutcome {
+            records: Vec::new(),
+            private_rdata_dropped: 0,
+            nxdomain: e.is_nx_domain(),
+        })
+    } else {
+        None
+    }
+}
+
 fn error_kind_label(e: &NetError) -> &'static str {
     // hickory 0.26 collapsed the old `ResolveErrorKind` into NetError
     // with semantic accessors. Map the common shapes back to the short
@@ -1278,6 +1310,53 @@ mod tests {
             RustyDnsError::Resolver(msg) => assert!(msg.contains("NOTAREALTYPE")),
             other => panic!("{other:?}"),
         }
+    }
+
+    // --- NODATA vs NXDOMAIN classification (TODO §2.3) ----------------
+
+    use hickory_proto::op::{Query, ResponseCode};
+    use hickory_resolver::net::{NetError, NoRecords};
+
+    fn no_records_error(rcode: ResponseCode) -> NetError {
+        let q = Query::query(
+            Name::from_ascii("does-not-exist.example.").unwrap(),
+            RecordType::A,
+        );
+        NoRecords::new(q, rcode).into()
+    }
+
+    #[test]
+    fn no_records_nxdomain_sets_flag() {
+        let outcome =
+            no_records_outcome(&no_records_error(ResponseCode::NXDomain)).expect("no-records");
+        assert!(
+            outcome.nxdomain,
+            "NXDOMAIN upstream must set the nxdomain flag"
+        );
+        assert!(outcome.records.is_empty());
+    }
+
+    #[test]
+    fn no_records_nodata_leaves_flag_clear() {
+        // NoError with no records = NODATA: name exists, no A records.
+        let outcome =
+            no_records_outcome(&no_records_error(ResponseCode::NoError)).expect("no-records");
+        assert!(
+            !outcome.nxdomain,
+            "NODATA (NoError, empty) must NOT set nxdomain"
+        );
+        assert!(outcome.records.is_empty());
+    }
+
+    #[test]
+    fn non_no_records_error_is_not_classified() {
+        // A genuine transport failure must NOT be treated as no-records —
+        // the caller maps it to SERVFAIL (fail-closed).
+        let e = NetError::NoConnections;
+        assert!(
+            no_records_outcome(&e).is_none(),
+            "transport failure must not become an empty Ok outcome"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

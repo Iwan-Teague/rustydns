@@ -60,6 +60,17 @@ impl MockUpstream {
     where
         F: Fn(&Name, RecordType) -> Vec<Record> + Send + Sync + 'static,
     {
+        // Default response code is NoError; delegate to the rcode-aware ctor.
+        Self::new_with_rcode(move |name, rtype| (ResponseCode::NoError, responder(name, rtype)))
+            .await
+    }
+
+    /// Like [`MockUpstream::new`], but the responder also chooses the
+    /// response code — used to drive NXDOMAIN vs NODATA classification.
+    async fn new_with_rcode<F>(responder: F) -> Self
+    where
+        F: Fn(&Name, RecordType) -> (ResponseCode, Vec<Record>) + Send + Sync + 'static,
+    {
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
         let addr = socket.local_addr().expect("local_addr");
         let queries_received = Arc::new(AtomicUsize::new(0));
@@ -85,14 +96,14 @@ impl MockUpstream {
                         let Some(question) = query.queries.first() else {
                             continue;
                         };
-                        let answers = responder(question.name(), question.query_type());
+                        let (rcode, answers) = responder(question.name(), question.query_type());
                         let mut resp = Message::new(
                             query.metadata.id,
                             MessageType::Response,
                             OpCode::Query,
                         );
                         resp.metadata.recursion_available = true;
-                        resp.metadata.response_code = ResponseCode::NoError;
+                        resp.metadata.response_code = rcode;
                         resp.add_query(question.clone());
                         for rec in answers {
                             resp.add_answer(rec);
@@ -384,6 +395,46 @@ async fn rebinding_defence_disabled_lets_private_through() {
         other => panic!("expected unfiltered private A, got {other:?}"),
     }
     assert_eq!(out.private_rdata_dropped, 0);
+}
+
+#[tokio::test]
+async fn nxdomain_upstream_sets_nxdomain_flag() {
+    // Upstream says the name does not exist (NXDOMAIN, no answers). The
+    // resolver must surface that as an empty outcome with nxdomain = true so
+    // the handler emits NXDomain rather than collapsing it to NODATA.
+    let mock = MockUpstream::new_with_rcode(|_, _| (ResponseCode::NXDomain, Vec::new())).await;
+
+    let cfg = plain_config(&mock.addr_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    let out = resolver
+        .resolve("does-not-exist.example.", "A")
+        .await
+        .expect("no-records is Ok, not an error");
+
+    assert!(out.records.is_empty(), "NXDOMAIN carries no answers");
+    assert!(out.nxdomain, "NXDOMAIN upstream must set the nxdomain flag");
+}
+
+#[tokio::test]
+async fn nodata_upstream_leaves_nxdomain_clear() {
+    // Upstream says the name exists but has no A records (NOERROR, no
+    // answers = NODATA). nxdomain must stay false → handler emits NoError.
+    let mock = MockUpstream::new_with_rcode(|_, _| (ResponseCode::NoError, Vec::new())).await;
+
+    let cfg = plain_config(&mock.addr_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    let out = resolver
+        .resolve("exists-no-a.example.", "A")
+        .await
+        .expect("NODATA is Ok");
+
+    assert!(out.records.is_empty());
+    assert!(
+        !out.nxdomain,
+        "NODATA (NoError, empty) must NOT set the nxdomain flag"
+    );
 }
 
 // `_unused_addr_string` is referenced indirectly via SocketAddr usage

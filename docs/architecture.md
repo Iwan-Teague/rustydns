@@ -144,6 +144,10 @@ The binary. Responsibilities:
                  (upstream.min_tls_version)
                - Validate DNSSEC on response (upstream.dnssec_validation)
                - On failure: SERVFAIL (fail_closed=true — there is no other mode)
+               - On "no records": the upstream's NXDOMAIN (name does not
+                 exist) vs NODATA (name exists, no records of this type) is
+                 preserved — the handler emits NXDomain or NoError
+                 accordingly rather than collapsing both to NODATA.
                - NOT yet applied: RFC 7816 query minimisation and RFC 8467
                  padding — hickory 0.26's stub resolver doesn't expose either,
                  and the daemon warns at startup if the matching privacy.*

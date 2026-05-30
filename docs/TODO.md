@@ -62,21 +62,6 @@ sandbox) is the mitigation. No code change needed.
 Files: `docs/operator-endpoints.md`, `docs/security.md`,
 `crates/rustydnsd/src/query_log.rs` (rationale already in module docs).
 
-### 2.3 🟡 Resolver conflates NODATA and NXDOMAIN — **M**
-
-`Resolver::resolve` maps both "no records" and "name does not exist" to
-`Ok(ResolveOutcome::default())` (empty), and the handler then always emits
-`NoError` (NODATA). A genuinely non-existent name is therefore returned as
-NODATA, not NXDOMAIN. This is **deliberate and documented**
-(`crates/rustydns-resolver/src/lib.rs:298`), but it is technically incorrect DNS
-and can weaken downstream negative caching. To fix: capture the upstream
-`response_code` from hickory's `NoRecordsFound` and thread an
-`nxdomain: bool` (or `ResponseCode`) through `ResolveOutcome` so the handler can
-emit the right code. Low security impact; correctness/interop nicety.
-
-Files: `crates/rustydns-resolver/src/lib.rs` (~line 386),
-`crates/rustydnsd/src/handler.rs` (resolver `Ok` arm).
-
 ### 2.4 🟡 Blocklist parser accepts non-ASCII domain bytes — **S**
 
 `validate_and_normalize` rejects control bytes but allows bytes ≥ 0x80, then

@@ -536,23 +536,26 @@ impl RequestHandler for DnsHandler {
                 self.metrics
                     .inc_private_rdata_dropped(out.private_rdata_dropped);
                 let answers = Self::dns_records_to_rrs(&out.records);
+                // Honour the upstream's NXDOMAIN vs NODATA distinction: a
+                // genuinely non-existent name returns NXDomain, not an empty
+                // NoError. The `answers.is_empty()` guard ensures we never
+                // emit NXDomain alongside records (defensive — the resolver
+                // only sets `nxdomain` on the empty-answer path).
+                let code = if out.nxdomain && answers.is_empty() {
+                    ResponseCode::NXDomain
+                } else {
+                    ResponseCode::NoError
+                };
                 self.log_query(
                     &policy,
                     &client,
                     &qname,
                     &qtype_str,
-                    ResponseCode::NoError,
+                    code,
                     ServedBy::Resolver,
                 );
-                self.respond(
-                    request,
-                    response_handle,
-                    builder,
-                    ResponseCode::NoError,
-                    false,
-                    answers,
-                )
-                .await
+                self.respond(request, response_handle, builder, code, false, answers)
+                    .await
             }
             Err(err) => {
                 self.metrics.inc_resolver_failures();
