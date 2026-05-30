@@ -242,6 +242,98 @@ Files: `crates/rustydnsd/src/handler.rs` (`PolicyDecision`, `resolve_policy`).
 
 ---
 
+## 8. Feature ideas from comparable projects
+
+Survey of Pi-hole, AdGuard Home, blocky, Technitium, and dnscrypt-proxy, scored
+against rustydns's hard constraints (no web UI, no database, hickory-only,
+privacy/security first, low-power). **rustydns already has** ad/tracker blocking
+(hosts / plain / RPZ / AdGuard list formats, allowlist, wildcards,
+NXDOMAIN/sinkhole/REFUSED responses, HTTPS-only sources, auto-reload),
+conditional forwarding, bounded LRU caching, DNSSEC, DoH/DoQ upstream + DoT/DoH
+inbound, randomised upstream selection, ECS stripping, per-client (IP) policy,
+rate limiting, and rebinding defence. The items below are what those projects
+have that we **don't**.
+
+### Worth adding (fits the constraints)
+
+- **8.1 🟠 Deep CNAME-chain blocking ("CNAME cloaking" defence) — M.** The single
+  best *ad-blocking* upgrade. Trackers evade QNAME blocklists by pointing
+  `metrics.example.com` at a CNAME like `c.tracker-adnetwork.net` (first-party
+  cloaking). We block only on the QNAME today, so these slip through. After the
+  resolver returns, walk the answer's CNAME chain and block (NXDOMAIN/sinkhole)
+  if any target is on the blocklist. blocky and AdGuard both do this. Pure logic,
+  no new deps, clear security/privacy win. Files: `crates/rustydnsd/src/handler.rs`
+  (resolver `Ok` arm), `crates/rustydns-blocklist`.
+- **8.2 🟠 DNS rewrite / local cloaking map — M.** A config-driven map that pins an
+  arbitrary external domain to a local answer: `example.com → 10.0.0.5`, or to
+  another name, or to NXDOMAIN. This is AdGuard's "DNS rewrites" and
+  dnscrypt-proxy's "cloaking" — one of the most-requested resolver features
+  (pin internal services, override a CDN, blackhole a domain without a list).
+  We have `static_records` for *authoritative* zones, but no rewrite for names
+  outside our zones. Slots into the pipeline right after authority, before
+  blocklist. Files: `config.rs` (new `[[rewrite]]`), `handler.rs`.
+- **8.3 🟠 Response-IP blocklists — M.** Block a query if its resolved A/AAAA is in
+  a configured IP/CIDR denylist (known malware C2, ad-network ranges). blocky
+  supports this. Complements the existing private-rdata rebinding defence (which
+  already strips RFC1918/loopback) by adding operator-supplied bad-IP ranges.
+  Files: `crates/rustydns-resolver` or `handler.rs` post-resolve, new blocklist
+  source kind.
+- **8.4 🟡 Safe Search enforcement — S/M.** A special case of 8.2: rewrite
+  `google.com`/`bing.com`/`youtube.com`/`duckduckgo.com` to their
+  `forcesafesearch.*` / `safe.*` variants (CNAME). AdGuard ships this as a
+  one-flag family feature. Cheap once 8.2 exists. Files: `config.rs`
+  (`[privacy] safe_search = true` or a `[safesearch]` block), `handler.rs`.
+- **8.5 🟡 Scheduled / time-window rules — M.** Per-client or per-domain block
+  schedules ("block social media 09:00–17:00", "kids' devices off after 22:00").
+  AdGuard has access schedules. Novel for a config-file resolver; extend
+  `[[policy]]` with optional `block_windows`. Keep it timezone-explicit. Files:
+  `config.rs` (`NodePolicy`), `handler.rs` (`resolve_policy`).
+- **8.6 🟡 Per-client blocklist groups — M.** Today `[[policy]]` toggles
+  bypass/zones per IP. blocky/AdGuard let you assign clients to named groups,
+  each with its own set of blocklists ("iot can only reach vendor domains",
+  "guest gets the strict list"). Extends the existing policy model rather than
+  adding a subsystem. Files: `config.rs`, `blocklist` engine (multiple named
+  sets), `handler.rs`.
+- **8.7 🟡 Regex / wildcard custom block rules — M (with ReDoS guard).** We have
+  exact + RPZ wildcard matching; blocky adds regex rules for power users. Useful
+  but must bound matching cost (anchored patterns, length caps, no catastrophic
+  backtracking — prefer a regex engine with linear guarantees like `regex`).
+  Files: `crates/rustydns-blocklist/src/{parser,engine}.rs`.
+
+### High anonymity value but likely blocked on upstream (hickory)
+
+- **8.8 ⚪ Oblivious DoH (ODoH, RFC 9230) upstream — L, likely upstream-blocked.**
+  The flagship anonymity feature and a direct fit for rustydns's "anonymity is
+  the #1 goal" mission. ODoH splits the path through a relay so the target
+  resolver never sees the client IP and the relay never sees the query. This is
+  dnscrypt-proxy's headline privacy mode. Needs hickory (or a vetted crate) to
+  expose an ODoH client; if absent, this joins qmin/padding in §1 as
+  upstream-blocked. Worth tracking precisely because it advances the core goal.
+
+### Deliberately out of scope (note the reason)
+
+- **DHCP server + auto DNS registration** (Technitium) — rustydns is a resolver,
+  not a DHCP server. Scope creep; AGENTS.md "what to avoid".
+- **Web UI / admin dashboard / 2FA HTTP API** (Pi-hole, AdGuard, Technitium) —
+  Rustyfin owns the UI; rustydns exposes only loopback `/metrics` `/health`
+  `/queries`. Hard "do not add a web UI" rule.
+- **Full from-scratch recursion / local root server** (Technitium, Unbound) — we
+  deliberately forward to a DoH/DoQ recursive; not a recursor.
+- **DNSCrypt protocol / Anonymized DNSCrypt relays** (dnscrypt-proxy) — would
+  need a non-hickory protocol library; violates "hickory only". (ODoH, 8.8, is
+  the in-family path to the same anonymity goal.)
+- **Serve-stale / stale-while-revalidate** (many) — conflicts with the
+  fail-closed security invariant; never return a stale answer silently.
+- **Statistics database / long-term query analytics** (Pi-hole FTL, AGH) — "no
+  database" invariant; query history stays in the bounded ring (+ opt-in hashed
+  on-disk log).
+
+> Recommended first pick: **8.1 (deep CNAME blocking)** — it's the highest-impact
+> ad-blocking gap, fits perfectly, and is a security/privacy win, not just a
+> convenience.
+
+---
+
 ## Done this session (for context — already shipped)
 
 - On-disk query log (roadmap 3.1); SIGHUP config reload Phase 1 + Phase 2 live
