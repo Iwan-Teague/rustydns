@@ -495,6 +495,21 @@ snapshot. Mitigations:
   whose `generated_at_unix` is older than `mesh_zone_max_age_secs`
   (default 600s), is rejected at load time. This limits the replay
   window for an attacker who captures an old signed bundle.
+- Anti-rollback / replay protection: freshness alone does not stop an
+  attacker who can write the bundle path from replaying an *older but
+  still-fresh* signed bundle (e.g. one generated 4 minutes ago, with
+  `mesh_zone_max_age_secs = 600`) to roll a name back to a previous IP or
+  drop a record — the signature still verifies because it is a legitimately
+  old bundle. The authority therefore tracks the last-applied
+  `(generated_at_unix, nonce)` in memory and **refuses any candidate that
+  orders strictly before it** (older `generated_at_unix`, or equal
+  `generated_at_unix` with a lower `nonce`). An identical bundle re-applies
+  idempotently (the periodic poller re-reads the same file every interval).
+  The watermark is in-memory only — the "no database" invariant stands — so
+  a process restart resets it to the freshly-loaded bundle's value; right
+  after boot the `mesh_zone_max_age_secs` freshness window is the backstop.
+  A rejected rollback keeps the previous trusted snapshot and is logged at
+  `warn!` plus the `rustydns_mesh_zone_reload_failure_total` metric.
 - Bundle file size cap of 256 KiB, enforced with a *capped reader* (reads
   at most the limit + 1 byte) rather than a `stat`-then-read — so a file
   swapped for a larger one between the size check and the read still cannot

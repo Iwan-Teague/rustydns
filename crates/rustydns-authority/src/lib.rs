@@ -44,7 +44,7 @@ pub use mesh::{LoadedBundle, MeshBundleError};
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -88,6 +88,23 @@ pub struct Authority {
     static_zones: Vec<String>,
     /// Atomically swappable snapshot of the merged static + mesh state.
     snapshot: ArcSwap<Snapshot>,
+    /// Anti-rollback watermark: the `(generated_at_unix, nonce)` of the most
+    /// recently *applied* mesh bundle, or `None` until the first is applied.
+    ///
+    /// A reload whose `(generated_at_unix, nonce)` orders strictly before
+    /// this is rejected as a rollback/replay (see [`Authority::reload_mesh`]).
+    /// Kept in-memory only — the "no database" invariant stands. A process
+    /// restart resets it to the freshly-loaded bundle's value, so the
+    /// `mesh_zone_max_age_secs` freshness window is the backstop right after
+    /// boot.
+    ///
+    /// Wrapped in a `Mutex` (not `ArcSwap`) so the watermark check and the
+    /// snapshot store happen atomically together: concurrent reloads (the
+    /// periodic poller racing a SIGHUP) cannot interleave such that an older
+    /// bundle's snapshot wins after a newer bundle already advanced the
+    /// watermark. The expensive signature verification runs *outside* this
+    /// lock; only the brief apply is serialised.
+    mesh_watermark: Mutex<Option<(u64, u64)>>,
 }
 
 impl Authority {
@@ -120,6 +137,9 @@ impl Authority {
         // Initial mesh-zone load. Failure is non-fatal.
         let mesh = load_mesh_if_configured(&config, &mesh_zone);
         let mesh_record_count = mesh.as_ref().map(|m| m.records.len()).unwrap_or(0);
+        // Seed the anti-rollback watermark from the bundle we just applied,
+        // so the very first `reload_mesh` already rejects an older bundle.
+        let mesh_watermark = mesh.as_ref().map(|m| (m.generated_at_unix, m.nonce));
 
         let snapshot = build_snapshot(&static_records, &static_zones, mesh.as_ref());
 
@@ -138,6 +158,7 @@ impl Authority {
             static_records,
             static_zones,
             snapshot: ArcSwap::from(Arc::new(snapshot)),
+            mesh_watermark: Mutex::new(mesh_watermark),
         })
     }
 
@@ -148,12 +169,31 @@ impl Authority {
     /// - `Ok(Some(count))` — bundle reloaded successfully, `count` mesh
     ///   records are now live.
     /// - `Ok(None)` — bundle is not configured; nothing to do.
+    /// - `Err(MeshBundleError::Rollback { .. })` — the candidate bundle is
+    ///   signature- and freshness-valid but orders strictly *before* the
+    ///   last-applied bundle, so it is rejected as a rollback/replay. The
+    ///   previous snapshot is **kept**.
     /// - `Err(_)` — bundle read or signature verification failed. The
     ///   previous snapshot is **kept** (caller decides whether to keep
     ///   running or shut down).
     ///
-    /// Lock-free: existing lookups in flight see the old snapshot until
-    /// they finish; new lookups after the swap see the new one.
+    /// # Anti-rollback / replay protection
+    ///
+    /// Signature + freshness checks alone do not stop an actor who can write
+    /// the bundle path (or cause a stale file to reappear) from replaying an
+    /// *older but still-fresh* signed bundle — one generated a few minutes
+    /// ago, within `mesh_zone_max_age_secs` — to roll a name back to a
+    /// previous IP or drop a record. The signature still verifies because it
+    /// is a legitimately old bundle. To close this, the authority refuses any
+    /// candidate whose `(generated_at_unix, nonce)` orders strictly before the
+    /// last-applied bundle's. An identical bundle (equal tuple) is allowed —
+    /// the periodic poller re-reads the same file every interval and that must
+    /// stay idempotent, not log a spurious rollback.
+    ///
+    /// Lock-free reads: existing lookups in flight see the old snapshot until
+    /// they finish; new lookups after the swap see the new one. The watermark
+    /// check + snapshot store are serialised under a `Mutex` so concurrent
+    /// reloads cannot apply an older snapshot after a newer one won.
     pub fn reload_mesh(&self) -> Result<Option<usize>, MeshBundleError> {
         let (bundle_path, key_path) = match (
             self.config.mesh_zone_bundle_path.as_ref(),
@@ -163,15 +203,52 @@ impl Authority {
             _ => return Ok(None),
         };
 
+        // Signature + freshness verification happens BEFORE taking the
+        // watermark lock — the expensive ed25519 check must not serialise
+        // with other reloads, and an attacker-supplied bundle never reaches
+        // the apply path if it fails to verify.
         let loaded = mesh::load_mesh_bundle(
             bundle_path,
             key_path,
             &self.mesh_zone,
             self.config.mesh_zone_max_age_secs,
         )?;
+        let candidate = (loaded.generated_at_unix, loaded.nonce);
+
+        // A poisoned watermark lock can only happen if a previous holder
+        // panicked mid-apply (which, with panic=abort in release, terminates
+        // the process). Recover the inner value rather than propagating the
+        // poison so a debug-build test panic doesn't wedge reloads forever.
+        let mut watermark = self
+            .mesh_watermark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some((cur_gen, cur_nonce)) = *watermark
+            && candidate < (cur_gen, cur_nonce)
+        {
+            tracing::warn!(
+                candidate_generated_at = loaded.generated_at_unix,
+                candidate_nonce = loaded.nonce,
+                current_generated_at = cur_gen,
+                current_nonce = cur_nonce,
+                "mesh bundle rejected as a rollback/replay — it is older than the currently \
+                 applied bundle. Keeping the previous snapshot. If this is a legitimate \
+                 re-key or clock reset, restart the daemon to reset the watermark."
+            );
+            return Err(MeshBundleError::Rollback {
+                candidate_generated_at: loaded.generated_at_unix,
+                candidate_nonce: loaded.nonce,
+                current_generated_at: cur_gen,
+                current_nonce: cur_nonce,
+            });
+        }
+
         let count = loaded.records.len();
         let snapshot = build_snapshot(&self.static_records, &self.static_zones, Some(&loaded));
         self.snapshot.store(Arc::new(snapshot));
+        *watermark = Some(candidate);
+        drop(watermark);
         tracing::info!(mesh_records = count, "mesh zone bundle reloaded");
         Ok(Some(count))
     }
@@ -891,7 +968,24 @@ mod tests {
     }
 
     /// Build a valid signed bundle and return (bundle_path, key_path).
+    /// Fresh `generated_at_unix = now`, `expires_at_unix = now + 600`, nonce 42.
     fn make_bundle(records: &[(&str, &str)], zone: &str) -> (PathBuf, PathBuf) {
+        let now = now_secs();
+        make_bundle_at(records, zone, now, now + 600, 42)
+    }
+
+    /// Build a signed bundle with explicit `generated_at_unix`,
+    /// `expires_at_unix`, and `nonce`. Always signs with the same key
+    /// (`[7u8; 32]`) so a second bundle written over the first still
+    /// verifies under the key the authority loaded at startup — exactly the
+    /// shape of a rollback/replay attempt.
+    fn make_bundle_at(
+        records: &[(&str, &str)],
+        zone: &str,
+        generated_at_unix: u64,
+        expires_at_unix: u64,
+        nonce: u64,
+    ) -> (PathBuf, PathBuf) {
         let signing = SigningKey::from_bytes(&[7u8; 32]);
         let verifier_hex: String = signing
             .verifying_key()
@@ -899,14 +993,13 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        let now = now_secs();
         let mut payload = String::new();
         payload.push_str("version=1\n");
         payload.push_str(&format!("zone_name={zone}\n"));
         payload.push_str("subject_node_id=test\n");
-        payload.push_str(&format!("generated_at_unix={now}\n"));
-        payload.push_str(&format!("expires_at_unix={}\n", now + 600));
-        payload.push_str("nonce=42\n");
+        payload.push_str(&format!("generated_at_unix={generated_at_unix}\n"));
+        payload.push_str(&format!("expires_at_unix={expires_at_unix}\n"));
+        payload.push_str(&format!("nonce={nonce}\n"));
         payload.push_str(&format!("record_count={}\n", records.len()));
         for (i, (label, ip)) in records.iter().enumerate() {
             payload.push_str(&format!("record.{i}.label={label}\n"));
@@ -1016,6 +1109,129 @@ mod tests {
     fn authority_reload_mesh_returns_none_when_unconfigured() {
         let auth = Authority::new(cfg(vec![])).unwrap();
         assert!(matches!(auth.reload_mesh(), Ok(None)));
+    }
+
+    // ----- Anti-rollback / replay protection (TODO §2.1 / §4.4) ----------
+
+    /// Helper: build an authority from a bundle path + key path.
+    fn auth_from(bundle_path: PathBuf, key_path: PathBuf) -> Authority {
+        Authority::new(AuthorityConfig {
+            mesh_zone_bundle_path: Some(bundle_path),
+            mesh_zone_verifier_key_path: Some(key_path),
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records: Vec::new(),
+            poll_interval_secs: 30,
+        })
+        .unwrap()
+    }
+
+    fn router_ip(auth: &Authority) -> String {
+        match &auth.lookup("router.mesh", "A").unwrap()[0].data {
+            RecordData::A(ip) => ip.to_string(),
+            other => panic!("expected A, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reload_mesh_rejects_rollback_to_older_bundle() {
+        // Apply bundle@T (newer), then attempt bundle@T-60 (older but still
+        // fresh, same signing key) → must be rejected, snapshot unchanged.
+        let now = now_secs();
+        let (bundle_path, key_path) =
+            make_bundle_at(&[("router", "100.64.0.9")], "mesh", now, now + 600, 5);
+        let auth = auth_from(bundle_path.clone(), key_path);
+        assert_eq!(router_ip(&auth), "100.64.0.9");
+
+        // Overwrite with an older bundle (generated_at = now-60). Still within
+        // the 600s freshness window, so signature + freshness both pass — only
+        // the anti-rollback watermark stops it.
+        let (older, _) =
+            make_bundle_at(&[("router", "100.64.0.1")], "mesh", now - 60, now + 600, 4);
+        std::fs::copy(&older, &bundle_path).unwrap();
+
+        let err = auth.reload_mesh().unwrap_err();
+        match err {
+            MeshBundleError::Rollback {
+                candidate_generated_at,
+                current_generated_at,
+                ..
+            } => {
+                assert_eq!(candidate_generated_at, now - 60);
+                assert_eq!(current_generated_at, now);
+            }
+            other => panic!("expected Rollback, got {other:?}"),
+        }
+
+        // Snapshot unchanged: still the NEWER value.
+        assert_eq!(router_ip(&auth), "100.64.0.9");
+    }
+
+    #[test]
+    fn reload_mesh_allows_identical_bundle_reapply() {
+        // The periodic poller re-reads the same file every interval. An
+        // identical (generated_at, nonce) must NOT be treated as a rollback —
+        // it re-applies idempotently.
+        let now = now_secs();
+        let (bundle_path, key_path) =
+            make_bundle_at(&[("router", "100.64.0.9")], "mesh", now, now + 600, 5);
+        let auth = auth_from(bundle_path, key_path);
+        // Reload the very same file — equal tuple, must succeed.
+        let count = auth.reload_mesh().expect("identical re-apply must succeed");
+        assert_eq!(count, Some(1));
+        assert_eq!(router_ip(&auth), "100.64.0.9");
+    }
+
+    #[test]
+    fn reload_mesh_rejects_same_generated_at_lower_nonce() {
+        // Same second, lower nonce → orders before → rollback.
+        let now = now_secs();
+        let (bundle_path, key_path) =
+            make_bundle_at(&[("router", "100.64.0.9")], "mesh", now, now + 600, 10);
+        let auth = auth_from(bundle_path.clone(), key_path);
+
+        let (lower_nonce, _) =
+            make_bundle_at(&[("router", "100.64.0.1")], "mesh", now, now + 600, 9);
+        std::fs::copy(&lower_nonce, &bundle_path).unwrap();
+
+        let err = auth.reload_mesh().unwrap_err();
+        assert!(matches!(err, MeshBundleError::Rollback { .. }), "{err:?}");
+        assert_eq!(router_ip(&auth), "100.64.0.9");
+    }
+
+    #[test]
+    fn reload_mesh_accepts_same_generated_at_higher_nonce() {
+        // Same second, higher nonce → orders after → accepted (a legitimate
+        // re-publish within the same wall-clock second).
+        let now = now_secs();
+        let (bundle_path, key_path) =
+            make_bundle_at(&[("router", "100.64.0.1")], "mesh", now, now + 600, 10);
+        let auth = auth_from(bundle_path.clone(), key_path);
+
+        let (higher_nonce, _) =
+            make_bundle_at(&[("router", "100.64.0.9")], "mesh", now, now + 600, 11);
+        std::fs::copy(&higher_nonce, &bundle_path).unwrap();
+
+        let count = auth.reload_mesh().expect("higher nonce must apply");
+        assert_eq!(count, Some(1));
+        assert_eq!(router_ip(&auth), "100.64.0.9");
+    }
+
+    #[test]
+    fn reload_mesh_accepts_newer_bundle() {
+        // The normal happy path: a genuinely newer bundle advances the zone.
+        let now = now_secs();
+        let (bundle_path, key_path) =
+            make_bundle_at(&[("router", "100.64.0.1")], "mesh", now - 300, now + 600, 1);
+        let auth = auth_from(bundle_path.clone(), key_path);
+        assert_eq!(router_ip(&auth), "100.64.0.1");
+
+        let (newer, _) = make_bundle_at(&[("router", "100.64.0.9")], "mesh", now, now + 600, 2);
+        std::fs::copy(&newer, &bundle_path).unwrap();
+
+        let count = auth.reload_mesh().expect("newer bundle must apply");
+        assert_eq!(count, Some(1));
+        assert_eq!(router_ip(&auth), "100.64.0.9");
     }
 
     #[test]

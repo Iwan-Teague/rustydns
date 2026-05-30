@@ -109,6 +109,30 @@ pub enum MeshBundleError {
         reason: String,
     },
 
+    /// The bundle is older than the one currently applied (anti-rollback).
+    ///
+    /// A signature- and freshness-valid bundle can still be a *replay* of a
+    /// genuinely older snapshot (one generated a few minutes ago, within the
+    /// `mesh_zone_max_age_secs` window). Re-applying it would silently roll
+    /// the mesh zone back to a previous IP mapping or drop a record. The
+    /// authority tracks the last-applied `(generated_at_unix, nonce)` and
+    /// refuses any candidate that orders strictly before it.
+    #[error(
+        "mesh bundle rejected (anti-rollback): candidate (generated_at_unix={candidate_generated_at}, \
+         nonce={candidate_nonce}) is older than the applied bundle \
+         (generated_at_unix={current_generated_at}, nonce={current_nonce})"
+    )]
+    Rollback {
+        /// `generated_at_unix` of the rejected candidate bundle.
+        candidate_generated_at: u64,
+        /// `nonce` of the rejected candidate bundle.
+        candidate_nonce: u64,
+        /// `generated_at_unix` of the currently applied bundle.
+        current_generated_at: u64,
+        /// `nonce` of the currently applied bundle.
+        current_nonce: u64,
+    },
+
     /// The zone_name in the bundle didn't match our configured mesh zone.
     #[error("mesh bundle zone_name `{bundle}` does not match configured mesh_zone `{configured}`")]
     ZoneMismatch {

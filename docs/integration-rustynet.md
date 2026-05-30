@@ -74,6 +74,28 @@ A bundle whose `expires_at_unix` is in the past, or whose
 at load time. The previous snapshot keeps serving — the daemon never
 serves an unsigned, untrusted, or expired bundle.
 
+**Anti-rollback ordering.** Beyond the freshness window, the daemon tracks
+the last-applied `(generated_at_unix, nonce)` in memory and rejects any
+reload whose pair orders strictly before it — an older `generated_at_unix`,
+or the same second with a lower `nonce`. This stops an attacker who can
+write the bundle path from replaying an *older but still-fresh* signed
+bundle to roll a name back to a previous IP or drop a record. Two
+consequences for `rustynetd`:
+
+- **`generated_at_unix` must be non-decreasing across successive bundles**
+  for the same zone. Re-publishing with an unchanged or *lower* timestamp
+  (e.g. after a clock step backwards) will be refused until the daemon is
+  restarted — restart resets the in-memory watermark.
+- **`nonce` is the tie-break within one wall-clock second.** If `rustynetd`
+  can emit more than one bundle per second, make `nonce` strictly
+  increasing within that second; otherwise a same-second re-publish with a
+  lower nonce is treated as a rollback. An *identical* `(generated_at_unix,
+  nonce)` re-applies idempotently (the poller re-reads the same file every
+  interval) and is never flagged.
+
+A rejected rollback keeps the previous snapshot and bumps
+`rustydns_mesh_zone_reload_failure_total`.
+
 ## Rustynet policy integration
 
 ### rustydns as a Rustynet service

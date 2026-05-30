@@ -41,30 +41,6 @@ These live in `roadmap.md` too; repeated here for completeness. **Do not start**
 
 ## 2. Security & anonymity
 
-### 2.1 🔴 Mesh-bundle anti-rollback / replay protection — **M**
-
-`Authority::reload_mesh` accepts any bundle that passes signature + freshness,
-but does **not** check that the new bundle is *newer* than the one currently
-loaded. The bundle carries both `generated_at_unix` and a `nonce`
-(`LoadedBundle` already parses them) — neither is used for ordering.
-
-**Attack:** an actor who can write the bundle path (or cause a stale file to
-reappear) can roll the mesh zone back to an **older but still-fresh** signed
-bundle — e.g. one generated 4 minutes ago (with `mesh_zone_max_age_secs = 600`)
-that re-points a name to a previous IP or drops a record. The signature still
-verifies because it's a legitimately old bundle.
-
-**Fix:** track the last-applied `(generated_at_unix, nonce)` in the `Authority`
-and reject a reload whose `generated_at_unix` is `<` current (tie-break on
-`nonce`). Keep it in-memory (the "no database" invariant stands); document that a
-process restart resets the watermark, so the `max_age` window is still the
-backstop right after boot. Add a test: load bundle@T, then attempt bundle@T-60 →
-rejected, snapshot unchanged.
-
-Files: `crates/rustydns-authority/src/lib.rs` (`reload_mesh`),
-`crates/rustydns-authority/src/mesh.rs` (`LoadedBundle`). Doc:
-`docs/security.md` §"Mesh Bundle Tampering", `docs/integration-rustynet.md`.
-
 ### 2.2 🟡 Query-log hash relies on the in-memory salt staying secret — **S (doc)**
 
 The ring buffer and on-disk NDJSON store a per-process-salted `u64` hash of each
@@ -182,7 +158,6 @@ Files: `crates/rustydnsd/src/handler.rs` (`PolicyDecision`, `resolve_policy`).
   tests covering ECS stripping, DNSSEC pass/fail, fail-closed, TLS 1.3
   enforcement, padding behaviour. Current resolver tests lean on classifier unit
   tests; add a mock upstream. Files: `crates/rustydns-resolver/`.
-- **4.4 🟡 Mesh anti-rollback** — add once §2.1 lands.
 - **4.5 🟡 Property/fuzz tests for parsers** — blocklist parser and mesh field
   parser process semi-trusted input; add `proptest`-style "no panic, invariants
   hold" tests (e.g. allowlist entries always ≥ 2 labels, no `http://` sources,
