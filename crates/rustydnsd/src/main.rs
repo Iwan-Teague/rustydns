@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
         query_log.clone(),
         rate_limiter,
         &config.policy,
-        &config.rewrite,
+        &combined_rewrite_rules(&config),
     )?;
     // An owning handler clone, used to build new listener generations and
     // to perform SIGHUP hot-swaps. Every generation/DoH server gets its
@@ -1074,6 +1074,20 @@ async fn handle_sighup(
 /// Atomically swap the hot-reloadable components into the running handler
 /// (roadmap 3.2, Phase 1). A resolver rebuild failure keeps the old
 /// resolver; policy and rate-limit builds are infallible.
+/// Combine the operator's `[[rewrite]]` rules with the built-in Safe Search
+/// rules into the single rule list the handler's rewrite map consumes.
+///
+/// Safe Search rules are listed **first** so an explicit `[[rewrite]]` for the
+/// same name overrides them — `RewriteMap::from_rules` lets a later exact rule
+/// win. Returns just the operator rules when Safe Search is disabled.
+fn combined_rewrite_rules(
+    config: &rustydns_core::config::DnsConfig,
+) -> Vec<rustydns_core::config::RewriteRule> {
+    let mut rules = config.safesearch.rewrite_rules();
+    rules.extend(config.rewrite.iter().cloned());
+    rules
+}
+
 async fn apply_hot_swaps(handler: &DnsHandler, new_config: &rustydns_core::config::DnsConfig) {
     match Resolver::new(new_config.clone()).await {
         Ok(resolver) => {
@@ -1089,7 +1103,7 @@ async fn apply_hot_swaps(handler: &DnsHandler, new_config: &rustydns_core::confi
     }
     handler.swap_rate_limiter(Arc::new(RateLimiter::new(&new_config.rate_limit)));
     handler.swap_policies(&new_config.policy);
-    handler.swap_rewrites(&new_config.rewrite);
+    handler.swap_rewrites(&combined_rewrite_rules(new_config));
     info!(
         policies = new_config.policy.len(),
         rate_limit_enabled = new_config.rate_limit.enabled,
@@ -1595,6 +1609,7 @@ mod tests {
             rate_limit: Default::default(),
             policy: Vec::new(),
             rewrite: Vec::new(),
+            safesearch: Default::default(),
         }
     }
 

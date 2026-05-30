@@ -113,7 +113,7 @@ fn default_true() -> bool {
 /// All defaults are the most secure and most private option. Unknown fields
 /// are rejected (`deny_unknown_fields`) to catch typos that would silently
 /// leave a security option un-set.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DnsConfig {
     /// Network listener settings (UDP/TCP/DoT/DoH ports and TLS material).
@@ -146,6 +146,9 @@ pub struct DnsConfig {
     /// CNAME target, or NXDOMAIN. Applied after authority, before blocklist.
     #[serde(default)]
     pub rewrite: Vec<RewriteRule>,
+    /// Safe Search enforcement for major search engines. Use `[safesearch]`.
+    #[serde(default)]
+    pub safesearch: SafeSearchConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +211,104 @@ pub struct RewriteRule {
     /// exclusive with `address`/`target`. Default: `false`.
     #[serde(default = "default_false")]
     pub block: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Safe Search
+// ---------------------------------------------------------------------------
+
+/// Safe Search enforcement for the major search engines.
+///
+/// When `enabled`, the daemon injects built-in CNAME [`RewriteRule`]s mapping
+/// each enabled engine to its SafeSearch / Restricted-Mode hostname (e.g.
+/// `google.com → forcesafesearch.google.com`). These are merged with the
+/// operator's `[[rewrite]]` rules — an explicit `[[rewrite]]` for the same
+/// name wins — and run at the same pipeline stage (after authority, before
+/// blocklist). The client receives a CNAME and resolves the safe hostname,
+/// which returns the engine's filtered IPs.
+///
+/// ```toml
+/// [safesearch]
+/// enabled    = true     # master switch (default: false)
+/// google     = true     # forcesafesearch.google.com
+/// bing       = true     # strict.bing.com
+/// duckduckgo = true     # safe.duckduckgo.com
+/// youtube    = true     # restrictmoderate.youtube.com (Restricted Mode)
+/// ```
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SafeSearchConfig {
+    /// Master switch. Default: `false`. When false, no rules are injected
+    /// regardless of the per-engine flags.
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// Enforce Google SafeSearch (`google.com` → `forcesafesearch.google.com`).
+    #[serde(default = "default_true")]
+    pub google: bool,
+    /// Enforce Bing strict mode (`bing.com` → `strict.bing.com`).
+    #[serde(default = "default_true")]
+    pub bing: bool,
+    /// Enforce DuckDuckGo safe mode (`duckduckgo.com` → `safe.duckduckgo.com`).
+    #[serde(default = "default_true")]
+    pub duckduckgo: bool,
+    /// Enforce YouTube Restricted Mode
+    /// (`youtube.com` → `restrictmoderate.youtube.com`).
+    #[serde(default = "default_true")]
+    pub youtube: bool,
+}
+
+impl Default for SafeSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            google: true,
+            bing: true,
+            duckduckgo: true,
+            youtube: true,
+        }
+    }
+}
+
+impl SafeSearchConfig {
+    /// Generate the built-in CNAME rewrite rules for the enabled engines.
+    /// Returns an empty `Vec` when `enabled` is `false`.
+    pub fn rewrite_rules(&self) -> Vec<RewriteRule> {
+        let mut rules = Vec::new();
+        if !self.enabled {
+            return rules;
+        }
+        fn cname(name: &str, target: &str) -> RewriteRule {
+            RewriteRule {
+                name: name.to_string(),
+                address: None,
+                target: Some(target.to_string()),
+                block: false,
+            }
+        }
+        if self.google {
+            rules.push(cname("google.com", "forcesafesearch.google.com."));
+            rules.push(cname("www.google.com", "forcesafesearch.google.com."));
+        }
+        if self.bing {
+            rules.push(cname("bing.com", "strict.bing.com."));
+            rules.push(cname("www.bing.com", "strict.bing.com."));
+        }
+        if self.duckduckgo {
+            rules.push(cname("duckduckgo.com", "safe.duckduckgo.com."));
+        }
+        if self.youtube {
+            for n in [
+                "youtube.com",
+                "www.youtube.com",
+                "m.youtube.com",
+                "youtubei.googleapis.com",
+                "youtube.googleapis.com",
+            ] {
+                rules.push(cname(n, "restrictmoderate.youtube.com."));
+            }
+        }
+        rules
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1623,6 +1724,7 @@ mod tests {
             rate_limit: RateLimitConfig::default(),
             policy: Vec::new(),
             rewrite: Vec::new(),
+            safesearch: SafeSearchConfig::default(),
         }
     }
 
@@ -2142,5 +2244,77 @@ mod tests {
         let mut cfg = baseline();
         cfg.rewrite = vec![rewrite("", Some("10.0.0.5"), None, false)];
         assert_config_err(validate_config(&cfg), "name is empty");
+    }
+
+    // --- safe search ------------------------------------------------
+
+    #[test]
+    fn safesearch_disabled_yields_no_rules() {
+        let ss = SafeSearchConfig::default(); // enabled defaults false
+        assert!(ss.rewrite_rules().is_empty());
+    }
+
+    #[test]
+    fn safesearch_enabled_maps_google_and_others() {
+        let ss = SafeSearchConfig {
+            enabled: true,
+            ..SafeSearchConfig::default()
+        };
+        let rules = ss.rewrite_rules();
+        // Every rule is a CNAME (target set, no address/block).
+        assert!(
+            rules
+                .iter()
+                .all(|r| r.target.is_some() && r.address.is_none() && !r.block)
+        );
+        let find = |name: &str| {
+            rules
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.target.clone().unwrap())
+        };
+        assert_eq!(
+            find("google.com").as_deref(),
+            Some("forcesafesearch.google.com.")
+        );
+        assert_eq!(
+            find("www.google.com").as_deref(),
+            Some("forcesafesearch.google.com.")
+        );
+        assert_eq!(find("bing.com").as_deref(), Some("strict.bing.com."));
+        assert_eq!(
+            find("duckduckgo.com").as_deref(),
+            Some("safe.duckduckgo.com.")
+        );
+        assert_eq!(
+            find("youtube.com").as_deref(),
+            Some("restrictmoderate.youtube.com.")
+        );
+    }
+
+    #[test]
+    fn safesearch_per_engine_toggle() {
+        let ss = SafeSearchConfig {
+            enabled: true,
+            google: true,
+            bing: false,
+            duckduckgo: false,
+            youtube: false,
+        };
+        let rules = ss.rewrite_rules();
+        assert!(rules.iter().any(|r| r.name == "google.com"));
+        assert!(!rules.iter().any(|r| r.name == "bing.com"));
+        assert!(!rules.iter().any(|r| r.name == "duckduckgo.com"));
+        assert!(!rules.iter().any(|r| r.name == "youtube.com"));
+    }
+
+    #[test]
+    fn safesearch_config_validates_in_full_config() {
+        let mut cfg = baseline();
+        cfg.safesearch = SafeSearchConfig {
+            enabled: true,
+            ..SafeSearchConfig::default()
+        };
+        validate_config(&cfg).expect("safe search config must validate");
     }
 }

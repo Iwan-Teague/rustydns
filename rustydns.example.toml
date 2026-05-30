@@ -422,3 +422,17 @@ path   = "/metrics"
 # [[rewrite]]
 # name  = "*.ads.example.com"
 # block = true
+
+# ---------------------------------------------------------------------------
+[safesearch]
+# ---------------------------------------------------------------------------
+# Enforce SafeSearch / Restricted Mode on the major search engines by
+# injecting built-in CNAME rewrites (e.g. google.com → forcesafesearch.
+# google.com). Merged with [[rewrite]] above — an explicit [[rewrite]] for
+# the same name wins. Disabled by default. Hot-reloadable on SIGHUP.
+enabled    = false
+# Per-engine toggles (only apply when enabled = true; all default true):
+google     = true     # → forcesafesearch.google.com
+bing       = true     # → strict.bing.com
+duckduckgo = true     # → safe.duckduckgo.com
+youtube    = true     # → restrictmoderate.youtube.com (Restricted Mode)

@@ -943,6 +943,7 @@ mod tests {
             rate_limit: Default::default(),
             policy: Vec::new(),
             rewrite: Vec::new(),
+            safesearch: Default::default(),
         };
         // Disable randomisation for deterministic test ordering.
         dns_config.privacy.randomize_upstream_selection = false;
@@ -1096,6 +1097,7 @@ mod tests {
             rate_limit: Default::default(),
             policy: Vec::new(),
             rewrite: Vec::new(),
+            safesearch: Default::default(),
         };
         dns_config.privacy.randomize_upstream_selection = false;
         dns_config.upstream.dnssec_validation = false;
@@ -1218,6 +1220,7 @@ mod tests {
             rate_limit: Default::default(),
             policy: Vec::new(),
             rewrite: Vec::new(),
+            safesearch: Default::default(),
         };
         dns_config.upstream.dnssec_validation = false;
         let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
@@ -1353,6 +1356,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn safesearch_rewrites_google_via_pipeline() {
+        // Safe Search rules are ordinary CNAME rewrites; feeding them through
+        // the rewrite harness proves the same pipeline serves them. A query
+        // for google.com must return a CNAME to forcesafesearch.google.com.
+        let ss = rustydns_core::config::SafeSearchConfig {
+            enabled: true,
+            ..rustydns_core::config::SafeSearchConfig::default()
+        };
+        let harness = build_rewrite_harness(vec![], ss.rewrite_rules()).await;
+        let resp = query(harness.port, "google.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::CNAME(t) => {
+                assert_eq!(t.to_string(), "forcesafesearch.google.com.")
+            }
+            other => panic!("expected CNAME to forcesafesearch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn authority_wins_over_rewrite() {
         // A static record AND a rewrite for the same name: authority is first
         // in the pipeline, so it answers and the rewrite never runs.
@@ -1441,6 +1465,7 @@ mod tests {
             rate_limit: Default::default(),
             policy: Vec::new(),
             rewrite: Vec::new(),
+            safesearch: Default::default(),
         };
         dns_config.upstream.dnssec_validation = false;
         let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
@@ -1927,6 +1952,7 @@ mod tests {
             rate_limit: Default::default(),
             policy: Vec::new(),
             rewrite: Vec::new(),
+            safesearch: Default::default(),
         };
         dns_config.privacy.randomize_upstream_selection = false;
         dns_config.upstream.dnssec_validation = false;

@@ -183,7 +183,8 @@ privacy/security first, low-power). **rustydns already has** ad/tracker blocking
 NXDOMAIN/sinkhole/REFUSED responses, HTTPS-only sources, auto-reload),
 conditional forwarding, bounded LRU caching, DNSSEC, DoH/DoQ upstream + DoT/DoH
 inbound, randomised upstream selection, ECS stripping, per-client (IP) policy,
-rate limiting, rebinding defence, and CNAME-cloaking defence (§8.1, done). The
+rate limiting, rebinding defence, CNAME-cloaking defence (§8.1, done), DNS
+rewrites / local cloaking (§8.2, done), and Safe Search (§8.4, done). The
 items below are what those projects have that we **don't**.
 
 ### Worth adding (fits the constraints)
@@ -194,11 +195,6 @@ items below are what those projects have that we **don't**.
   already strips RFC1918/loopback) by adding operator-supplied bad-IP ranges.
   Files: `crates/rustydns-resolver` or `handler.rs` post-resolve, new blocklist
   source kind.
-- **8.4 🟡 Safe Search enforcement — S/M.** A special case of 8.2: rewrite
-  `google.com`/`bing.com`/`youtube.com`/`duckduckgo.com` to their
-  `forcesafesearch.*` / `safe.*` variants (CNAME). AdGuard ships this as a
-  one-flag family feature. Cheap once 8.2 exists. Files: `config.rs`
-  (`[privacy] safe_search = true` or a `[safesearch]` block), `handler.rs`.
 - **8.5 🟡 Scheduled / time-window rules — M.** Per-client or per-domain block
   schedules ("block social media 09:00–17:00", "kids' devices off after 22:00").
   AdGuard has access schedules. Novel for a config-file resolver; extend
@@ -245,8 +241,9 @@ items below are what those projects have that we **don't**.
   database" invariant; query history stays in the bounded ring (+ opt-in hashed
   on-disk log).
 
-> 8.1 (CNAME blocking) and 8.2 (DNS rewrite map) are done. Next: **8.4 (safe
-> search)** builds directly on the 8.2 rewrite machinery.
+> 8.1 (CNAME blocking), 8.2 (DNS rewrite map), and 8.4 (safe search) are done.
+> Remaining: 8.3 (response-IP blocklists), 8.5 (scheduled rules), 8.6 (per-client
+> groups), 8.7 (regex rules).
 
 ---
 

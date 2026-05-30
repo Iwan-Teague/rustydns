@@ -173,6 +173,7 @@ fn plain_config(upstream_addr: &str) -> DnsConfig {
         rate_limit: RateLimitConfig::default(),
         policy: Vec::new(),
         rewrite: Vec::new(),
+        safesearch: Default::default(),
     }
 }
 

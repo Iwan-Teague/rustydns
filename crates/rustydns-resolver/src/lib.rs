@@ -1384,6 +1384,7 @@ mod tests {
             rate_limit: Default::default(),
             policy: Vec::new(),
             rewrite: Vec::new(),
+            safesearch: Default::default(),
         };
         cfg.upstream.resolvers.clear();
         let err = Resolver::new(cfg).await.unwrap_err();

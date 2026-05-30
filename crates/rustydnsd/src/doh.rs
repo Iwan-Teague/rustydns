@@ -302,6 +302,7 @@ mod tests {
             rate_limit: Default::default(),
             policy: Vec::new(),
             rewrite: Vec::new(),
+            safesearch: Default::default(),
         };
         dns_config.privacy.randomize_upstream_selection = false;
         dns_config.upstream.dnssec_validation = false;
