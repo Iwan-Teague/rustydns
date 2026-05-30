@@ -120,7 +120,7 @@ impl Authority {
     /// Returns [`RustyDnsError::Zone`] if any static record is malformed
     /// (unknown type, missing required field, unparseable address, etc.).
     pub fn new(config: AuthorityConfig) -> AuthorityResult<Self> {
-        let mesh_zone = normalise_name(&config.mesh_zone);
+        let mesh_zone = normalise_name(&config.mesh_zone).into_owned();
 
         // Build the static-record half once — it never changes at runtime.
         let mut static_records: HashMap<String, Vec<DnsRecord>> = HashMap::new();
@@ -535,12 +535,26 @@ fn name_within_zone(name: &str, zone: &str) -> bool {
 }
 
 /// Normalise a DNS name: lowercase, ensure trailing dot.
-fn normalise_name(name: &str) -> String {
-    let mut n = name.trim().to_ascii_lowercase();
-    if !n.ends_with('.') {
+///
+/// Returns a [`Cow`] that **borrows** the input untouched when it is already
+/// canonical (no surrounding whitespace, no uppercase ASCII, trailing dot
+/// present). The daemon canonicalises the QNAME once at the top of the
+/// request and passes that form here, so the per-query `Authority::lookup`
+/// allocation the old `String`-returning version always paid is now avoided
+/// for the common case.
+fn normalise_name(name: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = name.trim();
+    let has_dot = trimmed.ends_with('.');
+    let has_upper = trimmed.bytes().any(|b| b.is_ascii_uppercase());
+    if has_dot && !has_upper && trimmed.len() == name.len() {
+        // Already canonical — borrow, no allocation.
+        return std::borrow::Cow::Borrowed(name);
+    }
+    let mut n = trimmed.to_ascii_lowercase();
+    if !has_dot {
         n.push('.');
     }
-    n
+    std::borrow::Cow::Owned(n)
 }
 
 /// Convert a TOML [`StaticRecord`] into the in-memory [`DnsRecord`] form.
@@ -576,13 +590,13 @@ fn static_record_to_dns_record(sr: &StaticRecord) -> AuthorityResult<DnsRecord> 
             })?;
             RecordData::Aaaa(ip)
         }
-        "CNAME" => RecordData::Cname(normalise_name(require_target(sr, "CNAME")?)),
-        "PTR" => RecordData::Ptr(normalise_name(require_target(sr, "PTR")?)),
+        "CNAME" => RecordData::Cname(normalise_name(require_target(sr, "CNAME")?).into_owned()),
+        "PTR" => RecordData::Ptr(normalise_name(require_target(sr, "PTR")?).into_owned()),
         "TXT" => {
             let target = require_target(sr, "TXT")?;
             RecordData::Txt(vec![target.as_bytes().to_vec()])
         }
-        "NS" => RecordData::Ns(normalise_name(require_target(sr, "NS")?)),
+        "NS" => RecordData::Ns(normalise_name(require_target(sr, "NS")?).into_owned()),
         "MX" => {
             let target = require_target(sr, "MX")?;
             let mut parts = target.split_whitespace();
@@ -613,7 +627,7 @@ fn static_record_to_dns_record(sr: &StaticRecord) -> AuthorityResult<DnsRecord> 
             }
             RecordData::Mx {
                 preference: pref,
-                exchange: normalise_name(exchange),
+                exchange: normalise_name(exchange).into_owned(),
             }
         }
         "SRV" => {
@@ -632,7 +646,7 @@ fn static_record_to_dns_record(sr: &StaticRecord) -> AuthorityResult<DnsRecord> 
                 priority,
                 weight,
                 port,
-                target: normalise_name(parts[3]),
+                target: normalise_name(parts[3]).into_owned(),
             }
         }
         other => {

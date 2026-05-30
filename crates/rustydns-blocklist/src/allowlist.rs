@@ -79,17 +79,30 @@ impl Allowlist {
     /// comparison. Comparison is case-insensitive (input is lowercased).
     ///
     /// This is called on every query that passes the authority check — it must
-    /// be fast. The implementation is branchless for the common (not-allowed)
-    /// case and does not allocate.
+    /// be fast. It is allocation-free for ASCII names (the overwhelming common
+    /// case): it lowercases into a stack-local `String` **only** when the input
+    /// actually contains an uppercase ASCII byte, mirroring
+    /// [`crate::engine`]'s `is_blocked` fast path. Since the engine already
+    /// lowercases before calling this, the common path never allocates at all.
     #[inline]
     pub fn is_allowed(&self, domain: &str) -> bool {
-        let domain = domain.trim_end_matches('.').to_lowercase();
+        let domain = domain.trim_end_matches('.');
         if domain.is_empty() {
             return false;
         }
 
+        // Lowercase without allocating for ASCII-only-or-already-lowercase
+        // names. Only mixed-case input pays a single allocation.
+        let lower_buf: String;
+        let domain = if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+            lower_buf = domain.to_ascii_lowercase();
+            lower_buf.as_str()
+        } else {
+            domain
+        };
+
         // Fast path: exact match (O(1) hash lookup).
-        if self.exact.contains(domain.as_str()) {
+        if self.exact.contains(domain) {
             return true;
         }
 
@@ -98,7 +111,7 @@ impl Allowlist {
         //   ".example.com"      → check
         //   ".com"              → check
         // We never check "" (root), which would allow everything.
-        let mut rest = domain.as_str();
+        let mut rest = domain;
         while let Some(dot_pos) = rest.find('.') {
             rest = &rest[dot_pos..]; // includes the leading dot
             if self.suffixes.contains(rest) {

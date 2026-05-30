@@ -122,9 +122,17 @@ The Dockerfile builder image and the CI toolchain pin match.
 
 The query hot path (Authority lookup → Blocklist check → cache lookup) must
 not allocate on the heap for cache hits. Use `Cow<'_, str>` or pre-intern
-domain names where possible. Today the heaviest hot-path allocation is
-`normalise_name()` which lowercases and adds a trailing dot — acceptable
-because authority lookups are a small fraction of total queries.
+domain names where possible. The handler canonicalises the QNAME **once**
+(`canonical_qname` → `Cow`, borrowing when the client already sent lower
+case) and hands that single form to authority / blocklist / allowlist /
+query-log, so the pipeline no longer re-lowercases at each stage.
+`Authority::normalise_name` returns a borrowing `Cow` when the input is
+already canonical, and `Allowlist::is_allowed` mirrors `engine::is_blocked`'s
+ASCII fast path (no alloc unless the name has uppercase). The qtype label
+comes from `RecordType -> &'static str` (zero-alloc), and per-client
+`zones_allowed` is an `Arc<[String]>` so policied queries clone an `Arc`
+rather than deep-copying the zone list. Net: a lowercase cache-hit query
+allocates only the unavoidable `info.query.name().to_string()`.
 
 ## Logging conventions
 

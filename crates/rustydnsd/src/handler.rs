@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -30,15 +31,51 @@ use std::collections::HashMap;
 
 const SINKHOLE_TTL_SECS: u32 = 60;
 
+/// A process-wide shared empty `Arc<[String]>`.
+///
+/// `resolve_policy` returns `PolicyDecision::default()` for every
+/// non-policied client (the common case) — cloning this shared `Arc`
+/// is O(1) and allocation-free, so the default path never touches the
+/// heap. Without the shared instance, `Arc::from(Vec::new())` would
+/// allocate an `Arc` header on every query.
+fn empty_zones() -> Arc<[String]> {
+    static EMPTY: OnceLock<Arc<[String]>> = OnceLock::new();
+    EMPTY.get_or_init(|| Vec::<String>::new().into()).clone()
+}
+
 /// Resolved per-client policy decision for one query.
 ///
 /// Built once per query from the source IP. The default value is "no
 /// restrictions" so clients with no matching `[[policy]]` entry get
 /// the standard pipeline treatment.
-#[derive(Debug, Clone, Default)]
+///
+/// `zones_allowed` is an `Arc<[String]>` (not a `Vec<String>`) so a query
+/// from a zone-restricted client clones an `Arc` (O(1)) instead of deep-
+/// copying every zone string per query.
+#[derive(Debug, Clone)]
 struct PolicyDecision {
     blocklist_bypass: bool,
-    zones_allowed: Vec<String>,
+    zones_allowed: Arc<[String]>,
+    log_all_queries: bool,
+}
+
+impl Default for PolicyDecision {
+    fn default() -> Self {
+        Self {
+            blocklist_bypass: false,
+            zones_allowed: empty_zones(),
+            log_all_queries: false,
+        }
+    }
+}
+
+/// A `[[policy]]` entry compiled for fast per-query lookup: the zone list is
+/// pre-interned into an `Arc<[String]>` once at map-build time so
+/// [`DnsHandler::resolve_policy`] only clones an `Arc`.
+#[derive(Debug, Clone)]
+struct CompiledPolicy {
+    blocklist_bypass: bool,
+    zones_allowed: Arc<[String]>,
     log_all_queries: bool,
 }
 
@@ -60,20 +97,25 @@ pub struct DnsHandler {
     rate_limiter: Arc<ArcSwap<RateLimiter>>,
     sinkhole_ip: Option<IpAddr>,
     /// IP-keyed policy table, hot-swappable on SIGHUP.
-    policy_by_ip: Arc<ArcSwap<HashMap<IpAddr, NodePolicy>>>,
+    policy_by_ip: Arc<ArcSwap<HashMap<IpAddr, CompiledPolicy>>>,
 }
 
 /// Build the IP-keyed policy lookup table from a `[[policy]]` list.
 ///
 /// `validate_config` already rejected unparseable `client_ip` values, so
 /// the parse cannot fail in practice — we log and skip if it somehow does.
-fn build_policy_map(policies: &[NodePolicy]) -> HashMap<IpAddr, NodePolicy> {
-    let mut policy_by_ip: HashMap<IpAddr, NodePolicy> = HashMap::new();
+fn build_policy_map(policies: &[NodePolicy]) -> HashMap<IpAddr, CompiledPolicy> {
+    let mut policy_by_ip: HashMap<IpAddr, CompiledPolicy> = HashMap::new();
     for policy in policies {
         if let Some(ip_str) = &policy.client_ip {
             match ip_str.parse::<IpAddr>() {
                 Ok(ip) => {
-                    if policy_by_ip.insert(ip, policy.clone()).is_some() {
+                    let compiled = CompiledPolicy {
+                        blocklist_bypass: policy.blocklist_bypass,
+                        zones_allowed: Arc::from(policy.zones_allowed.as_slice()),
+                        log_all_queries: policy.log_all_queries,
+                    };
+                    if policy_by_ip.insert(ip, compiled).is_some() {
                         warn!(
                             client_ip = %ip,
                             "duplicate [[policy]] entries for the same client_ip; \
@@ -153,7 +195,8 @@ impl DnsHandler {
         match self.policy_by_ip.load().get(&src_ip) {
             Some(p) => PolicyDecision {
                 blocklist_bypass: p.blocklist_bypass,
-                zones_allowed: p.zones_allowed.clone(),
+                // Arc clone — O(1), no per-element String copy.
+                zones_allowed: Arc::clone(&p.zones_allowed),
                 log_all_queries: p.log_all_queries,
             },
             None => PolicyDecision::default(),
@@ -171,25 +214,22 @@ impl DnsHandler {
     /// audit line if the matching policy sets `log_all_queries = true`.
     /// Centralised so every pipeline arm uses the same hashing rules and
     /// `ServedBy` label.
+    /// `qname_canon` must already be the lowercased canonical form (the
+    /// handler computes it once per query); `qtype` is the static label from
+    /// `RecordType::into::<&'static str>()`. Neither allocates here.
     fn log_query(
         &self,
         policy: &PolicyDecision,
         client: &ClientId,
-        qname: &str,
-        qtype: &str,
+        qname_canon: &str,
+        qtype: &'static str,
         rcode: ResponseCode,
         served_by: ServedBy,
     ) {
-        // Static qtype label — `qtype.to_string()` would allocate
-        // every query. The hickory `RecordType: Display` form is
-        // already lowercase/uppercase ascii so we copy into a small
-        // static interning table.
-        let qtype_static = intern_qtype(qtype);
-        let qname_lower = qname.to_ascii_lowercase();
         self.query_log.record(
             client,
-            &qname_lower,
-            qtype_static,
+            qname_canon,
+            qtype,
             // ResponseCode lacks `From<ResponseCode> for u8` but does
             // expose `.low()` for the wire-level value (top nibble is
             // for EDNS extended codes which we don't surface here).
@@ -200,11 +240,11 @@ impl DnsHandler {
             // PRIVACY: hashed qname only, never the raw form. Anonymised
             // client only, never the raw IP. Matches the privacy
             // invariants for tracing output at info+ level.
-            let qname_hash = self.query_log.hash_qname(&qname_lower);
+            let qname_hash = self.query_log.hash_qname(qname_canon);
             tracing::info!(
                 client     = %client.anonymized(),
                 qname_hash = format!("{qname_hash:016x}"),
-                qtype      = %qtype_static,
+                qtype      = %qtype,
                 rcode      = rcode.low(),
                 served_by  = served_by.as_str(),
                 "policy.log_all_queries audit"
@@ -345,7 +385,17 @@ impl RequestHandler for DnsHandler {
         let qname = info.query.name().to_string();
         let qtype = info.query.query_type();
         let qclass = info.query.query_class();
-        let qtype_str = qtype.to_string();
+        // Canonicalise the QNAME ONCE: lowercased, borrowing when the client
+        // already sent lowercase (the common case). This single form is
+        // handed to the authority, blocklist, allowlist, and query log so the
+        // pipeline no longer re-lowercases at every stage. The raw `qname` is
+        // kept only for paths that should preserve the client's original case
+        // (the upstream query and the sinkhole record owner) and for
+        // debug-level logging.
+        let qname_canon = canonical_qname(&qname);
+        // Static qtype label via `RecordType -> &'static str` (zero-alloc);
+        // replaces a per-query `qtype.to_string()` and the old interning step.
+        let qtype_label: &'static str = qtype.into();
 
         self.metrics.inc_queries();
 
@@ -370,8 +420,8 @@ impl RequestHandler for DnsHandler {
             self.log_query(
                 &policy,
                 &client,
-                &qname,
-                &qtype_str,
+                &qname_canon,
+                qtype_label,
                 ResponseCode::Refused,
                 ServedBy::Rejected,
             );
@@ -394,8 +444,8 @@ impl RequestHandler for DnsHandler {
             self.log_query(
                 &policy,
                 &client,
-                &qname,
-                &qtype_str,
+                &qname_canon,
+                qtype_label,
                 ResponseCode::NotImp,
                 ServedBy::Rejected,
             );
@@ -416,8 +466,8 @@ impl RequestHandler for DnsHandler {
             self.log_query(
                 &policy,
                 &client,
-                &qname,
-                &qtype_str,
+                &qname_canon,
+                qtype_label,
                 ResponseCode::NotImp,
                 ServedBy::Rejected,
             );
@@ -442,15 +492,17 @@ impl RequestHandler for DnsHandler {
         // of zones, refuse anything outside that set BEFORE consulting
         // the pipeline. Mesh-local quarantine clients never even probe
         // the resolver / blocklist.
-        if !policy.zones_allowed.is_empty() && !name_in_any_zone(&qname, &policy.zones_allowed) {
+        if !policy.zones_allowed.is_empty()
+            && !name_in_any_zone(&qname_canon, &policy.zones_allowed)
+        {
             self.metrics.inc_policy_zone_denied();
             warn!(client = %client.anonymized(), "policy denied: name outside zones_allowed");
             let builder = MessageResponseBuilder::from_message_request(request);
             self.log_query(
                 &policy,
                 &client,
-                &qname,
-                &qtype_str,
+                &qname_canon,
+                qtype_label,
                 ResponseCode::Refused,
                 ServedBy::Rejected,
             );
@@ -466,14 +518,14 @@ impl RequestHandler for DnsHandler {
                 .await;
         }
 
-        if let Some(records) = self.authority.lookup(&qname, &qtype_str) {
+        if let Some(records) = self.authority.lookup(&qname_canon, qtype_label) {
             self.metrics.inc_authority_hits();
             let answers = Self::dns_records_to_rrs(&records);
             self.log_query(
                 &policy,
                 &client,
-                &qname,
-                &qtype_str,
+                &qname_canon,
+                qtype_label,
                 ResponseCode::NoError,
                 ServedBy::Authority,
             );
@@ -493,11 +545,11 @@ impl RequestHandler for DnsHandler {
         // outcome — i.e. the name would have been blocked but wasn't.
         // A trivial bypass on a name that wasn't on the blocklist
         // anyway doesn't deserve a metric bump.
-        let bypassed = policy.blocklist_bypass && self.blocklist.is_blocked(&qname);
+        let bypassed = policy.blocklist_bypass && self.blocklist.is_blocked(&qname_canon);
         if bypassed {
             self.metrics.inc_policy_blocklist_bypass();
         }
-        if !policy.blocklist_bypass && self.blocklist.is_blocked(&qname) {
+        if !policy.blocklist_bypass && self.blocklist.is_blocked(&qname_canon) {
             self.metrics.inc_blocklist_hits();
             // PRIVACY: qname logged at debug only; do not enable debug in production.
             debug!(client = %client.anonymized(), qname = %qname, "query blocked");
@@ -517,8 +569,8 @@ impl RequestHandler for DnsHandler {
             self.log_query(
                 &policy,
                 &client,
-                &qname,
-                &qtype_str,
+                &qname_canon,
+                qtype_label,
                 code,
                 ServedBy::Blocklist,
             );
@@ -531,7 +583,8 @@ impl RequestHandler for DnsHandler {
         // load_full() yields an owned Arc so we don't hold the ArcSwap
         // guard across the .await (the guard is not Send).
         let resolver = self.resolver.load_full();
-        match resolver.resolve(&qname, &qtype_str).await {
+        // Raw `qname` (original case) to the upstream — unchanged behaviour.
+        match resolver.resolve(&qname, qtype_label).await {
             Ok(out) => {
                 self.metrics
                     .inc_private_rdata_dropped(out.private_rdata_dropped);
@@ -549,8 +602,8 @@ impl RequestHandler for DnsHandler {
                 self.log_query(
                     &policy,
                     &client,
-                    &qname,
-                    &qtype_str,
+                    &qname_canon,
+                    qtype_label,
                     code,
                     ServedBy::Resolver,
                 );
@@ -576,8 +629,8 @@ impl RequestHandler for DnsHandler {
                 self.log_query(
                     &policy,
                     &client,
-                    &qname,
-                    &qtype_str,
+                    &qname_canon,
+                    qtype_label,
                     ResponseCode::ServFail,
                     ServedBy::ServerFailure,
                 );
@@ -619,26 +672,16 @@ fn name_in_any_zone(qname: &str, zones: &[String]) -> bool {
     false
 }
 
-/// Map a hickory `RecordType` Display string to a stable `&'static str`.
-/// Centralising this avoids allocating a `String` per query just for
-/// the log buffer.
-fn intern_qtype(s: &str) -> &'static str {
-    match s {
-        "A" => "A",
-        "AAAA" => "AAAA",
-        "CNAME" => "CNAME",
-        "MX" => "MX",
-        "NS" => "NS",
-        "PTR" => "PTR",
-        "SOA" => "SOA",
-        "SRV" => "SRV",
-        "TXT" => "TXT",
-        "CAA" => "CAA",
-        "DS" => "DS",
-        "DNSKEY" => "DNSKEY",
-        "RRSIG" => "RRSIG",
-        "ANY" => "ANY",
-        _ => "OTHER",
+/// Lowercase a QNAME into the single canonical form used for matching and
+/// logging, **borrowing** the input when the client already sent it in lower
+/// case (the common case — browsers emit lowercase names). hickory always
+/// yields a trailing-dot FQDN, so only the case can differ; we never need to
+/// touch the dot. Only a mixed-case query pays one allocation.
+fn canonical_qname(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
     }
 }
 
@@ -1576,6 +1619,22 @@ mod tests {
         // Query from 127.0.0.1 should still be blocked (policy is for 10.0.0.5).
         let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
         assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
+    }
+
+    #[test]
+    fn canonical_qname_borrows_lowercase_and_owns_mixed_case() {
+        use super::canonical_qname;
+        use std::borrow::Cow;
+        // Already-lowercase FQDN → borrowed, no allocation.
+        assert!(matches!(
+            canonical_qname("ads.example.com."),
+            Cow::Borrowed("ads.example.com.")
+        ));
+        // Mixed case → owned, lowercased; trailing dot untouched.
+        match canonical_qname("Ads.Example.COM.") {
+            Cow::Owned(s) => assert_eq!(s, "ads.example.com."),
+            Cow::Borrowed(_) => panic!("mixed-case input must be owned + lowercased"),
+        }
     }
 
     #[test]
