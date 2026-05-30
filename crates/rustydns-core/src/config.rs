@@ -760,6 +760,23 @@ pub struct BlocklistConfig {
     /// target instead.
     #[serde(default = "default_true")]
     pub block_cname_cloaking: bool,
+
+    /// Response-IP denylist — IPs / CIDR ranges that must never appear in an
+    /// answer. Default: empty.
+    ///
+    /// After the upstream answers, any query whose resolved A/AAAA rdata falls
+    /// inside one of these ranges is blocked (per `block_response`). Use it to
+    /// blackhole known malware C2 or ad-network IP ranges that rotate domains
+    /// faster than a name blocklist can track. Complements
+    /// `upstream.block_private_rdata` (which strips *private* rdata) by letting
+    /// you name *arbitrary* bad ranges. Clients with `blocklist_bypass` are
+    /// exempt, as for QNAME blocking.
+    ///
+    /// Entries are `"addr"` (single host) or `"addr/prefix"` (CIDR), IPv4 or
+    /// IPv6, e.g. `["198.51.100.0/24", "2001:db8::/32", "203.0.113.5"]`.
+    /// Malformed entries are rejected at startup.
+    #[serde(default)]
+    pub response_ip_denylist: Vec<String>,
 }
 
 impl Default for BlocklistConfig {
@@ -775,6 +792,7 @@ impl Default for BlocklistConfig {
             max_fetch_bytes: default_max_fetch_bytes(),
             allowlist: Vec::new(),
             block_cname_cloaking: true,
+            response_ip_denylist: Vec::new(),
         }
     }
 }
@@ -1467,6 +1485,13 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         )));
     }
 
+    // Response-IP denylist must parse (IPs / CIDR ranges).
+    if let Err(e) = crate::ip_denylist::IpDenylist::parse(&cfg.blocklist.response_ip_denylist) {
+        return Err(crate::RustyDnsError::Config(format!(
+            "blocklist.response_ip_denylist contains an invalid entry: {e}"
+        )));
+    }
+
     // Warn on overbroad allowlist entries
     for entry in &cfg.blocklist.allowlist {
         let entry = entry
@@ -1992,6 +2017,24 @@ mod tests {
         let mut cfg = baseline();
         cfg.blocklist.allowlist = vec!["safe.example.com".to_string(), "*.example.org".to_string()];
         validate_config(&cfg).expect("legitimate allowlist entries must pass");
+    }
+
+    #[test]
+    fn response_ip_denylist_valid_entries_pass() {
+        let mut cfg = baseline();
+        cfg.blocklist.response_ip_denylist = vec![
+            "198.51.100.0/24".to_string(),
+            "2001:db8::/32".to_string(),
+            "203.0.113.5".to_string(),
+        ];
+        validate_config(&cfg).expect("valid IP/CIDR denylist entries must pass");
+    }
+
+    #[test]
+    fn response_ip_denylist_bad_entry_rejected() {
+        let mut cfg = baseline();
+        cfg.blocklist.response_ip_denylist = vec!["not-an-ip".to_string()];
+        assert_config_err(validate_config(&cfg), "response_ip_denylist");
     }
 
     // --- privacy ----------------------------------------------------

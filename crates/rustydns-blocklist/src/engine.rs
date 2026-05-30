@@ -19,13 +19,15 @@
 //! atomically swap the pointer. Readers in flight see either the old or new
 //! state, never a partial one.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use ahash::AHashSet;
 use arc_swap::ArcSwap;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
+use rustydns_core::IpDenylist;
 use rustydns_core::config::BlocklistConfig;
 
 use crate::allowlist::Allowlist;
@@ -120,15 +122,31 @@ impl BlocklistState {
 pub struct BlocklistEngine {
     state: ArcSwap<BlocklistState>,
     config: BlocklistConfig,
+    /// Parsed response-IP denylist (startup-fixed, like the blocklist sources).
+    response_ip_denylist: IpDenylist,
 }
 
 impl BlocklistEngine {
     /// Create a new engine from config with an empty blocklist.
     pub fn new(config: BlocklistConfig) -> Self {
         let allowlist = Allowlist::from_entries(&config.allowlist);
+        // `validate_config` already rejected malformed entries; parse
+        // defensively and fall back to an empty denylist on the
+        // can't-happen error path rather than panicking.
+        let response_ip_denylist = match IpDenylist::parse(&config.response_ip_denylist) {
+            Ok(d) => d,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "invalid blocklist.response_ip_denylist — response-IP blocking disabled"
+                );
+                IpDenylist::default()
+            }
+        };
         Self {
             state: ArcSwap::from_pointee(BlocklistState::new_empty(allowlist)),
             config,
+            response_ip_denylist,
         }
     }
 
@@ -251,6 +269,18 @@ impl BlocklistEngine {
     /// Whether CNAME-cloaking defence is enabled (`blocklist.block_cname_cloaking`).
     pub fn block_cname_cloaking(&self) -> bool {
         self.config.block_cname_cloaking
+    }
+
+    /// Whether any response-IP denylist range is configured. Cheap guard so
+    /// the handler skips per-record checks when the feature is unused.
+    pub fn response_ip_denylist_active(&self) -> bool {
+        !self.response_ip_denylist.is_empty()
+    }
+
+    /// Returns `true` if `ip` (a resolved A/AAAA rdata) is on the
+    /// response-IP denylist.
+    pub fn is_response_ip_blocked(&self, ip: IpAddr) -> bool {
+        self.response_ip_denylist.contains(ip)
     }
 }
 

@@ -66,6 +66,7 @@ Standard Prometheus exposition over the `prometheus` crate's
 | `rustydns_rewrite_hits_total`           | counter | Queries answered by a `[[rewrite]]` rule          |
 | `rustydns_blocklist_hits_total`         | counter | Queries blocked by the blocklist                 |
 | `rustydns_blocklist_cname_cloaking_blocked_total` | counter | Queries blocked because an answer CNAME targeted a blocked domain |
+| `rustydns_blocklist_response_ip_blocked_total` | counter | Queries blocked because a resolved A/AAAA was on the response-IP denylist |
 | `rustydns_resolver_queries_total`       | counter | Queries forwarded to an upstream                 |
 | `rustydns_resolver_failures_total`      | counter | Resolver failures returned as SERVFAIL           |
 

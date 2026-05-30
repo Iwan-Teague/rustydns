@@ -8,10 +8,13 @@
 //! - [`error`]: unified [`RustyDnsError`] type.
 //! - [`record`]: DNS record model wrapping hickory-proto types.
 //! - [`client`]: [`client::ClientId`] for per-query identity and anonymised logging.
+//! - [`ip_denylist`]: dependency-free IP/CIDR matcher for response-IP blocking.
 
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod ip_denylist;
 pub mod record;
 
 pub use error::RustyDnsError;
+pub use ip_denylist::IpDenylist;

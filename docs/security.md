@@ -448,6 +448,20 @@ resolve public Internet names should turn it on; deployments with internal
 zones should either declare those as static records, route them via
 `[[upstream.routes]]`, or leave the defence off.
 
+### Response-IP Denylist
+
+`block_private_rdata` strips *private* rdata; it does not help against a
+malicious answer pointing at a *public* IP you know to be bad (a malware C2 host
+or an ad-network range that rotates domains faster than any name blocklist can
+track). `blocklist.response_ip_denylist` closes that gap: it is a list of
+IP/CIDR ranges (IPv4 or IPv6, single host or CIDR) and any query whose resolved
+A/AAAA rdata falls inside a range is blocked after resolution, using the same
+`block_response` as a QNAME block. Clients with `blocklist_bypass` are exempt,
+as for QNAME blocking. Matching is a dependency-free CIDR check
+(`rustydns_core::ip_denylist`) — no new crate enters the audit surface — and
+each block increments `rustydns_blocklist_response_ip_blocked_total`. Entries
+are validated at startup; a malformed range is a hard config error.
+
 ### DNS Amplification Between Mesh Nodes
 
 Mesh nodes that are granted the `dns` capability can query RustyDNS. A compromised mesh

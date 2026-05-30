@@ -256,6 +256,18 @@ allowlist = [
 # target instead).
 block_cname_cloaking = true
 
+# Response-IP denylist (default: empty). After the upstream answers, block any
+# query whose resolved A/AAAA falls inside one of these IP/CIDR ranges — useful
+# for malware C2 / ad-network ranges that rotate domains faster than a name
+# blocklist can track. Complements upstream.block_private_rdata (which strips
+# PRIVATE rdata) by letting you name ARBITRARY bad ranges. Entries are single
+# hosts or CIDRs, IPv4 or IPv6; malformed entries are rejected at startup.
+response_ip_denylist = [
+    # "198.51.100.0/24",
+    # "2001:db8:bad::/48",
+    # "203.0.113.5",
+]
+
 # ---------------------------------------------------------------------------
 [privacy]
 # ---------------------------------------------------------------------------

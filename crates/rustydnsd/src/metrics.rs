@@ -25,6 +25,7 @@ pub struct Metrics {
     rewrite_hits_total: IntCounter,
     blocklist_hits_total: IntCounter,
     blocklist_cname_cloaking_blocked_total: IntCounter,
+    blocklist_response_ip_blocked_total: IntCounter,
     resolver_queries_total: IntCounter,
     resolver_failures_total: IntCounter,
     blocklist_reload_success_total: IntCounter,
@@ -75,6 +76,11 @@ impl Metrics {
             &registry,
             "rustydns_blocklist_cname_cloaking_blocked_total",
             "Queries blocked because a CNAME in the answer pointed at a blocked domain",
+        )?;
+        let blocklist_response_ip_blocked_total = register_counter(
+            &registry,
+            "rustydns_blocklist_response_ip_blocked_total",
+            "Queries blocked because a resolved A/AAAA was on the response-IP denylist",
         )?;
         let resolver_queries_total = register_counter(
             &registry,
@@ -188,6 +194,7 @@ impl Metrics {
             rewrite_hits_total,
             blocklist_hits_total,
             blocklist_cname_cloaking_blocked_total,
+            blocklist_response_ip_blocked_total,
             resolver_queries_total,
             resolver_failures_total,
             blocklist_reload_success_total,
@@ -256,6 +263,12 @@ impl Metrics {
     /// CNAME in the upstream answer pointed at a blocked domain).
     pub fn inc_blocklist_cname_cloaking_blocked(&self) {
         self.blocklist_cname_cloaking_blocked_total.inc();
+    }
+
+    /// Increment the response-IP block counter (a query blocked because a
+    /// resolved A/AAAA was on the response-IP denylist).
+    pub fn inc_blocklist_response_ip_blocked(&self) {
+        self.blocklist_response_ip_blocked_total.inc();
     }
 
     /// Increment resolver query counter.

@@ -184,17 +184,12 @@ NXDOMAIN/sinkhole/REFUSED responses, HTTPS-only sources, auto-reload),
 conditional forwarding, bounded LRU caching, DNSSEC, DoH/DoQ upstream + DoT/DoH
 inbound, randomised upstream selection, ECS stripping, per-client (IP) policy,
 rate limiting, rebinding defence, CNAME-cloaking defence (§8.1, done), DNS
-rewrites / local cloaking (§8.2, done), and Safe Search (§8.4, done). The
-items below are what those projects have that we **don't**.
+rewrites / local cloaking (§8.2, done), response-IP denylists (§8.3, done), and
+Safe Search (§8.4, done). The items below are what those projects have that we
+**don't**.
 
 ### Worth adding (fits the constraints)
 
-- **8.3 🟠 Response-IP blocklists — M.** Block a query if its resolved A/AAAA is in
-  a configured IP/CIDR denylist (known malware C2, ad-network ranges). blocky
-  supports this. Complements the existing private-rdata rebinding defence (which
-  already strips RFC1918/loopback) by adding operator-supplied bad-IP ranges.
-  Files: `crates/rustydns-resolver` or `handler.rs` post-resolve, new blocklist
-  source kind.
 - **8.5 🟡 Scheduled / time-window rules — M.** Per-client or per-domain block
   schedules ("block social media 09:00–17:00", "kids' devices off after 22:00").
   AdGuard has access schedules. Novel for a config-file resolver; extend
@@ -241,8 +236,8 @@ items below are what those projects have that we **don't**.
   database" invariant; query history stays in the bounded ring (+ opt-in hashed
   on-disk log).
 
-> 8.1 (CNAME blocking), 8.2 (DNS rewrite map), and 8.4 (safe search) are done.
-> Remaining: 8.3 (response-IP blocklists), 8.5 (scheduled rules), 8.6 (per-client
+> 8.1 (CNAME blocking), 8.2 (DNS rewrite map), 8.3 (response-IP blocklists), and
+> 8.4 (safe search) are done. Remaining: 8.5 (scheduled rules), 8.6 (per-client
 > groups), 8.7 (regex rules).
 
 ---

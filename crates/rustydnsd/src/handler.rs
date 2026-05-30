@@ -399,6 +399,18 @@ impl DnsHandler {
             _ => false,
         })
     }
+
+    /// Response-IP denylist (TODO 8.3): returns `true` if any resolved A/AAAA
+    /// rdata is on the operator-supplied IP/CIDR denylist. Lets operators
+    /// blackhole malware C2 / ad-network IP ranges that rotate domains faster
+    /// than a name blocklist can track.
+    fn response_ip_blocked(&self, records: &[DnsRecord]) -> bool {
+        records.iter().any(|rec| match &rec.data {
+            RecordData::A(ip) => self.blocklist.is_response_ip_blocked(IpAddr::V4(*ip)),
+            RecordData::Aaaa(ip) => self.blocklist.is_response_ip_blocked(IpAddr::V6(*ip)),
+            _ => false,
+        })
+    }
 }
 
 #[async_trait]
@@ -686,6 +698,36 @@ impl RequestHandler for DnsHandler {
                         client = %client.anonymized(),
                         qname = %qname,
                         "query blocked (CNAME cloaking)"
+                    );
+                    let (code, answers) = self.build_block_response(&qname, qtype);
+                    self.log_query(
+                        &policy,
+                        &client,
+                        &qname_canon,
+                        qtype_label,
+                        code,
+                        ServedBy::Blocklist,
+                    );
+                    return self
+                        .respond(request, response_handle, builder, code, false, answers)
+                        .await;
+                }
+
+                // Response-IP denylist (TODO 8.3): block if any resolved
+                // A/AAAA rdata is on the operator's IP/CIDR denylist (malware
+                // C2 / ad-network ranges). Same bypass exemption; the active
+                // guard short-circuits when no ranges are configured.
+                if self.blocklist.response_ip_denylist_active()
+                    && !policy.blocklist_bypass
+                    && self.response_ip_blocked(&out.records)
+                {
+                    self.metrics.inc_blocklist_hits();
+                    self.metrics.inc_blocklist_response_ip_blocked();
+                    // PRIVACY: qname at debug only; do not enable debug in prod.
+                    debug!(
+                        client = %client.anonymized(),
+                        qname = %qname,
+                        "query blocked (response-IP denylist)"
                     );
                     let (code, answers) = self.build_block_response(&qname, qtype);
                     self.log_query(
@@ -1428,6 +1470,140 @@ mod tests {
             ResponseCode::NoError,
             "blocklist_bypass clients are exempt from CNAME-cloaking blocking too"
         );
+    }
+
+    /// Spawn a mock UDP upstream that answers any A query for `NAME` with a
+    /// single `NAME A <ip>` record. Used by the response-IP denylist tests.
+    async fn spawn_a_mock(ip: &'static str) -> u16 {
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record};
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+        let port = sock.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let (n, src) = match sock.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(q) = query.queries.first() else {
+                    continue;
+                };
+                let owner = q.name().clone();
+                let mut resp =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                resp.metadata.recursion_available = true;
+                resp.metadata.response_code = ResponseCode::NoError;
+                resp.add_query(q.clone());
+                resp.add_answer(Record::from_rdata(
+                    owner,
+                    300,
+                    RData::A(A(ip.parse().unwrap())),
+                ));
+                if let Ok(bytes) = resp.to_bytes() {
+                    let _ = sock.send_to(&bytes, src).await;
+                }
+            }
+        });
+        port
+    }
+
+    /// Build a harness whose resolver forwards to a plain-UDP upstream and
+    /// whose blocklist has `response_ip_denylist` set to `denylist`.
+    async fn build_response_ip_harness(denylist: &[&str], upstream_port: u16) -> Harness {
+        use rustydns_core::config::UpstreamProtocol;
+
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: Vec::new(),
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            response_ip_denylist: denylist.iter().map(|s| s.to_string()).collect(),
+            ..BlocklistConfig::default()
+        }));
+        let mut dns_config = DnsConfig {
+            upstream: UpstreamConfig {
+                resolvers: vec![format!("127.0.0.1:{upstream_port}")],
+                protocol: UpstreamProtocol::Plain,
+                timeout_ms: 1000,
+                ..UpstreamConfig::default()
+            },
+            ..Default::default()
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log.clone(),
+            rate_limiter,
+            &[],
+            &[],
+        )
+        .expect("handler");
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let port = udp.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server.register_socket(udp);
+        Harness {
+            port,
+            query_log,
+            _server: server,
+        }
+    }
+
+    #[tokio::test]
+    async fn response_ip_denylist_blocks_matching_answer() {
+        // Upstream resolves the name to 198.51.100.7, which is inside the
+        // configured /24 denylist → NXDOMAIN.
+        let upstream = spawn_a_mock("198.51.100.7").await;
+        let harness = build_response_ip_harness(&["198.51.100.0/24"], upstream).await;
+        let resp = query(harness.port, "c2.malware.example.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NXDomain,
+            "an answer IP inside the denylist must be blocked"
+        );
+        assert!(resp.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_ip_denylist_allows_clean_answer() {
+        // Same name resolves to a public IP outside the denylist → allowed.
+        let upstream = spawn_a_mock("93.184.216.34").await;
+        let harness = build_response_ip_harness(&["198.51.100.0/24"], upstream).await;
+        let resp = query(harness.port, "site.example.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::A(a) => assert_eq!(a.0.to_string(), "93.184.216.34"),
+            other => panic!("expected A, got {other:?}"),
+        }
     }
 
     /// Build a bare `DnsHandler` (no sockets/server) for unit-testing the
