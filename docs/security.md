@@ -275,6 +275,29 @@ When enabled, the on-disk log preserves the privacy invariants by construction:
   the disk stream drops entries (counted in `rustydns_query_log_disk_dropped_total`)
   rather than stalling the resolver.
 
+#### Residual risk: the QNAME-hash salt lives in process memory
+
+The on-disk (and in-memory) QNAME hash is keyed with a per-process salt
+(`rand::random()` at startup) that lives **only in process memory** — never
+written to disk, never exposed by any endpoint. An attacker who only obtains
+the log file therefore sees opaque hashes and **cannot** dictionary-attack it
+("was `example.com` queried?") without first guessing the 64-bit salt. This is
+the intended, sound design.
+
+The residual risk is narrow but worth stating so operators do not over-trust the
+on-disk hashes: anyone who can **dump the process's memory** (core dump,
+`/proc/<pid>/mem`, or swapped-out pages) recovers the salt and can then
+offline-confirm whether any *guessed* domain appears in a captured log. This
+requires host-level compromise that already implies worse access; it is not a
+break of the hash. Mitigations (mostly already implied by the systemd sandbox):
+disable or encrypt swap so the salt never pages to disk, restrict core dumps
+(`LimitCORE=0`), and keep the log directory `0700` with non-world-readable
+backups. Note the salt being process-lifetime *helps* here — a restart mints a
+fresh salt, so a log written before the restart can no longer be
+cross-referenced against a guess even with the live salt. See
+[`operator-endpoints.md`](operator-endpoints.md) for the operator-facing
+write-up.
+
 ### Metrics Endpoint Binding
 
 The Prometheus metrics endpoint must be bound to `127.0.0.1` (loopback) only. Binding

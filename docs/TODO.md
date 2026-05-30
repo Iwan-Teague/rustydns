@@ -41,27 +41,6 @@ These live in `roadmap.md` too; repeated here for completeness. **Do not start**
 
 ## 2. Security & anonymity
 
-### 2.2 🟡 Query-log hash relies on the in-memory salt staying secret — **S (doc)**
-
-The ring buffer and on-disk NDJSON store a per-process-salted `u64` hash of each
-QNAME. The salt (`rand::random()` at startup) lives only in process memory, so
-an actor who reads `/queries` or the log file sees only hashes and **cannot**
-run a dictionary attack ("was `example.com` queried?") without the salt — this
-is the intended, sound design.
-
-The residual risk is narrow but worth documenting: anyone who can dump the
-process's memory (core dump, `/proc/<pid>/mem`, swap) recovers the salt and can
-then offline-confirm whether any guessed domain appears in a captured log. The
-on-disk log makes this more relevant (the log outlives the process; the salt does
-not, which actually *helps* — old logs can't be cross-referenced after a
-restart). Action: spell this out in `docs/operator-endpoints.md` and
-`docs/security.md` so operators don't over-trust the on-disk hashes, and note
-that disabling swap / restricting core dumps (already implied by the systemd
-sandbox) is the mitigation. No code change needed.
-
-Files: `docs/operator-endpoints.md`, `docs/security.md`,
-`crates/rustydnsd/src/query_log.rs` (rationale already in module docs).
-
 ### 2.5 ⚪ Inbound DoQ (DNS-over-QUIC, RFC 9250) listener — **L**
 
 DoQ is supported **upstream** only; the daemon listens on UDP/TCP/DoT/DoH. An

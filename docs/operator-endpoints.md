@@ -193,6 +193,37 @@ A future operator-facing helper binary may be added; it will require
 local access to the process and operate on a salt snapshot rather
 than the live salt.
 
+### Residual risk: the salt lives in process memory
+
+The hash's confidentiality rests entirely on the salt staying secret.
+The salt is `rand::random()` at startup and lives **only in process
+memory** — it is never written to disk or exposed by any endpoint. So an
+attacker who only sees `/queries` output (or a captured on-disk log) sees
+opaque hashes and **cannot** run a dictionary attack ("was `example.com`
+queried?") — they would have to guess the 64-bit salt first.
+
+The residual risk is narrow but worth stating: anyone who can **dump the
+process's memory** — a core dump, `/proc/<pid>/mem`, or swapped-out pages —
+recovers the salt, and can then offline-confirm whether any *guessed*
+domain appears in a captured log (hash the guess under the recovered salt
+and grep). This is not a break of the hash; it requires host-level
+compromise that already implies far worse access. Mitigations, mostly
+already in place:
+
+- The systemd unit's sandbox (`PrivateTmp`, `ProtectSystem=strict`,
+  `MemoryDenyWriteExecute`) and running as an unprivileged user raise the
+  bar for reading the daemon's memory.
+- Disable swap, or encrypt it, so the salt and buffer never reach disk via
+  paging.
+- Restrict core dumps for the service (`LimitCORE=0` / a `coredump` filter)
+  so a crash can't spill the salt.
+
+Note the salt being process-lifetime actually **helps** the on-disk log: a
+restart mints a fresh salt, so an old on-disk log written under the
+previous salt can no longer be cross-referenced against a guess even with
+the live process's salt — the two salts differ. Operators should still
+treat the on-disk log as sensitive (see below).
+
 ### What never appears
 
 - Raw QNAMEs.
@@ -206,11 +237,30 @@ absent from the endpoint output.
 
 ## Disk persistence
 
-There is **no disk persistence** of the query log. `privacy.query_log_to_disk`
-is an opt-in flag that currently emits a startup warning per
-`AGENTS.md §Privacy invariants` but has no implementation — and any
-future implementation must be reviewed against the privacy
-invariants before landing.
+By default there is **no disk persistence** of the query log — the ring
+buffer is in-memory only and is lost on restart. Disk logging is an opt-in
+that emits a startup warning (`AGENTS.md §Privacy invariants`).
+
+When `privacy.query_log_to_disk = true` (plus `query_log_disk_path`), the
+daemon appends NDJSON — the *same* line format as `/queries`, so the two
+can never drift. The privacy invariants are preserved by construction:
+
+- **QNAME is always salted-hashed**, never plaintext. The raw name cannot
+  reach the disk writer — there is no code path that carries it there.
+- **Client IP is always anonymised** (IPv4 `/16`, IPv6 `/64`).
+  `log_client_ips` governs `tracing` output only; it does **not** lift
+  anonymisation for the on-disk log.
+- The file is created mode **0600**; if an existing target is group- or
+  world-readable the daemon refuses to write to it and keeps serving DNS
+  with the in-memory ring only.
+- Size-based rotation (`query_log_max_file_bytes` × `query_log_max_files`)
+  bounds the footprint — no external `logrotate` needed.
+
+Because the on-disk log outlives the process while the salt does not (a
+restart mints a fresh one), an old log cannot be cross-referenced against a
+guessed domain after a restart. The salt-in-memory residual risk above
+still applies *while the daemon is running*; treat the on-disk log as
+sensitive, keep its directory `0700`, and avoid world-readable backups.
 
 ## Authentication
 
