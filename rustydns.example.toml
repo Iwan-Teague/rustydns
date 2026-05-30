@@ -71,7 +71,17 @@ resolvers = [
 #   - "doq"   → all resolvers must start with `quic://`  (e.g. "quic://dns.adguard-dns.com:853")
 #   - "plain" → all resolvers must be bare `host:port` (no scheme), e.g. "1.1.1.1:53"
 #   The daemon refuses to start on a mismatch — caught at validate_config.
+#
+# "odoh" (Oblivious DoH, RFC 9230) is RESERVED but NOT yet implemented. The
+# schema below (protocol = "odoh" + odoh_proxy) is accepted so a future config
+# is forward-compatible, but setting protocol = "odoh" today is REJECTED at
+# startup — rustydns will not silently fall back to plain DoH, which would
+# de-anonymise you. Leave it on "doh"/"doq" until ODoH ships.
 protocol = "doh"
+
+# Oblivious proxy URL for ODoH (reserved; only used once protocol = "odoh" is
+# implemented). Choose a proxy operationally independent from the target.
+# odoh_proxy = "https://odoh-proxy.example/proxy"
 
 # Return SERVFAIL when all upstreams fail.
 # ⚠ SECURITY: Do not set to false. Disabling fail-closed allows the resolver

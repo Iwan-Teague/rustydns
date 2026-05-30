@@ -99,6 +99,33 @@ A few fields remain restart-only **by design**, not for lack of work:
 
 ---
 
+## 4. Large features needing their own design pass
+
+### ODoH — Oblivious DoH (RFC 9230)
+
+- **What:** the flagship *anonymity* upgrade. HPKE-encrypt the query to the
+  **target** resolver and relay it through an **oblivious proxy**, so the proxy
+  sees the client IP but not the query, and the target sees the query but not
+  the client IP. No single party can correlate "who asked what."
+- **Blocker:** *not* upstream-blocked (Cloudflare's `odoh-rs` implements RFC
+  9230 and the DNS wire format stays `hickory-proto`). It needs a design pass +
+  full verification because it is a **parallel upstream arm bypassing
+  `hickory-resolver`**: DNSSEC validation, fail-closed → SERVFAIL (never a plain
+  DoH fallback), ECS stripping, and the rebinding-defence rdata filter must all
+  be re-applied on the ODoH arm. A half-implementation that silently falls back
+  de-anonymises the operator, so it is gated behind that verification.
+- **Scaffolding (shipped):** `UpstreamProtocol::Odoh` + `upstream.odoh_proxy`
+  are reserved in the schema so a config written today is forward-compatible.
+  Enabling `protocol = "odoh"` is **rejected fail-closed** at both
+  `validate_config` and `Resolver::new` — the daemon refuses to start rather
+  than resolve over plain DoH. `odoh-rs`/`hpke` are deliberately **not** added
+  as dependencies until the arm is implemented (no unused attack surface).
+- **Doc mentions:** `docs/security.md` §"Oblivious DoH"; `docs/architecture.md`
+  resolver table; `crates/rustydns-resolver/src/lib.rs` crate-level table;
+  `rustydns.example.toml` `[upstream]` block; `docs/TODO.md` §7.3.
+
+---
+
 
 - **A local persistent store** — mesh data lives in the signed bundle file
   (`docs/integration-rustynet.md`); the daemon has no other persistent state

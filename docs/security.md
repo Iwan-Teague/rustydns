@@ -103,6 +103,30 @@ When multiple upstream resolvers are configured, RustyDNS selects among them ran
 per query. No single resolver builds a complete query history. Operators should configure
 resolvers from different jurisdictions and operators.
 
+### Oblivious DoH (ODoH, RFC 9230) — scaffolded, not yet implemented
+
+With plain DoH/DoQ the upstream resolver sees **both** the query content **and** the
+client's IP, so it can build a per-client profile. ODoH breaks that link: the query is
+HPKE-encrypted to the **target** resolver and relayed through an **oblivious proxy**, so
+the proxy sees the client IP but not the query, and the target sees the query but not the
+client IP — no single party can correlate "who asked what." This is the highest-leverage
+*anonymity* upgrade for rustydns and a direct fit for its #1 design goal.
+
+**Status: the configuration schema is reserved, but the resolver arm is not wired yet.**
+`upstream.protocol = "odoh"` and `upstream.odoh_proxy` exist so a config written today is
+forward-compatible, but enabling ODoH is **rejected at startup with a hard error** — in
+two places (config validation and the resolver constructor). This is deliberate and
+fail-closed: a half-implemented ODoH arm that silently fell back to plain DoH on any error
+would de-anonymise the very operator who asked for anonymity, which is worse than not
+offering it. rustydns will **never** resolve over plain DoH when ODoH was requested.
+
+When the arm is implemented it will be a *parallel* upstream that bypasses
+`hickory-resolver`, so it must re-apply every invariant hickory-resolver provides today:
+DNSSEC validation over the decrypted message, fail-closed → SERVFAIL (never a DoH
+fallback), ECS stripping, and the rebinding-defence rdata filter. The `odoh-rs` + `hpke`
+crates would then enter the dependency-audit surface and be pinned + run through
+`cargo deny`. Tracked in [`roadmap.md`](roadmap.md) §"ODoH" and `docs/TODO.md` §7.3.
+
 ### DNSSEC Validation
 
 Responses from upstream are DNSSEC-validated. A resolver that returns a forged answer

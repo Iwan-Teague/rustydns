@@ -125,7 +125,19 @@ matrix added to `docs/operator-endpoints.md`.)
   cardinality + the privacy posture need care (never label by qname/client).
   Bounded label sets only.
 
-- **7.3 🟠 Oblivious DoH (ODoH, RFC 9230) upstream transport — L.**
+- **7.3 🟠 Oblivious DoH (ODoH, RFC 9230) upstream transport — L. SCAFFOLDED,
+  arm not yet implemented (flagged).** The config schema is reserved
+  (`UpstreamProtocol::Odoh` + `upstream.odoh_proxy`) so a config written today
+  is forward-compatible, and enabling `protocol = "odoh"` is **rejected
+  fail-closed** at both `validate_config` and `Resolver::new` — rustydns refuses
+  to start rather than silently resolve over plain DoH (which would
+  de-anonymise). The crypto deps (`odoh-rs`/`hpke`) are deliberately NOT added
+  yet (no unused attack surface). **Remaining (the actual arm):** HPKE
+  encode/decode via `odoh-rs`, `reqwest` POST to the proxy, and re-applying
+  DNSSEC validation + fail-closed + ECS strip + rebinding filter on the parallel
+  arm — plus end-to-end verification against a real target+proxy (could not be
+  done this session offline). Tracked in `docs/roadmap.md` §ODoH and
+  `docs/security.md` §"Oblivious DoH".
   **The single highest-leverage *anonymity* feature** for rustydns, and a direct
   fit for the project's #1 design goal ("Security, privacy, and anonymity are the
   highest-priority design goals"). With plain DoH/DoQ, the upstream resolver

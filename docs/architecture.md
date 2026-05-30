@@ -88,6 +88,7 @@ Recursive resolver forwarding to upstream servers using DoH (default) or DoQ. Pr
 | DNS-rebinding defence (drop private rdata) | — | ✓ implemented (`upstream.block_private_rdata`, default off) |
 | Query Name Minimisation | RFC 7816 | ⏳ pending (hickory 0.26 still doesn't expose qmin) |
 | DoH query/response padding | RFC 8467 | ⏳ pending (hickory 0.26 still doesn't expose RFC 8467) |
+| Oblivious DoH (target never learns client IP) | RFC 9230 | ⏳ scaffolded — `upstream.protocol = "odoh"` + `upstream.odoh_proxy` schema reserved; **rejected at startup** (fail-closed, never falls back to plain DoH). See `docs/roadmap.md` §ODoH |
 
 **There is no stale-answer mode.** When `fail_closed = true` (the default), a failure of all upstreams returns `SERVFAIL`. Returning a stale answer without indicating staleness is a silent privacy degradation — a client might rely on that answer for a domain that has since changed, or the cached answer may have been for a different client's query.
 

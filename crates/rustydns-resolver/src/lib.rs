@@ -13,6 +13,7 @@
 //! |---------|-----|---------|------------|--------|
 //! | DNS-over-HTTPS upstream | RFC 8484 | ✓ | `upstream.protocol = "doh"` | implemented |
 //! | DNS-over-QUIC upstream | RFC 9250 | opt-in | `upstream.protocol = "doq"` | implemented (via hickory `quic-ring` feature → `NameServerConfig::quic`) |
+//! | Oblivious DoH upstream | RFC 9230 | opt-in | `upstream.protocol = "odoh"` | **scaffolded** — schema reserved (`+ upstream.odoh_proxy`); rejected at startup (fail-closed, never plain-DoH fallback). See `docs/roadmap.md` §ODoH. |
 //! | TLS 1.3 minimum | RFC 8446 | ✓ | `upstream.min_tls_version = "1.3"` | implemented |
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
@@ -204,6 +205,19 @@ impl Resolver {
         if config.upstream.resolvers.is_empty() {
             return Err(RustyDnsError::Config(
                 "upstream.resolvers is empty — at least one resolver URL is required".to_string(),
+            ));
+        }
+
+        // ODoH (RFC 9230) is scaffolded but NOT implemented (TODO 7.3).
+        // Fail closed here as a second line of defence behind validate_config:
+        // building any arm for protocol=odoh would resolve over plain DoH and
+        // silently de-anonymise the operator. Never do that.
+        if config.upstream.protocol == UpstreamProtocol::Odoh {
+            return Err(RustyDnsError::Config(
+                "upstream.protocol = \"odoh\" (Oblivious DoH, RFC 9230) is not yet implemented. \
+                 Refusing to start rather than fall back to plain DoH, which would de-anonymise \
+                 you. Use \"doh\" or \"doq\". See docs/roadmap.md §7.3."
+                    .to_string(),
             ));
         }
 
@@ -576,6 +590,9 @@ fn default_port(scheme: &str, protocol: UpstreamProtocol) -> u16 {
             UpstreamProtocol::Doh => 443,
             UpstreamProtocol::Doq => 853,
             UpstreamProtocol::Plain => 53,
+            // ODoH targets are https — but ODoH is rejected before we get
+            // here (see `Resolver::new_internal`); this is for exhaustiveness.
+            UpstreamProtocol::Odoh => 443,
         },
     }
 }
@@ -703,6 +720,16 @@ async fn build_name_servers(
             ),
             UpstreamProtocol::Doq => NameServerConfig::quic(ip, server_name.clone()),
             UpstreamProtocol::Plain => NameServerConfig::udp_and_tcp(ip),
+            // Fail-closed: ODoH is a parallel arm that does NOT go through
+            // hickory's NameServerConfig. It must never be coerced into a
+            // plain DoH NameServerConfig (that would de-anonymise). Reject.
+            UpstreamProtocol::Odoh => {
+                return Err(RustyDnsError::Resolver(
+                    "ODoH (RFC 9230) is not yet implemented; protocol=odoh must not build an \
+                     upstream arm. This should have been rejected by validate_config."
+                        .to_string(),
+                ));
+            }
         };
         // hickory 0.26's `NameServerConfig::{https,quic,udp_and_tcp}`
         // pin every ConnectionConfig to the protocol's default port
@@ -1370,6 +1397,23 @@ mod tests {
             .await
             .expect("localhost must resolve");
         assert!(!ips.is_empty());
+    }
+
+    #[tokio::test]
+    async fn odoh_protocol_rejected_at_new() {
+        // Fail-closed: even a well-shaped ODoH config must not build a resolver
+        // (it would otherwise resolve over plain DoH and de-anonymise).
+        let mut cfg = DnsConfig::default();
+        cfg.upstream.protocol = UpstreamProtocol::Odoh;
+        cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
+        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        let err = Resolver::new(cfg).await.unwrap_err();
+        match err {
+            RustyDnsError::Config(msg) => {
+                assert!(msg.contains("not yet implemented"), "msg={msg}")
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
     }
 
     #[tokio::test]

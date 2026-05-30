@@ -394,6 +394,21 @@ pub enum UpstreamProtocol {
     /// in production. A persistent `tracing::warn!` is emitted on every startup
     /// when this is configured.
     Plain,
+    /// Oblivious DNS-over-HTTPS (ODoH, RFC 9230) — **reserved, not yet
+    /// implemented.**
+    ///
+    /// ODoH HPKE-encrypts the query to the *target* resolver and relays it
+    /// through an *oblivious proxy* (`upstream.odoh_proxy`), so the proxy sees
+    /// the client IP but not the query, and the target sees the query but not
+    /// the client IP — no single party can correlate "who asked what."
+    ///
+    /// The schema is reserved here so a config written today is forward-
+    /// compatible, but the resolver arm is not wired yet. Setting
+    /// `protocol = "odoh"` is **rejected at startup** (a hard error): enabling
+    /// it would not provide the anonymity it implies, and rustydns will never
+    /// silently fall back to plain DoH (that would de-anonymise you). Tracked
+    /// in `docs/roadmap.md` / `docs/TODO.md` §7.3.
+    Odoh,
 }
 
 /// Minimum TLS version for all upstream encrypted connections.
@@ -506,6 +521,17 @@ pub struct UpstreamConfig {
     /// `docs/architecture.md` is preserved unchanged.
     #[serde(default)]
     pub routes: Vec<UpstreamRoute>,
+
+    /// Oblivious proxy URL for ODoH (RFC 9230) — **reserved, not yet wired.**
+    ///
+    /// When ODoH lands, this is the `https://` oblivious-proxy endpoint that
+    /// relays the HPKE-encrypted query to the target resolver (the `resolvers`
+    /// entries act as the ODoH *target*). Choose a proxy operationally
+    /// independent from the target, or the anonymity guarantee collapses. The
+    /// field is reserved now for forward-compatible configs; see
+    /// [`UpstreamProtocol::Odoh`]. Default: `None`.
+    #[serde(default)]
+    pub odoh_proxy: Option<String>,
 }
 
 impl Default for UpstreamConfig {
@@ -520,6 +546,7 @@ impl Default for UpstreamConfig {
             max_cache_entries: default_max_cache_entries(),
             block_private_rdata: false,
             routes: Vec::new(),
+            odoh_proxy: None,
         }
     }
 }
@@ -1260,6 +1287,46 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         ));
     }
 
+    // ODoH (RFC 9230) scaffolding (TODO 7.3): the schema is reserved so a
+    // config written today is forward-compatible, but the resolver arm is not
+    // wired yet. We reject `protocol = "odoh"` at startup rather than silently
+    // resolving over plain DoH — falling back would de-anonymise the operator,
+    // which is exactly what ODoH exists to prevent. Validate the forward-compat
+    // shape first (so a future config is known-good), then fail closed.
+    if cfg.upstream.protocol == UpstreamProtocol::Odoh {
+        for url in &cfg.upstream.resolvers {
+            if !url.starts_with("https://") {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "upstream.protocol = \"odoh\" but target resolver `{url}` is not an https:// \
+                     URL. The ODoH target must be an https:// endpoint."
+                )));
+            }
+        }
+        match &cfg.upstream.odoh_proxy {
+            None => {
+                return Err(crate::RustyDnsError::Config(
+                    "upstream.protocol = \"odoh\" requires upstream.odoh_proxy (the oblivious \
+                     proxy URL that relays the encrypted query to the target)."
+                        .to_string(),
+                ));
+            }
+            Some(p) if !p.starts_with("https://") => {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "upstream.odoh_proxy `{p}` must be an https:// URL."
+                )));
+            }
+            Some(_) => {}
+        }
+        return Err(crate::RustyDnsError::Config(
+            "upstream.protocol = \"odoh\" (Oblivious DoH, RFC 9230) is not yet implemented in \
+             this build. The schema is reserved so a future config is forward-compatible, but \
+             enabling it today would NOT provide the anonymity it implies — and rustydns will \
+             never silently fall back to plain DoH (that would de-anonymise you). Use \"doh\" or \
+             \"doq\" until ODoH ships. Tracked in docs/roadmap.md §7.3."
+                .to_string(),
+        ));
+    }
+
     // All resolver URLs must be https:// or quic:// (or — only when the
     // selected protocol is "plain" — bare host:port), AND the scheme
     // has to match `upstream.protocol`. Mismatches (e.g. protocol=doq
@@ -1308,6 +1375,9 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                     )));
                 }
             }
+            // ODoH is handled (and rejected, fail-closed) before this loop;
+            // this arm only satisfies exhaustiveness.
+            UpstreamProtocol::Odoh => {}
         }
     }
 
@@ -1411,6 +1481,14 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                              (e.g. \"192.168.1.1:53\")."
                         )));
                     }
+                }
+                UpstreamProtocol::Odoh => {
+                    return Err(crate::RustyDnsError::Config(format!(
+                        "upstream.routes[{idx}].protocol = \"odoh\" is not supported — ODoH (RFC \
+                         9230) applies only to the global upstream (it needs upstream.odoh_proxy), \
+                         not to a conditional-forwarding route. (Also, ODoH is not yet \
+                         implemented — see docs/roadmap.md §7.3.)"
+                    )));
                 }
             }
         }
@@ -1878,6 +1956,57 @@ mod tests {
         // The plaintext upstream emits a startup warning but does not
         // reject — the operator is informed but free to proceed.
         validate_config(&cfg).expect("bare host:port with plain protocol must validate");
+    }
+
+    // --- ODoH scaffolding (TODO 7.3) — reserved schema, fail-closed -----
+
+    #[test]
+    fn protocol_odoh_without_proxy_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Odoh;
+        cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
+        cfg.upstream.odoh_proxy = None;
+        assert_config_err(validate_config(&cfg), "requires upstream.odoh_proxy");
+    }
+
+    #[test]
+    fn protocol_odoh_non_https_target_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Odoh;
+        cfg.upstream.resolvers = vec!["quic://odoh.example".to_string()];
+        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        assert_config_err(validate_config(&cfg), "not an https://");
+    }
+
+    #[test]
+    fn protocol_odoh_non_https_proxy_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Odoh;
+        cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
+        cfg.upstream.odoh_proxy = Some("http://proxy.example".to_string());
+        assert_config_err(validate_config(&cfg), "must be an https://");
+    }
+
+    #[test]
+    fn protocol_odoh_well_formed_still_rejected_not_implemented() {
+        // Even a perfectly-shaped ODoH config is rejected fail-closed: the arm
+        // is not wired and we must never fall back to plain DoH.
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Odoh;
+        cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
+        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        assert_config_err(validate_config(&cfg), "not yet implemented");
+    }
+
+    #[test]
+    fn route_protocol_odoh_rejected() {
+        let mut cfg = baseline();
+        cfg.upstream.routes = vec![route(
+            "corp.internal.",
+            &["https://odoh.example/dns-query"],
+            UpstreamProtocol::Odoh,
+        )];
+        assert_config_err(validate_config(&cfg), "is not supported");
     }
 
     // --- upstream.routes (conditional forwarding) ------------------
