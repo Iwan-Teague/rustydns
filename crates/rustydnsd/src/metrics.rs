@@ -8,7 +8,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::get;
-use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
+use prometheus::{Encoder, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -21,6 +21,8 @@ use crate::query_log::QueryLog;
 pub struct Metrics {
     registry: Registry,
     dns_queries_total: IntCounter,
+    queries_by_qtype: IntCounterVec,
+    responses_by_rcode: IntCounterVec,
     authority_hits_total: IntCounter,
     rewrite_hits_total: IntCounter,
     blocklist_hits_total: IntCounter,
@@ -57,6 +59,22 @@ impl Metrics {
             &registry,
             "rustydns_dns_queries_total",
             "Total DNS queries received",
+        )?;
+        let queries_by_qtype = register_counter_vec(
+            &registry,
+            "rustydns_dns_queries_by_qtype_total",
+            "DNS queries received, partitioned by query type. Bounded label set: \
+             hickory maps every RecordType to a fixed mnemonic and collapses \
+             unknown/unsupported types to \"Unknown\", so attacker-chosen qtypes \
+             cannot inflate label cardinality.",
+            "qtype",
+        )?;
+        let responses_by_rcode = register_counter_vec(
+            &registry,
+            "rustydns_dns_responses_by_rcode_total",
+            "DNS responses sent, partitioned by response code. Bounded label set: \
+             codes rustydns does not itself emit collapse to \"other\".",
+            "rcode",
         )?;
         let authority_hits_total = register_counter(
             &registry,
@@ -197,6 +215,8 @@ impl Metrics {
         Ok(Self {
             registry,
             dns_queries_total,
+            queries_by_qtype,
+            responses_by_rcode,
             authority_hits_total,
             rewrite_hits_total,
             blocklist_hits_total,
@@ -250,6 +270,27 @@ impl Metrics {
     /// Increment total DNS queries counter.
     pub fn inc_queries(&self) {
         self.dns_queries_total.inc();
+    }
+
+    /// Increment the per-qtype query counter.
+    ///
+    /// `qtype` MUST be a bounded `&'static str` — callers pass hickory's
+    /// `RecordType -> &'static str`, which is structurally bounded (a match
+    /// over a fixed set of literals; unknown types collapse to `"Unknown"`),
+    /// so an attacker sending arbitrary 16-bit qtypes cannot explode the
+    /// label cardinality of this vector (which would be a metrics-memory DoS).
+    pub fn inc_query_qtype(&self, qtype: &'static str) {
+        self.queries_by_qtype.with_label_values(&[qtype]).inc();
+    }
+
+    /// Increment the per-rcode response counter.
+    ///
+    /// `rcode` MUST be a bounded `&'static str` — the handler maps every
+    /// `ResponseCode` to a fixed set plus an `"other"` catch-all before
+    /// calling this, so label cardinality stays bounded regardless of what
+    /// rcode an upstream returns.
+    pub fn inc_response_rcode(&self, rcode: &'static str) {
+        self.responses_by_rcode.with_label_values(&[rcode]).inc();
     }
 
     /// Increment authority hit counter.
@@ -496,6 +537,20 @@ fn register_counter(
     Ok(counter)
 }
 
+fn register_counter_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    label: &str,
+) -> Result<IntCounterVec, RustyDnsError> {
+    let vec = IntCounterVec::new(Opts::new(name, help), &[label])
+        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
+    registry
+        .register(Box::new(vec.clone()))
+        .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
+    Ok(vec)
+}
+
 fn register_gauge(registry: &Registry, name: &str, help: &str) -> Result<IntGauge, RustyDnsError> {
     let gauge = IntGauge::new(name, help)
         .map_err(|e| RustyDnsError::Config(format!("metrics error: {e}")))?;
@@ -547,6 +602,46 @@ mod tests {
         assert!(!body.contains("10.0.0.7"), "raw IP leaked into /queries");
         // qname_hash field is a 16-char hex string.
         assert!(body.contains("\"qname_hash\":\""));
+    }
+
+    #[test]
+    fn qtype_and_rcode_label_vectors_increment_and_stay_bounded() {
+        let m = Metrics::new().unwrap();
+
+        // Known + unknown buckets both land on their (static) label series.
+        m.inc_query_qtype("A");
+        m.inc_query_qtype("A");
+        m.inc_query_qtype("AAAA");
+        m.inc_query_qtype("Unknown");
+        m.inc_response_rcode("NOERROR");
+        m.inc_response_rcode("NXDOMAIN");
+        m.inc_response_rcode("other");
+        m.inc_response_rcode("other");
+
+        assert_eq!(m.queries_by_qtype.with_label_values(&["A"]).get(), 2);
+        assert_eq!(m.queries_by_qtype.with_label_values(&["AAAA"]).get(), 1);
+        assert_eq!(m.queries_by_qtype.with_label_values(&["Unknown"]).get(), 1);
+        assert_eq!(
+            m.responses_by_rcode.with_label_values(&["NOERROR"]).get(),
+            1
+        );
+        assert_eq!(
+            m.responses_by_rcode.with_label_values(&["NXDOMAIN"]).get(),
+            1
+        );
+        assert_eq!(m.responses_by_rcode.with_label_values(&["other"]).get(), 2);
+
+        // The label sets only contain the values that were actually emitted —
+        // no per-input series explosion. (Each vec started empty; we touched
+        // 3 qtype labels and 3 rcode labels.)
+        let qtype_series = m
+            .registry
+            .gather()
+            .into_iter()
+            .find(|f| f.name() == "rustydns_dns_queries_by_qtype_total")
+            .map(|f| f.get_metric().len())
+            .unwrap_or(0);
+        assert_eq!(qtype_series, 3, "qtype label cardinality must be bounded");
     }
 
     #[tokio::test(flavor = "current_thread")]

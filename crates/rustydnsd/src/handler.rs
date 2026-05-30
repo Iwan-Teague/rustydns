@@ -312,6 +312,11 @@ impl DnsHandler {
         authoritative: bool,
         answers: Vec<Record>,
     ) -> ResponseInfo {
+        // Single send choke point for every response path — count the final
+        // rcode here, mapped to a bounded label set (see `rcode_metric_label`).
+        self.metrics
+            .inc_response_rcode(rcode_metric_label(response_code));
+
         // hickory 0.26: Request derefs to MessageRequest, and the
         // EDNS opt-record lives on `MessageRequest::edns` directly.
         // The builder's `.edns()` now takes `&Edns` (borrowed,
@@ -498,6 +503,10 @@ impl RequestHandler for DnsHandler {
         let qtype_label: &'static str = qtype.into();
 
         self.metrics.inc_queries();
+        // Bounded label: `qtype_label` is hickory's structurally-bounded
+        // `RecordType -> &'static str`, so attacker-chosen qtypes collapse to
+        // "Unknown" rather than inflating cardinality.
+        self.metrics.inc_query_qtype(qtype_label);
 
         let client = ClientId::from_ip(info.src.ip());
 
@@ -870,6 +879,23 @@ impl RequestHandler for DnsHandler {
 /// `zones_allowed` entries (case-insensitive, trailing-dot tolerant
 /// subdomain match). The empty list case is handled by the caller
 /// (treated as "no restriction").
+/// Map a `ResponseCode` to a bounded `&'static str` metric label. Only the
+/// codes rustydns itself emits get their own series; everything else (an
+/// unusual upstream rcode, an EDNS extended code) collapses to `"other"`, so
+/// the `rustydns_dns_responses_by_rcode_total` label set cannot be inflated
+/// into a metrics-memory DoS by attacker- or upstream-controlled rcodes.
+fn rcode_metric_label(rcode: ResponseCode) -> &'static str {
+    match rcode {
+        ResponseCode::NoError => "NOERROR",
+        ResponseCode::FormErr => "FORMERR",
+        ResponseCode::ServFail => "SERVFAIL",
+        ResponseCode::NXDomain => "NXDOMAIN",
+        ResponseCode::NotImp => "NOTIMP",
+        ResponseCode::Refused => "REFUSED",
+        _ => "other",
+    }
+}
+
 fn name_in_any_zone(qname: &str, zones: &[String]) -> bool {
     let lower = qname.trim_end_matches('.').to_ascii_lowercase();
     for zone in zones {
@@ -968,11 +994,27 @@ mod tests {
         UpstreamConfig,
     };
 
-    use super::name_in_any_zone;
+    use super::{name_in_any_zone, rcode_metric_label};
     use rustydns_resolver::Resolver;
 
     use crate::handler::DnsHandler;
     use crate::metrics::Metrics;
+
+    #[test]
+    fn rcode_metric_label_maps_known_codes_and_buckets_the_rest() {
+        // Codes rustydns emits map to their own stable series.
+        assert_eq!(rcode_metric_label(ResponseCode::NoError), "NOERROR");
+        assert_eq!(rcode_metric_label(ResponseCode::FormErr), "FORMERR");
+        assert_eq!(rcode_metric_label(ResponseCode::ServFail), "SERVFAIL");
+        assert_eq!(rcode_metric_label(ResponseCode::NXDomain), "NXDOMAIN");
+        assert_eq!(rcode_metric_label(ResponseCode::NotImp), "NOTIMP");
+        assert_eq!(rcode_metric_label(ResponseCode::Refused), "REFUSED");
+        // Anything else collapses to a single "other" bucket, so an unusual
+        // upstream rcode can never inflate the metric's label cardinality.
+        assert_eq!(rcode_metric_label(ResponseCode::NXRRSet), "other");
+        assert_eq!(rcode_metric_label(ResponseCode::YXDomain), "other");
+        assert_eq!(rcode_metric_label(ResponseCode::NotAuth), "other");
+    }
 
     /// Daemon test harness: pipeline wired, listening on a randomly
     /// assigned loopback port. `port` is the bound UDP port.

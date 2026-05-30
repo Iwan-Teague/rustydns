@@ -62,6 +62,7 @@ Standard Prometheus exposition over the `prometheus` crate's
 | Series                                  | Type    | Meaning                                          |
 |-----------------------------------------|---------|--------------------------------------------------|
 | `rustydns_dns_queries_total`            | counter | Every accepted query                             |
+| `rustydns_dns_queries_by_qtype_total`   | counter | Accepted queries partitioned by a `qtype` label (`A`/`AAAA`/`HTTPS`/…) |
 | `rustydns_authority_hits_total`         | counter | Authority lookups returning records              |
 | `rustydns_rewrite_hits_total`           | counter | Queries answered by a `[[rewrite]]` rule          |
 | `rustydns_policy_schedule_blocked_total` | counter | Queries refused because the client was inside an active `[[policy.block_windows]]` window |
@@ -70,6 +71,15 @@ Standard Prometheus exposition over the `prometheus` crate's
 | `rustydns_blocklist_response_ip_blocked_total` | counter | Queries blocked because a resolved A/AAAA was on the response-IP denylist |
 | `rustydns_resolver_queries_total`       | counter | Queries forwarded to an upstream                 |
 | `rustydns_resolver_failures_total`      | counter | Resolver failures returned as SERVFAIL           |
+| `rustydns_dns_responses_by_rcode_total` | counter | Responses sent partitioned by an `rcode` label (`NOERROR`/`NXDOMAIN`/`SERVFAIL`/`REFUSED`/`FORMERR`/`NOTIMP`) |
+
+The two partitioned series above use **bounded label sets** by design — a
+privacy- and DoS-safety choice, not an oversight. The `qtype` label comes from
+hickory's fixed `RecordType` mnemonics (unknown/unsupported types collapse to
+`Unknown`), and the `rcode` label maps any code rustydns does not itself emit to
+`other`. Neither is ever labelled by qname or client, and neither can be
+inflated into unbounded cardinality (a metrics-memory exhaustion vector) by
+attacker-chosen query types or unusual upstream response codes.
 
 ### Blocklist state
 

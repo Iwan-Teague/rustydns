@@ -145,9 +145,18 @@ matrix added to `docs/operator-endpoints.md`.)
   `LISTEN_FDS`/`LISTEN_PID`, adopt pre-bound fds into the listener setup, ship a
   `.socket` unit, and design a non-systemd fallback) — not a library feature
   that can be wired in safely without that design pass. Deferred deliberately.
-- **7.2 ⚪ Per-qtype / per-rcode metrics** — useful for operators, but label
-  cardinality + the privacy posture need care (never label by qname/client).
-  Bounded label sets only.
+- **7.2 ✅ Per-qtype / per-rcode metrics — DONE.** Added
+  `rustydns_dns_queries_by_qtype_total{qtype}` (incremented at the query-receipt
+  choke point) and `rustydns_dns_responses_by_rcode_total{rcode}` (incremented in
+  the single `respond()` send path, so every protocol — UDP/TCP/DoT/DoH — and
+  every response branch is counted exactly once). The cardinality concern is
+  resolved by **bounded `&'static str` label sets**: `qtype` uses hickory's
+  structurally-bounded `RecordType -> &'static str` (unknown types collapse to
+  `Unknown`), and `rcode` maps any code rustydns does not emit to `other`
+  (`handler::rcode_metric_label`). Neither labels by qname/client, so the privacy
+  posture holds and attacker-chosen qtypes/rcodes cannot exhaust metrics memory.
+  Unit-tested in `metrics.rs` (increment + bounded series count) and `handler.rs`
+  (rcode bucketing); documented in `docs/operator-endpoints.md`.
 
 - **7.3 🟠 Oblivious DoH (ODoH, RFC 9230) upstream transport — L. SCAFFOLDED,
   arm not yet implemented (flagged).** The config schema is reserved
