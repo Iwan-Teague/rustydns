@@ -545,4 +545,122 @@ mod tests {
         let entries = parse(content);
         assert_eq!(entries, vec![exact("normal.example.com")]);
     }
+
+    /// Assert every emitted entry satisfies the domain invariants that the
+    /// engine and the rest of the pipeline rely on.
+    fn assert_entry_invariants(entries: &[ParsedEntry], ctx: &str) {
+        for e in entries {
+            let d = match e {
+                ParsedEntry::Exact(d) | ParsedEntry::WildcardParent(d) | ParsedEntry::Allow(d) => d,
+            };
+            assert!(!d.is_empty(), "empty entry from {ctx:?}");
+            assert!(
+                d.len() <= MAX_DOMAIN_BYTES,
+                "oversized entry `{d}` from {ctx:?}"
+            );
+            assert!(
+                d.bytes().all(|b| b.is_ascii() && !b.is_ascii_control()),
+                "non-ASCII/control byte in `{d}` from {ctx:?}"
+            );
+            assert!(!d.contains(".."), "consecutive dots in `{d}` from {ctx:?}");
+            assert!(
+                d.split('.').all(|l| l.len() <= MAX_LABEL_BYTES),
+                "oversized label in `{d}` from {ctx:?}"
+            );
+            // validate_and_normalize lowercases; no uppercase should survive.
+            assert!(
+                !d.bytes().any(|b| b.is_ascii_uppercase()),
+                "uppercase survived in `{d}` from {ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_property_no_panic_and_invariants_hold() {
+        // Property/fuzz (TODO 4.5): build many lines from a palette of
+        // adversarial fragments and confirm NO format parser panics and every
+        // emitted entry satisfies the domain invariants. Untrusted blocklist
+        // CDN content reaches these parsers, so panic=abort makes a panic here
+        // a remote DoS. Deterministic LCG → reproducible.
+        let long_label = "a".repeat(70);
+        let long_domain = "a".repeat(300);
+        let fragments: Vec<&str> = vec![
+            "",
+            " ",
+            "\t",
+            "#",
+            ";",
+            "!",
+            "[",
+            "||",
+            "@@||",
+            "^",
+            "0.0.0.0",
+            "127.0.0.1",
+            "::1",
+            "CNAME",
+            "A",
+            "TXT",
+            ".",
+            "rpz-passthru.",
+            "*.",
+            "..",
+            "a",
+            &long_label,
+            &long_domain,
+            "ünïçödé",
+            "ads.example.com",
+            "\u{0000}",
+            "\u{007f}",
+            "\u{0080}",
+            "🎉",
+            "a/b",
+            "google.com",
+            "-",
+            "xn--caf-dma.example.com",
+        ];
+
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n
+        };
+
+        for _ in 0..5000 {
+            let parts = 1 + next(6);
+            let mut line = String::new();
+            for _ in 0..parts {
+                line.push_str(fragments[next(fragments.len())]);
+                if next(2) == 0 {
+                    line.push(' ');
+                }
+            }
+            let content = format!("{line}\n");
+
+            // Auto-detect path AND each format parser directly — none may panic.
+            assert_entry_invariants(&parse(&content), &content);
+            assert_entry_invariants(&parse_hosts(&content), &content);
+            assert_entry_invariants(&parse_plain(&content), &content);
+            assert_entry_invariants(&parse_rpz(&content), &content);
+            assert_entry_invariants(&parse_adguard(&content), &content);
+        }
+    }
+
+    #[test]
+    fn parser_handles_pathological_whitespace_and_length() {
+        // Lines at and beyond the byte caps, plus odd whitespace runs.
+        let cases = [
+            format!("0.0.0.0 {}\n", "a".repeat(MAX_LINE_BYTES)),
+            format!("0.0.0.0 {}\n", "a".repeat(MAX_LINE_BYTES + 5000)),
+            format!("{}\n", " ".repeat(1000)),
+            "\u{0}\u{0}\u{0}\n".to_string(),
+            "||\u{0}^\n".to_string(),
+            format!("||{}^\n", "x".repeat(400)),
+        ];
+        for c in &cases {
+            assert_entry_invariants(&parse(c), c);
+        }
+    }
 }

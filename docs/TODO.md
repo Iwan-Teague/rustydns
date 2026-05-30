@@ -57,18 +57,29 @@ design pass for the live-handover model. Privileged-port caveat (§4 of
   automated test. Add an integration test: start with DoT on an unprivileged
   port + a self-signed cert (use `test_pem`), SIGHUP with a new cert, assert the
   listener rebinds and serves the new cert (TLS client checks the presented
-  cert). Files: `crates/rustydnsd/tests/`.
+  cert). Files: `crates/rustydnsd/tests/`. **Partial:** DoT over a real TLS
+  handshake is covered by `handler.rs::dot_listener_serves_authority_hit_over_real_tls_handshake`,
+  and the live SO_REUSEPORT listener-rebind path by `tests/sighup_reload.rs`
+  (DNS+metrics). The *cert-swap-on-SIGHUP* assertion specifically is still
+  manual.
 - **4.2 🟠 ActiveListeners DoH-group reload** — the e2e covers DNS+metrics
   rebind and the privileged-port refusal; DoH **add/remove/move** on reload is
   only manually verified. Extend `tests/sighup_reload.rs`.
-- **4.3 🟠 Resolver mock coverage** — AGENTS.md asks for `wiremock`/axum mock-DoH
-  tests covering ECS stripping, DNSSEC pass/fail, fail-closed, TLS 1.3
-  enforcement, padding behaviour. Current resolver tests lean on classifier unit
-  tests; add a mock upstream. Files: `crates/rustydns-resolver/`.
-- **4.5 🟡 Property/fuzz tests for parsers** — blocklist parser and mesh field
-  parser process semi-trusted input; add `proptest`-style "no panic, invariants
-  hold" tests (e.g. allowlist entries always ≥ 2 labels, no `http://` sources,
-  bounded output). Files: `crates/rustydns-blocklist/`, `crates/rustydns-authority/src/mesh.rs`.
+- **4.3 ✅ Resolver mock coverage — DONE for the testable cases.** Added a UDP
+  mock-upstream harness in `tests/upstream_e2e.rs` plus handler-level mock
+  harnesses covering: fail-closed → SERVFAIL, ECS stripping (no EDNS Client
+  Subnet on the wire even with EDNS0 on), NXDOMAIN vs NODATA, cache reuse,
+  conditional-forwarding dispatch, rebinding-defence default-vs-route, CNAME
+  cloaking, response-IP denylist, and rewrites. **Remaining (need a TLS mock,
+  not a plain-UDP one):** DNSSEC *pass* with a signed zone, and TLS-1.3-floor
+  rejection of a 1.2-only upstream. Padding is upstream-blocked (§1.2).
+- **4.5 ✅ Property/fuzz tests for parsers — DONE (blocklist).** Dependency-free
+  fuzz over the blocklist parser (5000 LCG-generated adversarial inputs across
+  all four formats): no panic, and every emitted entry satisfies the domain
+  invariants (ASCII, ≤253 B, ≤63 B labels, no empty labels, lowercased). The
+  mesh field parser is signature-gated (untrusted bytes never reach the record
+  loop without the signing key), and its malformed-payload rejections are
+  already covered by the `mesh::tests` suite.
 
 ---
 

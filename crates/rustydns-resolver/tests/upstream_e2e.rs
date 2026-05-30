@@ -400,6 +400,63 @@ async fn rebinding_defence_disabled_lets_private_through() {
 }
 
 #[tokio::test]
+async fn resolver_never_sends_edns_client_subnet() {
+    // PRIVACY (RFC 7871): the resolver must never advertise EDNS Client Subnet
+    // upstream — that would leak the client's network to the upstream/CDN.
+    // Enable DNSSEC so EDNS0 IS present on the wire (DO bit), making this the
+    // meaningful case: EDNS0 on, but ClientSubnet absent. The response is
+    // unsigned so validation fails (we ignore the SERVFAIL); the mock has
+    // already inspected the outgoing query.
+    use hickory_proto::rr::rdata::opt::EdnsCode;
+    use std::sync::atomic::AtomicBool;
+
+    let saw_ecs = Arc::new(AtomicBool::new(false));
+    let flag = saw_ecs.clone();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (n, src) = match socket.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                continue;
+            };
+            if query
+                .edns
+                .as_ref()
+                .is_some_and(|e| e.option(EdnsCode::Subnet).is_some())
+            {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let Some(q) = query.queries.first() else {
+                continue;
+            };
+            let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.add_query(q.clone());
+            resp.add_answer(a_record(q.name(), Ipv4Addr::new(1, 2, 3, 4), 300));
+            if let Ok(bytes) = resp.to_bytes() {
+                let _ = socket.send_to(&bytes, src).await;
+            }
+        }
+    });
+
+    let mut cfg = plain_config(&addr.to_string());
+    cfg.upstream.dnssec_validation = true; // turns EDNS0 on
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+    // The answer is unsigned → validation fails → Err; we only care that the
+    // outgoing query carried no ECS.
+    let _ = resolver.resolve("example.com.", "A").await;
+    assert!(
+        !saw_ecs.load(Ordering::SeqCst),
+        "resolver must never advertise EDNS Client Subnet"
+    );
+}
+
+#[tokio::test]
 async fn nxdomain_upstream_sets_nxdomain_flag() {
     // Upstream says the name does not exist (NXDOMAIN, no answers). The
     // resolver must surface that as an empty outcome with nxdomain = true so
