@@ -19,6 +19,7 @@
 //! atomically swap the pointer. Readers in flight see either the old or new
 //! state, never a partial one.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -134,6 +135,11 @@ pub struct BlocklistEngine {
     /// Compiled regex block rules (startup-fixed). Cloned into each new
     /// [`BlocklistState`] on reload (cheap — the automaton is shared).
     regex_rules: RegexRules,
+    /// Per-client blocklist groups (TODO 8.6): one swappable state per named
+    /// `[[blocklist.groups]]` entry. A client assigned to a group is matched
+    /// against its state instead of the global `state`. The global regex rules
+    /// still apply (cloned into each group state).
+    groups: HashMap<String, ArcSwap<BlocklistState>>,
 }
 
 impl BlocklistEngine {
@@ -162,24 +168,35 @@ impl BlocklistEngine {
         };
         let mut initial = BlocklistState::new_empty(allowlist);
         initial.regex_rules = regex_rules.clone();
+        // One empty state per configured group; content is filled by the loader.
+        let groups: HashMap<String, ArcSwap<BlocklistState>> = config
+            .groups
+            .iter()
+            .map(|g| {
+                let mut st = BlocklistState::new_empty(Allowlist::from_entries(&g.allowlist));
+                st.regex_rules = regex_rules.clone();
+                (g.name.clone(), ArcSwap::from_pointee(st))
+            })
+            .collect();
         Self {
             state: ArcSwap::from_pointee(initial),
             config,
             response_ip_denylist,
             regex_rules,
+            groups,
         }
     }
 
-    /// Load and merge multiple blocklist sources.
-    ///
-    /// Each source is paired with a [`BlocklistSource`] trust level. Allow
-    /// entries from untrusted sources are discarded with a warning; allow
-    /// entries from trusted sources are added to the allowlist.
-    ///
-    /// All sources are processed before the atomic state swap — exactly one
-    /// swap per reload regardless of source count.
-    pub fn load_many_with_trust(&self, sources: &[(&str, BlocklistSource)]) {
-        let mut state = BlocklistState::new_empty(Allowlist::from_entries(&self.config.allowlist));
+    /// Build a [`BlocklistState`] from `sources` using `allowlist_entries` as
+    /// the base allowlist. `label` names the set in log output (`"default"` or
+    /// a group name). Shared by the global loader and the per-group loader.
+    fn build_state(
+        &self,
+        sources: &[(&str, BlocklistSource)],
+        allowlist_entries: &[String],
+        label: &str,
+    ) -> BlocklistState {
+        let mut state = BlocklistState::new_empty(Allowlist::from_entries(allowlist_entries));
         let mut trusted_allows: Vec<String> = Vec::new();
 
         for (content, trust) in sources {
@@ -222,6 +239,7 @@ impl BlocklistEngine {
         state.heap_bytes = state.entry_count * 80;
 
         info!(
+            group = %label,
             exact = state.domains.len(),
             wildcards = state.wildcard_parents.len(),
             total = state.entry_count,
@@ -247,7 +265,40 @@ impl BlocklistEngine {
             );
         }
 
+        state
+    }
+
+    /// Load and merge multiple blocklist sources into the **global** state.
+    ///
+    /// Each source is paired with a [`BlocklistSource`] trust level. Allow
+    /// entries from untrusted sources are discarded with a warning; allow
+    /// entries from trusted sources are added to the allowlist.
+    ///
+    /// All sources are processed before the atomic state swap — exactly one
+    /// swap per reload regardless of source count.
+    pub fn load_many_with_trust(&self, sources: &[(&str, BlocklistSource)]) {
+        let state = self.build_state(sources, &self.config.allowlist, "default");
         self.state.store(Arc::new(state));
+    }
+
+    /// Load sources into a named per-client group's state (TODO 8.6). No-op
+    /// (with a warning) if `group` is not a configured group.
+    pub fn load_group(
+        &self,
+        group: &str,
+        sources: &[(&str, BlocklistSource)],
+        allowlist_entries: &[String],
+    ) {
+        match self.groups.get(group) {
+            Some(slot) => {
+                let state = self.build_state(sources, allowlist_entries, group);
+                slot.store(Arc::new(state));
+            }
+            None => warn!(
+                group,
+                "load_group called for an unknown blocklist group — ignoring"
+            ),
+        }
     }
 
     /// Convenience: load a single content string, treated as untrusted.
@@ -260,12 +311,28 @@ impl BlocklistEngine {
         self.load_many_with_trust(&[(content, BlocklistSource::Trusted)]);
     }
 
-    /// Returns `true` if `domain` is blocked.
+    /// Returns `true` if `domain` is blocked by the **global** blocklist.
     ///
     /// Lock-free, allocation-free for the common case. Hot path.
     #[inline]
     pub fn is_blocked(&self, domain: &str) -> bool {
-        self.state.load().is_blocked(domain)
+        self.is_blocked_for_group(domain, None)
+    }
+
+    /// Returns `true` if `domain` is blocked for a client in `group` (TODO
+    /// 8.6). `None`, or an unknown group name, falls back to the global
+    /// blocklist. Lock-free; the group lookup is a single `HashMap` get.
+    #[inline]
+    pub fn is_blocked_for_group(&self, domain: &str, group: Option<&str>) -> bool {
+        match group.and_then(|g| self.groups.get(g)) {
+            Some(slot) => slot.load().is_blocked(domain),
+            None => self.state.load().is_blocked(domain),
+        }
+    }
+
+    /// Names of the configured blocklist groups (for the loader to iterate).
+    pub fn group_names(&self) -> Vec<String> {
+        self.groups.keys().cloned().collect()
     }
 
     /// Number of blocking entries currently loaded (exact + wildcard).
@@ -457,6 +524,67 @@ mod tests {
         assert!(e.is_blocked("tracker.ads.example.com"));
         // allowlisted → the allowlist wins over the regex
         assert!(!e.is_blocked("safe.ads.example.com"));
+    }
+
+    #[test]
+    fn group_uses_its_own_blocklist() {
+        let cfg = BlocklistConfig {
+            groups: vec![rustydns_core::config::BlocklistGroup {
+                name: "strict".to_string(),
+                sources: Vec::new(),
+                local_files: Vec::new(),
+                trusted_rpz_sources: Vec::new(),
+                allowlist: Vec::new(),
+            }],
+            ..BlocklistConfig::default()
+        };
+        let e = BlocklistEngine::new(cfg);
+        // Global blocks ads.example.com; the "strict" group blocks a different
+        // name (tracker.example.net) and NOT ads.
+        e.load("0.0.0.0 ads.example.com\n");
+        e.load_group(
+            "strict",
+            &[("0.0.0.0 tracker.example.net\n", BlocklistSource::Untrusted)],
+            &[],
+        );
+
+        // Default (no group) → the global set.
+        assert!(e.is_blocked_for_group("ads.example.com", None));
+        assert!(!e.is_blocked_for_group("tracker.example.net", None));
+        assert!(e.is_blocked("ads.example.com")); // convenience == group None
+
+        // "strict" group → its OWN set, independent of the global one.
+        assert!(e.is_blocked_for_group("tracker.example.net", Some("strict")));
+        assert!(!e.is_blocked_for_group("ads.example.com", Some("strict")));
+
+        // Unknown group name → falls back to the global set (never a panic).
+        assert!(e.is_blocked_for_group("ads.example.com", Some("nope")));
+        assert!(!e.is_blocked_for_group("tracker.example.net", Some("nope")));
+    }
+
+    #[test]
+    fn group_has_its_own_allowlist() {
+        let cfg = BlocklistConfig {
+            groups: vec![rustydns_core::config::BlocklistGroup {
+                name: "g".to_string(),
+                sources: Vec::new(),
+                local_files: Vec::new(),
+                trusted_rpz_sources: Vec::new(),
+                allowlist: vec!["safe.example.com".to_string()],
+            }],
+            ..BlocklistConfig::default()
+        };
+        let e = BlocklistEngine::new(cfg);
+        e.load_group(
+            "g",
+            &[(
+                "0.0.0.0 safe.example.com\n0.0.0.0 bad.example.com\n",
+                BlocklistSource::Untrusted,
+            )],
+            &["safe.example.com".to_string()],
+        );
+        assert!(!e.is_blocked_for_group("safe.example.com", Some("g")));
+        assert!(e.is_blocked_for_group("bad.example.com", Some("g")));
     }
 
     #[test]

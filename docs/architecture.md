@@ -102,6 +102,7 @@ Fast in-memory blocklist engine. Key properties:
 - **Lock-free hot-reload** via `arc-swap` — readers never block during reload.
 - **Wildcard blocking** — RPZ `*.example.com` and AdGuard `||example.com^` rules.
 - **Regex block rules** — `blocklist.regex_rules` (power users) match the QNAME with a **linear-time** finite-automata engine (`regex`, no ReDoS); bounded by pattern length (≤ 512 B), count (≤ 1000), and compiled size (1 MiB). Checked alongside the exact/wildcard sets; the allowlist still wins.
+- **Per-client blocklist groups** — `[[blocklist.groups]]` define independent named block sets (own sources/allowlist). A `[[policy]].blocklist_group` assigns a client to a group; that client is matched against the group's set instead of the global one (the global response settings — `block_response`/regex/response-IP/cname-cloaking — still apply). Each group is its own swappable `BlocklistState`; the lookup is `is_blocked_for_group(qname, group)`.
 - **Suffix-aware allowlist** — `*.example.com` whitelists all subdomains; exact match does not.
 - **Four input formats** — hosts, plain domain list, RPZ, AdGuard/uBlock (auto-detected per source).
 - **Domain validation** — label length (63 bytes), total length (253 bytes), control character rejection.

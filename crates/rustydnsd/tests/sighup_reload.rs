@@ -34,16 +34,37 @@ fn free_port() -> u16 {
 }
 
 fn write_config(path: &Path, dns: u16, metrics: u16, doh: u16) {
-    let body = format!(
+    // Keep the daemon fully OFFLINE so this listener-reload test is
+    // deterministic: no remote blocklist fetch, and a plain bare-IP upstream
+    // (an IP literal needs no bootstrap DNS). A `probe.mesh` static record is
+    // answered locally by the authority, so `dns_responds` never depends on a
+    // reachable public resolver.
+    std::fs::write(path, local_config_body(dns, metrics, doh)).unwrap();
+    set_mode_600(path);
+}
+
+/// The shared offline config body — also used for the in-place SIGHUP rewrite
+/// so the resolver hot-swap never bootstraps over the network either.
+fn local_config_body(dns: u16, metrics: u16, doh: u16) -> String {
+    format!(
         "[server]\n\
          listen = [\"127.0.0.1:{dns}\"]\n\
          mesh_zone = \"mesh.\"\n\
          doh_listen = \"127.0.0.1:{doh}\"\n\
          [metrics]\n\
-         listen = \"127.0.0.1:{metrics}\"\n"
-    );
-    std::fs::write(path, body).unwrap();
-    set_mode_600(path);
+         listen = \"127.0.0.1:{metrics}\"\n\
+         [blocklist]\n\
+         sources = []\n\
+         reload_interval_secs = 0\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:5353\"]\n\
+         [[authority.static_records]]\n\
+         name = \"probe.mesh\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n"
+    )
 }
 
 fn set_mode_600(path: &Path) {
@@ -97,7 +118,9 @@ fn dns_responds(port: u16) -> bool {
     msg.metadata.recursion_desired = true;
     msg.add_query({
         let mut q = Query::new();
-        q.set_name(Name::from_ascii("example.com.").unwrap())
+        // `probe.mesh` is a local static record (see `local_config_body`), so a
+        // response proves the listener is up WITHOUT needing an upstream.
+        q.set_name(Name::from_ascii("probe.mesh.").unwrap())
             .set_query_type(RecordType::A);
         q
     });
@@ -209,15 +232,10 @@ fn sighup_refuses_privileged_port_change_and_keeps_serving() {
 
     // Change the DNS listener to a privileged port (:53). The daemon dropped
     // CAP_NET_BIND_SERVICE at startup, so it must refuse the rebind, warn,
-    // and keep the existing listener serving.
-    let body = format!(
-        "[server]\n\
-         listen = [\"127.0.0.1:53\"]\n\
-         mesh_zone = \"mesh.\"\n\
-         doh_listen = \"127.0.0.1:{doh}\"\n\
-         [metrics]\n\
-         listen = \"127.0.0.1:{metrics}\"\n"
-    );
+    // and keep the existing listener serving. Reuse the offline body (just
+    // swapping the DNS port to :53) so the SIGHUP resolver hot-swap stays
+    // network-free.
+    let body = local_config_body(53, metrics, doh);
     std::fs::write(&config, body).unwrap();
     set_mode_600(&config);
     send_sighup(&guard);

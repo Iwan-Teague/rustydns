@@ -1152,6 +1152,12 @@ fn restart_required_changes(
     if old.blocklist.regex_rules != new.blocklist.regex_rules {
         changed.push("blocklist.regex_rules");
     }
+    // Group *definitions* (names/sources/allowlist) are baked into the engine's
+    // group map at startup; the SIGHUP loader re-fetches a group's content but
+    // cannot add/remove groups or change their source URLs. Restart-only.
+    if old.blocklist.groups != new.blocklist.groups {
+        changed.push("blocklist.groups");
+    }
     if old.privacy.query_log_to_disk != new.privacy.query_log_to_disk
         || old.privacy.query_log_disk_path != new.privacy.query_log_disk_path
     {
@@ -1676,6 +1682,7 @@ mod tests {
             zones_allowed: Vec::new(),
             log_all_queries: false,
             block_windows: Vec::new(),
+            blocklist_group: None,
         });
         assert!(
             restart_required_changes(&a, &b).is_empty(),

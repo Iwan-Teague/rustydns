@@ -67,41 +67,23 @@ impl BlocklistLoader {
         Ok(Self { config, client })
     }
 
-    /// Reload all configured sources. Leaves existing state untouched if nothing loads.
+    /// Reload all configured sources. Leaves existing state untouched if
+    /// nothing loads. Also reloads every `[[blocklist.groups]]` set (TODO 8.6);
+    /// a group that fails to load keeps its previous state and is warned, and
+    /// does not affect the returned (default-blocklist) summary.
     pub async fn reload(&self, engine: &BlocklistEngine) -> Result<LoadSummary, RustyDnsError> {
-        let mut sources: Vec<(String, BlocklistSource)> = Vec::new();
-        let mut failed_sources = 0usize;
-
-        for path in &self.config.local_files {
-            match self.read_local(path) {
-                Ok(content) => sources.push((content, BlocklistSource::Trusted)),
-                Err(e) => {
-                    failed_sources += 1;
-                    warn!(path = %path.display(), error = %e, "failed to read local blocklist");
-                }
-            }
-        }
-
-        for url in &self.config.sources {
-            let trust = if self.config.trusted_rpz_sources.iter().any(|t| t == url) {
-                BlocklistSource::Trusted
-            } else {
-                BlocklistSource::Untrusted
-            };
-
-            match self.fetch_remote(url).await {
-                Ok(content) => sources.push((content, trust)),
-                Err(e) => {
-                    failed_sources += 1;
-                    warn!(url = %url, error = %e, "failed to fetch blocklist source");
-                }
-            }
-        }
+        // --- Global (default) blocklist ---
+        let (sources, failed_sources) = self
+            .gather(
+                &self.config.local_files,
+                &self.config.sources,
+                &self.config.trusted_rpz_sources,
+            )
+            .await;
 
         let loaded_sources = sources.len();
-        let total_sources = loaded_sources + failed_sources;
         let summary = LoadSummary {
-            total_sources,
+            total_sources: loaded_sources + failed_sources,
             loaded_sources,
             failed_sources,
         };
@@ -112,22 +94,83 @@ impl BlocklistLoader {
                 failed = summary.failed_sources,
                 "no blocklist sources loaded; keeping existing state"
             );
-            return Ok(summary);
+        } else {
+            let refs: Vec<(&str, BlocklistSource)> =
+                sources.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+            engine.load_many_with_trust(&refs);
+            info!(
+                loaded = summary.loaded_sources,
+                failed = summary.failed_sources,
+                "blocklist reload complete"
+            );
         }
 
-        let refs: Vec<(&str, BlocklistSource)> = sources
-            .iter()
-            .map(|(s, trust): &(String, BlocklistSource)| (s.as_str(), *trust))
-            .collect();
-        engine.load_many_with_trust(&refs);
-
-        info!(
-            loaded = summary.loaded_sources,
-            failed = summary.failed_sources,
-            "blocklist reload complete"
-        );
+        // --- Per-client groups (TODO 8.6) ---
+        for group in &self.config.groups {
+            let (gsrc, gfailed) = self
+                .gather(
+                    &group.local_files,
+                    &group.sources,
+                    &group.trusted_rpz_sources,
+                )
+                .await;
+            if gsrc.is_empty() {
+                warn!(
+                    group = %group.name,
+                    failed = gfailed,
+                    "no sources loaded for blocklist group; keeping existing group state"
+                );
+                continue;
+            }
+            let grefs: Vec<(&str, BlocklistSource)> =
+                gsrc.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+            engine.load_group(&group.name, &grefs, &group.allowlist);
+            info!(
+                group = %group.name,
+                loaded = gsrc.len(),
+                failed = gfailed,
+                "blocklist group reload complete"
+            );
+        }
 
         Ok(summary)
+    }
+
+    /// Fetch a set of local + remote sources, returning the loaded contents
+    /// (each tagged trusted/untrusted) and the count that failed.
+    async fn gather(
+        &self,
+        local_files: &[std::path::PathBuf],
+        remote: &[String],
+        trusted_rpz: &[String],
+    ) -> (Vec<(String, BlocklistSource)>, usize) {
+        let mut sources: Vec<(String, BlocklistSource)> = Vec::new();
+        let mut failed = 0usize;
+
+        for path in local_files {
+            match self.read_local(path) {
+                Ok(content) => sources.push((content, BlocklistSource::Trusted)),
+                Err(e) => {
+                    failed += 1;
+                    warn!(path = %path.display(), error = %e, "failed to read local blocklist");
+                }
+            }
+        }
+        for url in remote {
+            let trust = if trusted_rpz.iter().any(|t| t == url) {
+                BlocklistSource::Trusted
+            } else {
+                BlocklistSource::Untrusted
+            };
+            match self.fetch_remote(url).await {
+                Ok(content) => sources.push((content, trust)),
+                Err(e) => {
+                    failed += 1;
+                    warn!(url = %url, error = %e, "failed to fetch blocklist source");
+                }
+            }
+        }
+        (sources, failed)
     }
 
     fn read_local(&self, path: &Path) -> Result<String, RustyDnsError> {

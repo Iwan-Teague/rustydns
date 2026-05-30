@@ -288,6 +288,7 @@ a change.
 | `blocklist.allowlist` | **Restart** — rebuilt from the startup config on each content reload |
 | `blocklist.block_response` / `blocklist.sinkhole_ip` | **Restart** |
 | `blocklist.block_cname_cloaking` / `blocklist.response_ip_denylist` / `blocklist.regex_rules` | **Restart** — compiled into the engine at startup |
+| `[[blocklist.groups]]` definitions (names/sources/allowlist) | **Restart** — the engine's group map is built at startup (SIGHUP re-fetches a group's *content* but can't add/remove groups). A `[[policy]].blocklist_group` *assignment* change is live (it's in the hot-swappable policy table). |
 | `privacy.query_log_to_disk` / `query_log_disk_path` and the in-memory ring size | **Restart** — the writer task and ring are bound at startup |
 
 > Why some listener changes are restart-only: the daemon drops **all** Linux

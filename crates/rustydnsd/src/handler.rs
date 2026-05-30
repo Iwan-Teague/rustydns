@@ -71,6 +71,9 @@ struct PolicyDecision {
     /// `true` if a `[[policy.block_windows]]` window is active for this client
     /// right now — every query is refused before the pipeline runs.
     schedule_blocked: bool,
+    /// Named blocklist group for this client (TODO 8.6), or `None` for the
+    /// global blocklist. `Arc<str>` so the per-query clone is O(1).
+    blocklist_group: Option<Arc<str>>,
 }
 
 impl Default for PolicyDecision {
@@ -80,6 +83,7 @@ impl Default for PolicyDecision {
             zones_allowed: empty_zones(),
             log_all_queries: false,
             schedule_blocked: false,
+            blocklist_group: None,
         }
     }
 }
@@ -94,6 +98,7 @@ struct CompiledPolicy {
     zones_allowed: Arc<[String]>,
     log_all_queries: bool,
     schedule: BlockSchedule,
+    blocklist_group: Option<Arc<str>>,
 }
 
 /// DNS request handler implementing Authority -> Blocklist -> Resolver.
@@ -137,6 +142,7 @@ fn build_policy_map(policies: &[NodePolicy]) -> HashMap<IpAddr, CompiledPolicy> 
                         // back to an empty (never-blocking) schedule on the
                         // can't-happen error rather than panicking.
                         schedule: BlockSchedule::compile(&policy.block_windows).unwrap_or_default(),
+                        blocklist_group: policy.blocklist_group.as_deref().map(Arc::from),
                     };
                     if policy_by_ip.insert(ip, compiled).is_some() {
                         warn!(
@@ -242,6 +248,7 @@ impl DnsHandler {
                 // Evaluate the (pre-compiled) block schedule against now. Cheap
                 // when no windows are configured (empty schedule → false).
                 schedule_blocked: !p.schedule.is_empty() && p.schedule.is_blocked_at(now_unix()),
+                blocklist_group: p.blocklist_group.clone(),
             },
             None => PolicyDecision::default(),
         }
@@ -416,9 +423,9 @@ impl DnsHandler {
     /// since the final A/AAAA owner name is always the last CNAME target,
     /// checking targets covers the whole chain. Pure in-memory lookups — no
     /// extra upstream queries.
-    fn cname_chain_blocked(&self, records: &[DnsRecord]) -> bool {
+    fn cname_chain_blocked(&self, records: &[DnsRecord], group: Option<&str>) -> bool {
         records.iter().any(|rec| match &rec.data {
-            RecordData::Cname(target) => self.blocklist.is_blocked(target),
+            RecordData::Cname(target) => self.blocklist.is_blocked_for_group(target, group),
             _ => false,
         })
     }
@@ -699,11 +706,15 @@ impl RequestHandler for DnsHandler {
         // outcome — i.e. the name would have been blocked but wasn't.
         // A trivial bypass on a name that wasn't on the blocklist
         // anyway doesn't deserve a metric bump.
-        let bypassed = policy.blocklist_bypass && self.blocklist.is_blocked(&qname_canon);
+        // Per-client blocklist group (TODO 8.6): match against the client's
+        // named group set when assigned, else the global blocklist.
+        let group = policy.blocklist_group.as_deref();
+        let bypassed =
+            policy.blocklist_bypass && self.blocklist.is_blocked_for_group(&qname_canon, group);
         if bypassed {
             self.metrics.inc_policy_blocklist_bypass();
         }
-        if !policy.blocklist_bypass && self.blocklist.is_blocked(&qname_canon) {
+        if !policy.blocklist_bypass && self.blocklist.is_blocked_for_group(&qname_canon, group) {
             self.metrics.inc_blocklist_hits();
             // PRIVACY: qname logged at debug only; do not enable debug in production.
             debug!(client = %client.anonymized(), qname = %qname, "query blocked");
@@ -741,7 +752,7 @@ impl RequestHandler for DnsHandler {
                 // `&&` short-circuits so bypass clients pay nothing.
                 if self.blocklist.block_cname_cloaking()
                     && !policy.blocklist_bypass
-                    && self.cname_chain_blocked(&out.records)
+                    && self.cname_chain_blocked(&out.records, policy.blocklist_group.as_deref())
                 {
                     self.metrics.inc_blocklist_hits();
                     self.metrics.inc_blocklist_cname_cloaking_blocked();
@@ -1507,6 +1518,7 @@ mod tests {
             zones_allowed: Vec::new(),
             log_all_queries: false,
             block_windows: Vec::new(),
+            blocklist_group: None,
         };
         let port = spawn_cname_mock("c.tracker-adnetwork.net.").await;
         let harness = build_cname_harness(
@@ -1726,6 +1738,7 @@ mod tests {
             zones_allowed: Vec::new(),
             log_all_queries: false,
             block_windows: Vec::new(),
+            blocklist_group: None,
         }
     }
 
@@ -2303,6 +2316,7 @@ mod tests {
             zones_allowed: Vec::new(),
             log_all_queries: false,
             block_windows: Vec::new(),
+            blocklist_group: None,
         };
         let harness = build_harness_with_policies(
             vec![],
@@ -2330,6 +2344,7 @@ mod tests {
             zones_allowed: vec!["mesh.".to_string()],
             log_all_queries: false,
             block_windows: Vec::new(),
+            blocklist_group: None,
         };
         let harness = build_harness_with_policies(
             vec![static_a("router.mesh", "100.64.0.1")],
@@ -2365,6 +2380,7 @@ mod tests {
             zones_allowed: Vec::new(),
             log_all_queries: true,
             block_windows: Vec::new(),
+            blocklist_group: None,
         };
         let harness = build_harness_with_policies(
             vec![static_a("router.mesh", "100.64.0.1")],
@@ -2385,6 +2401,125 @@ mod tests {
         assert_eq!(snap[0].rcode, 0);
     }
 
+    /// Harness with a named blocklist group: the global list blocks
+    /// `default_lines`, the group `group_name` blocks `group_lines`, and the
+    /// given policies (assigning a client to the group) are installed.
+    async fn build_group_harness(
+        default_lines: &str,
+        group_name: &str,
+        group_lines: &str,
+        policies: Vec<NodePolicy>,
+    ) -> Harness {
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: Vec::new(),
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            groups: vec![rustydns_core::config::BlocklistGroup {
+                name: group_name.to_string(),
+                sources: Vec::new(),
+                local_files: Vec::new(),
+                trusted_rpz_sources: Vec::new(),
+                allowlist: Vec::new(),
+            }],
+            ..BlocklistConfig::default()
+        }));
+        blocklist.load_trusted(default_lines);
+        blocklist.load_group(
+            group_name,
+            &[(group_lines, rustydns_blocklist::BlocklistSource::Trusted)],
+            &[],
+        );
+
+        let mut dns_config = DnsConfig {
+            upstream: UpstreamConfig {
+                resolvers: vec!["https://127.0.0.1:1/dns-query".to_string()],
+                timeout_ms: 500,
+                ..UpstreamConfig::default()
+            },
+            ..Default::default()
+        };
+        dns_config.upstream.dnssec_validation = false;
+        dns_config.privacy.randomize_upstream_selection = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log.clone(),
+            rate_limiter,
+            &policies,
+            &[],
+        )
+        .expect("handler");
+        let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let port = udp.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server.register_socket(udp);
+        Harness {
+            port,
+            query_log,
+            _server: server,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocklist_group_routes_grouped_client_to_group_list() {
+        // 127.0.0.1 is assigned to the "strict" group. The group blocks
+        // grouponly.example.com; the global list blocks defaultonly.example.com.
+        let policy = NodePolicy {
+            node_id: None,
+            client_ip: Some("127.0.0.1".to_string()),
+            blocklist_bypass: false,
+            zones_allowed: Vec::new(),
+            log_all_queries: false,
+            block_windows: Vec::new(),
+            blocklist_group: Some("strict".to_string()),
+        };
+        let harness = build_group_harness(
+            "0.0.0.0 defaultonly.example.com\n",
+            "strict",
+            "0.0.0.0 grouponly.example.com\n",
+            vec![policy],
+        )
+        .await;
+
+        // The group's list applies → grouponly is blocked (NXDOMAIN).
+        let resp = query(harness.port, "grouponly.example.com.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NXDomain,
+            "a name on the client's group list must be blocked"
+        );
+
+        // The GLOBAL list does NOT apply to a grouped client → defaultonly
+        // reaches the resolver, which fail-closes (bogus upstream) → SERVFAIL.
+        let resp = query(harness.port, "defaultonly.example.com.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::ServFail,
+            "the global blocklist must NOT apply to a client assigned to a group"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn policy_block_window_refuses_during_active_window() {
         // An all-day, every-day block window is active at any wall-clock time,
@@ -2402,6 +2537,7 @@ mod tests {
                 end: None,
                 utc_offset_minutes: 0,
             }],
+            blocklist_group: None,
         };
         let harness = build_harness_with_policies(
             vec![static_a("router.mesh", "100.64.0.1")],
@@ -2430,6 +2566,7 @@ mod tests {
             zones_allowed: Vec::new(),
             log_all_queries: false,
             block_windows: Vec::new(),
+            blocklist_group: None,
         };
         let harness = build_harness_with_policies(
             vec![],

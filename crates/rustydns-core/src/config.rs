@@ -821,6 +821,15 @@ pub struct BlocklistConfig {
     /// time or memory.
     #[serde(default)]
     pub regex_rules: Vec<String>,
+
+    /// Per-client blocklist groups (TODO 8.6). Each group has its own source
+    /// list and allowlist; a `[[policy]]` assigns a client to a group by name
+    /// via `blocklist_group`. A client in a group is matched against **that
+    /// group's** blocklist instead of the global one ("guest gets the strict
+    /// list", "iot only reaches vendor domains"). Clients with no group use the
+    /// global `sources`/`allowlist`. Default: none.
+    #[serde(default)]
+    pub groups: Vec<BlocklistGroup>,
 }
 
 /// Maximum length (bytes) of a single `blocklist.regex_rules` pattern.
@@ -828,6 +837,34 @@ pub const MAX_REGEX_PATTERN_LEN: usize = 512;
 
 /// Maximum number of `blocklist.regex_rules` patterns.
 pub const MAX_REGEX_RULES: usize = 1000;
+
+/// A named per-client blocklist group (TODO 8.6).
+///
+/// Declared as `[[blocklist.groups]]`. A group is an independent block set —
+/// its own remote `sources`, `local_files`, `trusted_rpz_sources`, and
+/// `allowlist` — that *replaces* the global blocklist for clients assigned to
+/// it via `[[policy]].blocklist_group`. The global response settings
+/// (`block_response`, `regex_rules`, `response_ip_denylist`,
+/// `block_cname_cloaking`) still apply; only the QNAME domain/wildcard set and
+/// allowlist are group-specific.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlocklistGroup {
+    /// Group name, referenced by `[[policy]].blocklist_group`. Must be unique.
+    pub name: String,
+    /// Remote blocklist source URLs for this group. **Must use `https://`.**
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Local blocklist files for this group (always trusted for passthru).
+    #[serde(default)]
+    pub local_files: Vec<PathBuf>,
+    /// URLs in this group's `sources` trusted to provide RPZ passthru entries.
+    #[serde(default)]
+    pub trusted_rpz_sources: Vec<String>,
+    /// Allowlist for this group (same syntax/rules as `blocklist.allowlist`).
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+}
 
 impl Default for BlocklistConfig {
     fn default() -> Self {
@@ -844,6 +881,7 @@ impl Default for BlocklistConfig {
             block_cname_cloaking: true,
             response_ip_denylist: Vec::new(),
             regex_rules: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }
@@ -1146,6 +1184,14 @@ pub struct NodePolicy {
     /// none. See [`BlockWindow`].
     #[serde(default)]
     pub block_windows: Vec<BlockWindow>,
+
+    /// Per-client blocklist group name (TODO 8.6). When set, this client is
+    /// matched against the named `[[blocklist.groups]]` set instead of the
+    /// global blocklist. Must reference a defined group. Mutually compatible
+    /// with `blocklist_bypass` (bypass wins — a bypass client is never
+    /// blocked). Default: `None` (use the global blocklist).
+    #[serde(default)]
+    pub blocklist_group: Option<String>,
 }
 
 /// One scheduled block window for a `[[policy]]` (TODO 8.5).
@@ -1661,19 +1707,53 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     }
 
     // Warn on overbroad allowlist entries
-    for entry in &cfg.blocklist.allowlist {
-        let entry = entry
-            .trim()
-            .trim_start_matches("*.")
-            .trim_start_matches('.');
-        let label_count = entry.split('.').filter(|l| !l.is_empty()).count();
-        if label_count <= 1 {
+    let reject_overbroad_allowlist =
+        |entries: &[String], ctx: &str| -> Result<(), crate::RustyDnsError> {
+            for entry in entries {
+                let bare = entry
+                    .trim()
+                    .trim_start_matches("*.")
+                    .trim_start_matches('.');
+                if bare.split('.').filter(|l| !l.is_empty()).count() <= 1 {
+                    return Err(crate::RustyDnsError::Config(format!(
+                        "{ctx} entry `{bare}` is a single-label or TLD-level wildcard. \
+                     This would allowlist an entire TLD (e.g. all .com domains). \
+                     Allowlist entries must have at least two labels (e.g. `example.com`)."
+                    )));
+                }
+            }
+            Ok(())
+        };
+    reject_overbroad_allowlist(&cfg.blocklist.allowlist, "blocklist.allowlist")?;
+
+    // Per-client blocklist groups (TODO 8.6): unique non-empty names, HTTPS-only
+    // sources, and a well-formed allowlist — same rules as the global blocklist.
+    let mut group_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (idx, group) in cfg.blocklist.groups.iter().enumerate() {
+        if group.name.trim().is_empty() {
             return Err(crate::RustyDnsError::Config(format!(
-                "blocklist.allowlist entry `{entry}` is a single-label or TLD-level wildcard. \
-                 This would allowlist an entire TLD (e.g. all .com domains). \
-                 Allowlist entries must have at least two labels (e.g. `example.com`).",
+                "blocklist.groups[{idx}].name is empty — every group must be named"
             )));
         }
+        if !group_names.insert(group.name.as_str()) {
+            return Err(crate::RustyDnsError::Config(format!(
+                "blocklist.groups[{idx}].name `{}` is defined more than once",
+                group.name
+            )));
+        }
+        for url in group.sources.iter().chain(group.trusted_rpz_sources.iter()) {
+            if url.starts_with("http://") {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "blocklist.groups[{idx}] (`{}`) source `{url}` uses plain HTTP — only \
+                     https:// sources are allowed.",
+                    group.name
+                )));
+            }
+        }
+        reject_overbroad_allowlist(
+            &group.allowlist,
+            &format!("blocklist.groups[{idx}].allowlist"),
+        )?;
     }
 
     // --- Privacy -----------------------------------------------------------------
@@ -1831,6 +1911,14 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         if let Err(e) = crate::schedule::BlockSchedule::compile(&policy.block_windows) {
             return Err(crate::RustyDnsError::Config(format!(
                 "policy[{idx}] has an invalid block window: {e}"
+            )));
+        }
+        // A referenced blocklist group must exist.
+        if let Some(g) = &policy.blocklist_group
+            && !cfg.blocklist.groups.iter().any(|grp| &grp.name == g)
+        {
+            return Err(crate::RustyDnsError::Config(format!(
+                "policy[{idx}].blocklist_group `{g}` does not match any [[blocklist.groups]] name"
             )));
         }
     }
@@ -2276,6 +2364,69 @@ mod tests {
         assert_config_err(validate_config(&cfg), "regex_rules is invalid");
     }
 
+    fn group(name: &str, sources: &[&str], allowlist: &[&str]) -> BlocklistGroup {
+        BlocklistGroup {
+            name: name.to_string(),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            local_files: Vec::new(),
+            trusted_rpz_sources: Vec::new(),
+            allowlist: allowlist.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn blocklist_group_valid_passes() {
+        let mut cfg = baseline();
+        cfg.blocklist.groups = vec![
+            group(
+                "strict",
+                &["https://lists.example/strict"],
+                &["safe.example.com"],
+            ),
+            group("iot", &[], &[]),
+        ];
+        let mut p = empty_policy();
+        p.client_ip = Some("10.0.0.5".to_string());
+        p.blocklist_group = Some("strict".to_string());
+        cfg.policy = vec![p];
+        validate_config(&cfg).expect("valid groups + policy reference must pass");
+    }
+
+    #[test]
+    fn blocklist_group_duplicate_name_rejected() {
+        let mut cfg = baseline();
+        cfg.blocklist.groups = vec![group("g", &[], &[]), group("g", &[], &[])];
+        assert_config_err(validate_config(&cfg), "defined more than once");
+    }
+
+    #[test]
+    fn blocklist_group_http_source_rejected() {
+        let mut cfg = baseline();
+        cfg.blocklist.groups = vec![group("g", &["http://insecure.example/list"], &[])];
+        assert_config_err(validate_config(&cfg), "plain HTTP");
+    }
+
+    #[test]
+    fn blocklist_group_tld_allowlist_rejected() {
+        let mut cfg = baseline();
+        cfg.blocklist.groups = vec![group("g", &[], &["*.com"])];
+        assert_config_err(validate_config(&cfg), "single-label or TLD-level wildcard");
+    }
+
+    #[test]
+    fn policy_unknown_blocklist_group_rejected() {
+        let mut cfg = baseline();
+        cfg.blocklist.groups = vec![group("strict", &[], &[])];
+        let mut p = empty_policy();
+        p.client_ip = Some("10.0.0.5".to_string());
+        p.blocklist_group = Some("nonexistent".to_string());
+        cfg.policy = vec![p];
+        assert_config_err(
+            validate_config(&cfg),
+            "does not match any [[blocklist.groups]]",
+        );
+    }
+
     // --- privacy ----------------------------------------------------
 
     #[test]
@@ -2399,6 +2550,7 @@ mod tests {
             zones_allowed: Vec::new(),
             log_all_queries: false,
             block_windows: Vec::new(),
+            blocklist_group: None,
         }
     }
 

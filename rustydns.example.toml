@@ -290,6 +290,22 @@ regex_rules = [
     # "(^|\\.)googlesyndication\\.com$",
 ]
 
+# Per-client blocklist groups (default: none). Each [[blocklist.groups]] is an
+# independent block set (its own sources/local_files/allowlist) that REPLACES
+# the global blocklist for clients assigned to it via [[policy]].blocklist_group
+# ("guest gets the strict list", "iot can only reach vendor domains"). The
+# global response settings (block_response / regex_rules / response_ip_denylist
+# / block_cname_cloaking) still apply. Group definitions are restart-only
+# (SIGHUP re-fetches a group's content but can't add/remove groups).
+# [[blocklist.groups]]
+# name      = "strict"
+# sources   = ["https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social/hosts"]
+# allowlist = ["fonts.gstatic.com"]
+#
+# [[blocklist.groups]]
+# name    = "iot"
+# local_files = ["/etc/rustydns/iot-allowlist.hosts"]
+
 # ---------------------------------------------------------------------------
 [privacy]
 # ---------------------------------------------------------------------------
@@ -419,6 +435,13 @@ path   = "/metrics"
 # [[policy]]
 # client_ip     = "10.0.0.99"
 # zones_allowed = ["mesh."]
+
+# Example: assign a client to a named blocklist group (see [[blocklist.groups]]
+# above). This client is matched against the "strict" group's list instead of
+# the global blocklist.
+# [[policy]]
+# client_ip       = "10.0.0.60"
+# blocklist_group = "strict"
 
 # Example: NodeId-keyed policy. Parsed but not yet matched at runtime —
 # `client_ip` is required for actual enforcement today.

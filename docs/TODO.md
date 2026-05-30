@@ -216,17 +216,17 @@ conditional forwarding, bounded LRU caching, DNSSEC, DoH/DoQ upstream + DoT/DoH
 inbound, randomised upstream selection, ECS stripping, per-client (IP) policy,
 rate limiting, rebinding defence, CNAME-cloaking defence (§8.1, done), DNS
 rewrites / local cloaking (§8.2, done), response-IP denylists (§8.3, done),
-Safe Search (§8.4, done), scheduled block windows (§8.5, done), and regex rules
-(§8.7, done). The items below are what those projects have that we **don't**.
+Safe Search (§8.4, done), scheduled block windows (§8.5, done), per-client
+blocklist groups (§8.6, done), and regex rules (§8.7, done). The only items
+those projects have that we still don't are the deliberately-out-of-scope ones
+below.
 
 ### Worth adding (fits the constraints)
 
-- **8.6 🟡 Per-client blocklist groups — M.** Today `[[policy]]` toggles
-  bypass/zones per IP. blocky/AdGuard let you assign clients to named groups,
-  each with its own set of blocklists ("iot can only reach vendor domains",
-  "guest gets the strict list"). Extends the existing policy model rather than
-  adding a subsystem. Files: `config.rs`, `blocklist` engine (multiple named
-  sets), `handler.rs`.
+(All "worth adding" §8 items are now done: 8.1–8.5, 8.7. 8.6 per-client
+blocklist groups shipped — `[[blocklist.groups]]` named sets + a
+`[[policy]].blocklist_group` assignment, routed via `is_blocked_for_group`.)
+
 ### High anonymity value — promoted to its own item
 
 - **8.8 → see §7.3 🟠 Oblivious DoH (ODoH, RFC 9230).** The flagship anonymity
@@ -256,9 +256,9 @@ Safe Search (§8.4, done), scheduled block windows (§8.5, done), and regex rule
   database" invariant; query history stays in the bounded ring (+ opt-in hashed
   on-disk log).
 
-> Done: 8.1 (CNAME blocking), 8.2 (DNS rewrite map), 8.3 (response-IP
-> blocklists), 8.4 (safe search), 8.5 (scheduled block windows), 8.7 (regex
-> rules). Remaining: 8.6 (per-client groups).
+> All §8 "worth adding" items are done: 8.1 (CNAME blocking), 8.2 (DNS rewrite
+> map), 8.3 (response-IP blocklists), 8.4 (safe search), 8.5 (scheduled block
+> windows), 8.6 (per-client blocklist groups), 8.7 (regex rules).
 
 ---
 
