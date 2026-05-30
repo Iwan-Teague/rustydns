@@ -495,9 +495,14 @@ snapshot. Mitigations:
   whose `generated_at_unix` is older than `mesh_zone_max_age_secs`
   (default 600s), is rejected at load time. This limits the replay
   window for an attacker who captures an old signed bundle.
-- Bundle file size cap of 256 KiB at read time (matches the Rustynet
-  writer-side limit); a file over the cap is rejected without
-  allocating memory proportional to its size.
+- Bundle file size cap of 256 KiB, enforced with a *capped reader* (reads
+  at most the limit + 1 byte) rather than a `stat`-then-read — so a file
+  swapped for a larger one between the size check and the read still cannot
+  make us allocate beyond the cap (no TOCTOU).
+- `record_count` is bounded (≤ 100,000) *before* any allocation, so a
+  signed-but-malicious or buggy bundle cannot drive a multi-gigabyte
+  `Vec::with_capacity` from a tiny file. The signature is verified before
+  the payload is parsed, so untrusted bytes never reach the record loop.
 - The verifier key must be deployed via the operator's normal config
   channel and never written by `rustydns`. The signing key never leaves
   `rustynetd`.

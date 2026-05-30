@@ -56,6 +56,16 @@ use rustydns_core::record::{DnsRecord, RecordData};
 /// allocating proportionally.
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 
+/// Upper bound on `record_count` before we even start allocating.
+///
+/// `record_count` comes from the (signed) payload, but a compromised or
+/// buggy signer could set it to a huge value and make us
+/// `Vec::with_capacity(huge)` → multi-gigabyte allocation → OOM, from a
+/// tiny bundle. A 256 KiB bundle physically cannot contain anywhere near
+/// this many records (each needs several `record.N.*` lines), so any count
+/// beyond this is malformed and rejected before allocation.
+const MAX_BUNDLE_RECORDS: usize = 100_000;
+
 /// Errors that can occur while loading or verifying the mesh bundle.
 #[derive(Debug, Error)]
 pub enum MeshBundleError {
@@ -174,11 +184,20 @@ fn read_verifier_key(path: &Path) -> Result<VerifyingKey, MeshBundleError> {
 }
 
 fn read_bundle_file(path: &Path) -> Result<Vec<u8>, MeshBundleError> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() as usize > MAX_BUNDLE_BYTES {
+    use std::io::Read;
+    // Read at most MAX_BUNDLE_BYTES + 1 bytes regardless of the file's
+    // reported size. This avoids a metadata()-then-read() TOCTOU where the
+    // file is swapped for a much larger one between the size check and the
+    // read — a capped reader can never allocate more than the limit + 1.
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    let read = file
+        .take(MAX_BUNDLE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)?;
+    if read > MAX_BUNDLE_BYTES {
         return Err(MeshBundleError::TooLarge);
     }
-    Ok(fs::read(path)?)
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +304,17 @@ fn build_loaded_bundle(
 
     let nonce = parse_u64(fields, "nonce")?;
     let record_count = parse_usize(fields, "record_count")?;
+    if record_count > MAX_BUNDLE_RECORDS {
+        return Err(MeshBundleError::InvalidField {
+            field: "record_count".to_string(),
+            reason: format!(
+                "record_count {record_count} exceeds the maximum of {MAX_BUNDLE_RECORDS}"
+            ),
+        });
+    }
 
+    // Capacity is now bounded by the check above (and, in practice, far
+    // lower by the 256 KiB bundle-size limit).
     let mut records = Vec::with_capacity(record_count);
     for i in 0..record_count {
         let rec = build_record(fields, i, mesh_zone)?;
@@ -711,6 +740,49 @@ mod tests {
         let key_path = write_temp(&[b'0'; 64], "huge-key");
         let err = load_mesh_bundle(&bundle_path, &key_path, "mesh.", 600).unwrap_err();
         assert!(matches!(err, MeshBundleError::TooLarge));
+    }
+
+    #[test]
+    fn rejects_absurd_record_count_before_allocating() {
+        // A *validly signed* bundle that claims billions of records must be
+        // rejected at the count check — never reach Vec::with_capacity(huge)
+        // and OOM. This models a compromised/buggy signer.
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_hex = signing
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let now = now();
+        let mut payload = String::new();
+        payload.push_str("version=1\n");
+        payload.push_str("zone_name=mesh\n");
+        payload.push_str("subject_node_id=test\n");
+        payload.push_str(&format!("generated_at_unix={now}\n"));
+        payload.push_str(&format!("expires_at_unix={}\n", now + 300));
+        payload.push_str("nonce=1\n");
+        // Way beyond MAX_BUNDLE_RECORDS, with no record fields present.
+        payload.push_str("record_count=4000000000\n");
+        let sig = signing.sign(payload.as_bytes());
+        let sig_hex = sig
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let wire = format!("{payload}signature={sig_hex}\n");
+
+        let bundle_path = write_temp(wire.as_bytes(), "absurd-count-bundle");
+        let key_path = write_temp(verifier_hex.as_bytes(), "absurd-count-key");
+
+        let err = load_mesh_bundle(&bundle_path, &key_path, "mesh.", 600).unwrap_err();
+        match err {
+            MeshBundleError::InvalidField { field, reason } => {
+                assert_eq!(field, "record_count");
+                assert!(reason.contains("exceeds the maximum"), "{reason}");
+            }
+            other => panic!("expected InvalidField for record_count, got {other:?}"),
+        }
     }
 
     #[test]
