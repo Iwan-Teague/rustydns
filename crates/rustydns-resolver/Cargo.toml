@@ -30,7 +30,7 @@ reqwest          = { workspace = true }
 arc-swap         = { workspace = true }
 # hpke 0.13 (via odoh-rs) needs a rand_core-0.9 CSPRNG; the workspace pins
 # rand 0.8 (a different, incompatible major) for other crates, so pin 0.9 here.
-rand             = "0.9"
+rand             = "0.10"
 
 [dev-dependencies]
 tokio        = { workspace = true }
