@@ -35,7 +35,8 @@ Doc surfaces:
 - `docs/integration-rustynet.md` — signed dns-zone bundle integration
 - `docs/operator-endpoints.md` — `/metrics`, `/health`, `/queries` reference
 - `docs/deployment-docker.md` — image layout, capability model, compose template
-- `docs/roadmap.md` — single source of truth for everything pending (upstream-blocked, sibling-blocked, unstarted features, test gaps)
+- `docs/roadmap.md` — single source of truth for *feature* deferrals (upstream-blocked, sibling-blocked, unstarted features)
+- `docs/TODO.md` — broad improvement backlog (security/anonymity/efficiency hardening, test gaps, tech debt) found by scouring the repo; prioritized with effort estimates
 - `AGENTS.md` — this file
 - `CLAUDE.md` — Claude-specific guidance
 

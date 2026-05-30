@@ -1,8 +1,14 @@
 # Roadmap
 
-Single source of truth for unfinished work in `rustydns`. Everything not in
-this list is either shipped or out of scope. Items are grouped by **what is
-blocking them**, then by category. Each item names:
+Single source of truth for **feature deferrals** in `rustydns` — things that are
+deliberately not built yet because they're blocked on upstream/sibling code, are
+restart-only by design, or need their own design pass. For the broader, more
+opportunistic **improvement backlog** (security/anonymity/efficiency hardening,
+test-coverage gaps, tech debt found by scouring the code), see
+[`TODO.md`](TODO.md).
+
+Items are grouped by **what is blocking them**, then by category. Each item
+names:
 
 - the concrete deliverable,
 - what's blocking it (upstream, sibling project, design, or just unstarted),
