@@ -65,18 +65,23 @@ test burden aren't justified yet, not a blocked one.
 
 ## 4. Test coverage gaps
 
-- **4.1 🟠 DoT TLS cert rotation** — claimed working in docs/commits but has no
-  automated test. Add an integration test: start with DoT on an unprivileged
-  port + a self-signed cert (use `test_pem`), SIGHUP with a new cert, assert the
-  listener rebinds and serves the new cert (TLS client checks the presented
-  cert). Files: `crates/rustydnsd/tests/`. **Partial:** DoT over a real TLS
-  handshake is covered by `handler.rs::dot_listener_serves_authority_hit_over_real_tls_handshake`,
-  and the live SO_REUSEPORT listener-rebind path by `tests/sighup_reload.rs`
-  (DNS+metrics). The *cert-swap-on-SIGHUP* assertion specifically is still
-  manual.
-- **4.2 🟠 ActiveListeners DoH-group reload** — the e2e covers DNS+metrics
-  rebind and the privileged-port refusal; DoH **add/remove/move** on reload is
-  only manually verified. Extend `tests/sighup_reload.rs`.
+- **4.1 ✅ DoT TLS cert rotation — DONE.**
+  `tests/sighup_reload.rs::sighup_rotates_dot_cert_on_path_change` starts DoT on
+  an unprivileged port with a self-signed leaf (cert A), SIGHUPs with
+  `tls_cert_path`/`tls_key_path` repointed to a second leaf (cert B), and a
+  tokio-rustls client (accept-any verifier) reads the presented leaf back off
+  the wire — asserting it flips A→B and the daemon logs a live rebind. (Path
+  repoint is the documented rotation trigger; see `design-sighup-reload.md`.)
+  The pre-existing real-handshake coverage in
+  `handler.rs::dot_listener_serves_authority_hit_over_real_tls_handshake`
+  remains.
+- **4.2 ✅ ActiveListeners DoH-group reload — DONE.**
+  `tests/sighup_reload.rs::sighup_rebinds_doh_listener_to_new_unprivileged_port`
+  moves the DoH listener to a fresh unprivileged port on SIGHUP and asserts the
+  new port serves (RFC 8484 GET → 200), the old port stops, and a live rebind is
+  logged. DoH *add* is the startup default (`doh_listen` defaults to
+  `127.0.0.1:8053`); DoH *remove* is not expressible in the TOML config (no
+  null literal), so that unreachable branch is intentionally not tested.
 - **4.3 ✅ Resolver mock coverage — DONE for the testable cases.** Added a UDP
   mock-upstream harness in `tests/upstream_e2e.rs` plus handler-level mock
   harnesses covering: fail-closed → SERVFAIL, ECS stripping (no EDNS Client
