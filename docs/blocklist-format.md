@@ -99,6 +99,9 @@ The most widely used format. Lines starting with `#` are comments. The first fie
 - Maximum total length: 253 bytes (RFC 1035 wire-format limit)
 - Maximum label length: 63 bytes (RFC 1035)
 - No control characters (null bytes, etc.)
+- ASCII only — non-ASCII bytes (≥ 0x80) are rejected. Internationalised
+  names must be supplied in their punycode (`xn--…`) form, which is how real
+  DNS queries arrive; a raw UTF-8 label could never match and is dead weight.
 - No empty labels (consecutive dots)
 - Entries failing validation are silently skipped
 

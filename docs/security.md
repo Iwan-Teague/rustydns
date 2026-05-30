@@ -209,6 +209,8 @@ Every domain parsed from a blocklist is validated before insertion:
 - Label length ≤ 63 bytes (RFC 1035 §2.3.4)
 - Total domain length ≤ 253 bytes
 - No control characters (0x00–0x1f, 0x7f)
+- ASCII only — non-ASCII bytes (≥ 0x80) are rejected (IDNs must be supplied
+  in punycode `xn--` form, which is how real queries arrive)
 - No empty labels (consecutive dots)
 
 Entries that fail validation are skipped with a warning. They are never inserted into

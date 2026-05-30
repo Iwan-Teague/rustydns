@@ -62,16 +62,6 @@ sandbox) is the mitigation. No code change needed.
 Files: `docs/operator-endpoints.md`, `docs/security.md`,
 `crates/rustydnsd/src/query_log.rs` (rationale already in module docs).
 
-### 2.4 🟡 Blocklist parser accepts non-ASCII domain bytes — **S**
-
-`validate_and_normalize` rejects control bytes but allows bytes ≥ 0x80, then
-applies Unicode `to_lowercase()`. Such entries are harmless dead weight (real
-queries arrive as punycode/`xn--`, ASCII) but they (a) never match anything and
-(b) make the `to_lowercase()` comment ("ASCII lowercased") inaccurate. Consider
-rejecting non-ASCII labels outright (smaller, faster set; honest comment).
-
-Files: `crates/rustydns-blocklist/src/parser.rs` (`validate_and_normalize`).
-
 ### 2.5 ⚪ Inbound DoQ (DNS-over-QUIC, RFC 9250) listener — **L**
 
 DoQ is supported **upstream** only; the daemon listens on UDP/TCP/DoT/DoH. An

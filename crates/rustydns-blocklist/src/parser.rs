@@ -298,23 +298,30 @@ pub fn parse_adguard(content: &str) -> Vec<ParsedEntry> {
 /// Returns `None` and logs a trace if the domain is invalid. Invalid reasons:
 /// - Exceeds [`MAX_DOMAIN_BYTES`]
 /// - Any label exceeds [`MAX_LABEL_BYTES`]  (RFC 1035)
-/// - Contains null bytes, control characters, or spaces
+/// - Contains an ASCII control character or any non-ASCII byte (≥ 0x80)
 /// - Is empty after normalisation
 ///
-/// Valid domains are lowercased and the trailing dot is stripped.
+/// Valid domains are ASCII-lowercased and the trailing dot is stripped.
 fn validate_and_normalize(s: &str) -> Option<String> {
     let s = s.trim().trim_end_matches('.');
     if s.is_empty() {
         return None;
     }
 
-    // Reject non-printable / control characters (null byte, newlines embedded in line, etc.)
-    if s.bytes().any(|b| b == 0 || b < 0x20 || b == 0x7f) {
-        tracing::trace!(domain = %s, "skipping domain with control characters");
+    // Reject anything outside printable ASCII: control characters (null,
+    // embedded newlines, DEL) AND any non-ASCII byte (≥ 0x80). Real DNS
+    // queries arrive ASCII/punycode-encoded (`xn--…`), so a raw non-ASCII
+    // label can never match a query — keeping it would be dead weight in the
+    // set and would make the lowercase step lie about being ASCII-only.
+    // Rejecting here keeps the set smaller, the hot-path lookup honest, and
+    // is robust against a hostile source feeding arbitrary bytes.
+    if s.bytes().any(|b| b.is_ascii_control() || !b.is_ascii()) {
+        tracing::trace!("skipping blocklist domain with control or non-ASCII bytes");
         return None;
     }
 
-    let lower = s.to_lowercase();
+    // Guaranteed ASCII now → ascii-lowercase is correct and allocation-cheap.
+    let lower = s.to_ascii_lowercase();
 
     // Total length check (ASCII lowercased, so byte length == char length for valid DNS names)
     if lower.len() > MAX_DOMAIN_BYTES {
@@ -505,5 +512,37 @@ mod tests {
     #[test]
     fn consecutive_dots_rejected() {
         assert!(parse_plain("ads..example.com\n").is_empty());
+    }
+
+    #[test]
+    fn non_ascii_domain_rejected() {
+        // Raw non-ASCII labels can never match a real query (which arrives
+        // punycode-encoded) — they must be skipped, not added as dead weight.
+        assert!(parse_plain("café.example.com\n").is_empty());
+        assert!(parse_plain("münchen.example\n").is_empty());
+        // Hosts format too.
+        assert!(parse_hosts("0.0.0.0 café.example.com\n").is_empty());
+        // RPZ + AdGuard formats.
+        assert!(parse_rpz("café.example.com CNAME .\n").is_empty());
+        assert!(parse_adguard("||café.example.com^\n").is_empty());
+    }
+
+    #[test]
+    fn punycode_domain_accepted() {
+        // The ASCII-compatible encoding of an IDN is how real queries arrive;
+        // it must pass (it's plain ASCII).
+        let e = parse_plain("xn--caf-dma.example.com\n");
+        assert!(e.contains(&exact("xn--caf-dma.example.com")));
+    }
+
+    #[test]
+    fn parser_does_not_panic_on_non_ascii_and_mixed_input() {
+        // A hostile source feeding arbitrary (valid-UTF-8) bytes must never
+        // panic — with panic=abort in release that would be a remote DoS.
+        // Every non-ASCII line is skipped; only the clean ASCII line survives.
+        let content =
+            "café\n\u{0080}\u{00ff}.example\n٠٠٠.example\n🎉.tracker.net\nnormal.example.com\n";
+        let entries = parse(content);
+        assert_eq!(entries, vec![exact("normal.example.com")]);
     }
 }
