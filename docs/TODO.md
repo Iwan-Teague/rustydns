@@ -240,6 +240,56 @@ Files: `crates/rustydnsd/src/handler.rs` (`PolicyDecision`, `resolve_policy`).
   cardinality + the privacy posture need care (never label by qname/client).
   Bounded label sets only.
 
+- **7.3 🟠 Oblivious DoH (ODoH, RFC 9230) upstream transport — L.**
+  **The single highest-leverage *anonymity* feature** for rustydns, and a direct
+  fit for the project's #1 design goal ("Security, privacy, and anonymity are the
+  highest-priority design goals"). With plain DoH/DoQ, the upstream resolver
+  sees *both* the query content **and** the client's IP. ODoH breaks that link:
+  the query is HPKE-encrypted to the **target** resolver and relayed through an
+  **oblivious proxy**, so the proxy sees the client IP but not the query, and the
+  target sees the query but not the client IP. No single party can correlate
+  "who asked what." This is dnscrypt-proxy's flagship privacy mode (also called
+  𝜇ODNS in the literature).
+
+  **Implementable now — NOT upstream-blocked.** Cloudflare's `odoh-rs`
+  (RFC 9230, BSD-2, HPKE via the `hpke` crate; `odoh-client-rs` is a working
+  reference) provides the oblivious-message encryption/decryption. The DNS wire
+  format stays `hickory-proto` (so "hickory only" still holds — that rule is
+  about the DNS library, not the crypto), and the HTTP POST to the proxy uses the
+  existing `reqwest`. Flow: fetch the target's ODoH config (public key) →
+  `hickory-proto` encodes the query → `odoh-rs` HPKE-encrypts it → `reqwest`
+  POSTs `application/oblivious-dns-message` to the proxy (`?targethost=&targetpath=`)
+  → decrypt the response → `hickory-proto` parses it.
+
+  **Why it's "L" / needs a design pass — the hard parts:**
+  - It's a *parallel* upstream arm that bypasses `hickory-resolver`. The
+    invariants currently delivered by hickory-resolver — **DNSSEC validation**,
+    **fail-closed → SERVFAIL**, ECS stripping, randomised selection,
+    rebinding-defence rdata filtering — must be re-applied to the ODoH arm
+    (DNSSEC validation in particular: do it with `hickory-proto`'s validator over
+    the decrypted message, and keep fail-closed — never fall back to plain DoH on
+    ODoH failure, which would silently de-anonymise).
+  - **Config surface:** target resolver URL, one or more proxy URLs, and the
+    target's `ODoHConfig` (fetch from `/.well-known/odohconfigs` or pin in
+    config), plus key-rotation handling. Choose proxies that are operationally
+    independent from the target, or the anonymity guarantee collapses.
+  - **Dependency vetting:** adds `odoh-rs` + `hpke` (and transitive crypto) to
+    the audit surface. `odoh-rs` is Cloudflare-maintained but low-traffic
+    (~hundreds of downloads/mo) — run it through `cargo deny` (advisories +
+    license: BSD-2 is fine) and pin it like everything else in
+    `[workspace.dependencies]`. The minimal-attack-surface ethos means this
+    dependency choice deserves explicit sign-off.
+  - **Scaffolding suggestion:** add `upstream.protocol = "odoh"` (alongside
+    `doh`/`doq`/`plain`) + `upstream.odoh_proxy` so a config written today is
+    forward-compatible, and emit a startup warning until the arm is wired (same
+    pattern as the qmin/padding knobs).
+
+  Files: new `crates/rustydns-resolver` ODoH arm, `crates/rustydns-core/src/config.rs`
+  (`UpstreamConfig`), `deny.toml`, `Cargo.toml` workspace deps. Docs:
+  `docs/security.md` (new threat-model entry), `docs/architecture.md`,
+  `rustydns.example.toml`. Supersedes the (inaccurate) "upstream-blocked" framing
+  of §8.8.
+
 ---
 
 ## 8. Feature ideas from comparable projects
@@ -300,15 +350,16 @@ have that we **don't**.
   backtracking — prefer a regex engine with linear guarantees like `regex`).
   Files: `crates/rustydns-blocklist/src/{parser,engine}.rs`.
 
-### High anonymity value but likely blocked on upstream (hickory)
+### High anonymity value — promoted to its own item
 
-- **8.8 ⚪ Oblivious DoH (ODoH, RFC 9230) upstream — L, likely upstream-blocked.**
-  The flagship anonymity feature and a direct fit for rustydns's "anonymity is
-  the #1 goal" mission. ODoH splits the path through a relay so the target
-  resolver never sees the client IP and the relay never sees the query. This is
-  dnscrypt-proxy's headline privacy mode. Needs hickory (or a vetted crate) to
-  expose an ODoH client; if absent, this joins qmin/padding in §1 as
-  upstream-blocked. Worth tracking precisely because it advances the core goal.
+- **8.8 → see §7.3 🟠 Oblivious DoH (ODoH, RFC 9230).** The flagship anonymity
+  feature: the target resolver never learns the client IP and the relay never
+  learns the query. Originally filed here as "likely upstream-blocked" — that was
+  **wrong**: Cloudflare's `odoh-rs` implements RFC 9230 today, and the DNS wire
+  format stays `hickory-proto`, so it's implementable now (not blocked on
+  hickory). Promoted to **§7.3** with full design notes (DNSSEC/fail-closed
+  re-application, config surface, dependency vetting) because it directly serves
+  rustydns's #1 goal.
 
 ### Deliberately out of scope (note the reason)
 
