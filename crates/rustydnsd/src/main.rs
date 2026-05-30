@@ -64,6 +64,7 @@ mod metrics;
 mod query_log;
 mod query_log_disk;
 mod rate_limiter;
+mod rewrite;
 
 #[cfg(test)]
 mod test_pem;
@@ -274,6 +275,7 @@ async fn main() -> Result<()> {
         query_log.clone(),
         rate_limiter,
         &config.policy,
+        &config.rewrite,
     )?;
     // An owning handler clone, used to build new listener generations and
     // to perform SIGHUP hot-swaps. Every generation/DoH server gets its
@@ -1087,6 +1089,7 @@ async fn apply_hot_swaps(handler: &DnsHandler, new_config: &rustydns_core::confi
     }
     handler.swap_rate_limiter(Arc::new(RateLimiter::new(&new_config.rate_limit)));
     handler.swap_policies(&new_config.policy);
+    handler.swap_rewrites(&new_config.rewrite);
     info!(
         policies = new_config.policy.len(),
         rate_limit_enabled = new_config.rate_limit.enabled,
@@ -1591,6 +1594,7 @@ mod tests {
             metrics: Default::default(),
             rate_limit: Default::default(),
             policy: Vec::new(),
+            rewrite: Vec::new(),
         }
     }
 

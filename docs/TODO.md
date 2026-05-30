@@ -188,14 +188,6 @@ items below are what those projects have that we **don't**.
 
 ### Worth adding (fits the constraints)
 
-- **8.2 🟠 DNS rewrite / local cloaking map — M.** A config-driven map that pins an
-  arbitrary external domain to a local answer: `example.com → 10.0.0.5`, or to
-  another name, or to NXDOMAIN. This is AdGuard's "DNS rewrites" and
-  dnscrypt-proxy's "cloaking" — one of the most-requested resolver features
-  (pin internal services, override a CDN, blackhole a domain without a list).
-  We have `static_records` for *authoritative* zones, but no rewrite for names
-  outside our zones. Slots into the pipeline right after authority, before
-  blocklist. Files: `config.rs` (new `[[rewrite]]`), `handler.rs`.
 - **8.3 🟠 Response-IP blocklists — M.** Block a query if its resolved A/AAAA is in
   a configured IP/CIDR denylist (known malware C2, ad-network ranges). blocky
   supports this. Complements the existing private-rdata rebinding defence (which
@@ -253,8 +245,8 @@ items below are what those projects have that we **don't**.
   database" invariant; query history stays in the bounded ring (+ opt-in hashed
   on-disk log).
 
-> Next pick after 8.1: **8.2 (DNS rewrite map)** — most-requested resolver
-> feature and the foundation 8.4 (safe search) builds on.
+> 8.1 (CNAME blocking) and 8.2 (DNS rewrite map) are done. Next: **8.4 (safe
+> search)** builds directly on the 8.2 rewrite machinery.
 
 ---
 

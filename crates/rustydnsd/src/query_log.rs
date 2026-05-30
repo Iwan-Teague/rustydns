@@ -47,6 +47,8 @@ use rustydns_core::client::ClientId;
 pub enum ServedBy {
     /// Authority returned a record (or authoritative NODATA).
     Authority,
+    /// A `[[rewrite]]` rule produced the answer (local cloaking map).
+    Rewrite,
     /// Blocklist returned the configured `block_response`.
     Blocklist,
     /// Resolver forwarded to an upstream and returned its answer.
@@ -63,6 +65,7 @@ impl ServedBy {
     pub fn as_str(self) -> &'static str {
         match self {
             ServedBy::Authority => "authority",
+            ServedBy::Rewrite => "rewrite",
             ServedBy::Blocklist => "blocklist",
             ServedBy::Resolver => "resolver",
             ServedBy::ServerFailure => "servfail",

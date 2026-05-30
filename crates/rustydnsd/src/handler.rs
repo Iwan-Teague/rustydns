@@ -19,13 +19,14 @@ use rustydns_authority::Authority;
 use rustydns_blocklist::BlocklistEngine;
 use rustydns_core::RustyDnsError;
 use rustydns_core::client::ClientId;
-use rustydns_core::config::{BlockResponse, NodePolicy};
+use rustydns_core::config::{BlockResponse, NodePolicy, RewriteRule};
 use rustydns_core::record::{DnsRecord, RecordData};
 use rustydns_resolver::Resolver;
 
 use crate::metrics::Metrics;
 use crate::query_log::{QueryLog, ServedBy};
 use crate::rate_limiter::{LimitDecision, RateLimiter};
+use crate::rewrite::{RewriteDecision, RewriteMap};
 
 use std::collections::HashMap;
 
@@ -98,6 +99,8 @@ pub struct DnsHandler {
     sinkhole_ip: Option<IpAddr>,
     /// IP-keyed policy table, hot-swappable on SIGHUP.
     policy_by_ip: Arc<ArcSwap<HashMap<IpAddr, CompiledPolicy>>>,
+    /// DNS rewrite / local cloaking map, hot-swappable on SIGHUP.
+    rewrites: Arc<ArcSwap<RewriteMap>>,
 }
 
 /// Build the IP-keyed policy lookup table from a `[[policy]]` list.
@@ -137,6 +140,11 @@ fn build_policy_map(policies: &[NodePolicy]) -> HashMap<IpAddr, CompiledPolicy> 
 impl DnsHandler {
     /// Construct a new handler with shared authority, blocklist, resolver,
     /// rate limiter, and query-log ring buffer.
+    // A dependency-injection constructor: each argument is a distinct shared
+    // subsystem or config slice the handler wires together. Grouping them into
+    // a struct would only move the same fields elsewhere, so allow the arg
+    // count here.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         authority: Arc<Authority>,
         blocklist: Arc<BlocklistEngine>,
@@ -145,6 +153,7 @@ impl DnsHandler {
         query_log: Arc<QueryLog>,
         rate_limiter: Arc<RateLimiter>,
         policies: &[NodePolicy],
+        rewrites: &[RewriteRule],
     ) -> Result<Self, RustyDnsError> {
         let sinkhole_ip = if blocklist.block_response() == BlockResponse::Sinkhole {
             Some(IpAddr::from_str(blocklist.sinkhole_ip()).map_err(|_| {
@@ -159,6 +168,11 @@ impl DnsHandler {
 
         let policy_by_ip = build_policy_map(policies);
 
+        let rewrite_map = RewriteMap::from_rules(rewrites);
+        if !rewrite_map.is_empty() {
+            tracing::info!(rules = rewrite_map.len(), "DNS rewrite map active");
+        }
+
         Ok(Self {
             authority,
             blocklist,
@@ -168,6 +182,7 @@ impl DnsHandler {
             rate_limiter: Arc::new(ArcSwap::from(rate_limiter)),
             sinkhole_ip,
             policy_by_ip: Arc::new(ArcSwap::from_pointee(policy_by_ip)),
+            rewrites: Arc::new(ArcSwap::from_pointee(rewrite_map)),
         })
     }
 
@@ -187,6 +202,12 @@ impl DnsHandler {
     pub fn swap_policies(&self, policies: &[NodePolicy]) {
         self.policy_by_ip
             .store(Arc::new(build_policy_map(policies)));
+    }
+
+    /// Atomically replace the DNS rewrite map (SIGHUP reload).
+    pub fn swap_rewrites(&self, rewrites: &[RewriteRule]) {
+        self.rewrites
+            .store(Arc::new(RewriteMap::from_rules(rewrites)));
     }
 
     /// Resolve the per-query policy for `src_ip`. Returns the default
@@ -578,6 +599,38 @@ impl RequestHandler for DnsHandler {
                 .await;
         }
 
+        // DNS rewrites / local cloaking map (TODO 8.2): operator-defined
+        // overrides for names OUTSIDE our zones — pin a name to an IP, CNAME
+        // it elsewhere, or blackhole it. Consulted AFTER authority (authority
+        // wins) and BEFORE the blocklist/resolver. Bind the decision to a
+        // local so the ArcSwap guard is not held across the `.await` below.
+        let rewrite = self.rewrites.load().lookup(&qname_canon, qtype);
+        if let Some(decision) = rewrite {
+            self.metrics.inc_rewrite_hits();
+            // PRIVACY: qname at debug only; do not enable debug in production.
+            debug!(client = %client.anonymized(), qname = %qname, "query rewritten");
+            let (code, aa, answers) = match decision {
+                RewriteDecision::Nxdomain => (ResponseCode::NXDomain, false, Vec::new()),
+                RewriteDecision::NoData => (ResponseCode::NoError, false, Vec::new()),
+                RewriteDecision::Answer(records) => (
+                    ResponseCode::NoError,
+                    false,
+                    Self::dns_records_to_rrs(&records),
+                ),
+            };
+            self.log_query(
+                &policy,
+                &client,
+                &qname_canon,
+                qtype_label,
+                code,
+                ServedBy::Rewrite,
+            );
+            return self
+                .respond(request, response_handle, builder, code, aa, answers)
+                .await;
+        }
+
         // Surface blocklist_bypass only when it ACTUALLY changed the
         // outcome — i.e. the name would have been blocked but wasn't.
         // A trivial bypass on a name that wasn't on the blocklist
@@ -889,6 +942,7 @@ mod tests {
             metrics: Default::default(),
             rate_limit: Default::default(),
             policy: Vec::new(),
+            rewrite: Vec::new(),
         };
         // Disable randomisation for deterministic test ordering.
         dns_config.privacy.randomize_upstream_selection = false;
@@ -918,6 +972,7 @@ mod tests {
             query_log.clone(),
             rate_limiter,
             &policies,
+            &[],
         )
         .expect("handler");
 
@@ -1040,6 +1095,7 @@ mod tests {
             metrics: Default::default(),
             rate_limit: Default::default(),
             policy: Vec::new(),
+            rewrite: Vec::new(),
         };
         dns_config.privacy.randomize_upstream_selection = false;
         dns_config.upstream.dnssec_validation = false;
@@ -1060,6 +1116,7 @@ mod tests {
             query_log.clone(),
             rate_limiter,
             &policies,
+            &[],
         )
         .expect("handler");
 
@@ -1121,6 +1178,204 @@ mod tests {
             "with block_cname_cloaking = false the cloaked tracker is not blocked"
         );
         assert!(!resp.answers.is_empty());
+    }
+
+    /// Build a harness with `[[rewrite]]` rules and optional static records.
+    /// The upstream is bogus — rewrites are served before the resolver, so a
+    /// rewrite hit never touches the network.
+    async fn build_rewrite_harness(
+        static_records: Vec<StaticRecord>,
+        rewrites: Vec<rustydns_core::config::RewriteRule>,
+    ) -> Harness {
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records,
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            ..BlocklistConfig::default()
+        }));
+        let mut dns_config = DnsConfig {
+            server: Default::default(),
+            upstream: UpstreamConfig {
+                resolvers: vec!["https://127.0.0.1:1/dns-query".to_string()],
+                timeout_ms: 500,
+                ..UpstreamConfig::default()
+            },
+            authority: Default::default(),
+            blocklist: Default::default(),
+            privacy: Default::default(),
+            metrics: Default::default(),
+            rate_limit: Default::default(),
+            policy: Vec::new(),
+            rewrite: Vec::new(),
+        };
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log.clone(),
+            rate_limiter,
+            &[],
+            &rewrites,
+        )
+        .expect("handler");
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let port = udp.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server.register_socket(udp);
+        Harness {
+            port,
+            query_log,
+            _server: server,
+        }
+    }
+
+    fn rewrite_rule(
+        name: &str,
+        address: Option<&str>,
+        target: Option<&str>,
+        block: bool,
+    ) -> rustydns_core::config::RewriteRule {
+        rustydns_core::config::RewriteRule {
+            name: name.to_string(),
+            address: address.map(str::to_string),
+            target: target.map(str::to_string),
+            block,
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrite_address_pins_name_to_ip() {
+        let harness = build_rewrite_harness(
+            vec![],
+            vec![rewrite_rule(
+                "grafana.corp.example.com",
+                Some("10.0.0.20"),
+                None,
+                false,
+            )],
+        )
+        .await;
+        let resp = query(
+            harness.port,
+            "grafana.corp.example.com.",
+            ProtoRecordType::A,
+        )
+        .await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::A(a) => assert_eq!(a.0.to_string(), "10.0.0.20"),
+            other => panic!("expected A, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrite_block_returns_nxdomain() {
+        let harness = build_rewrite_harness(
+            vec![],
+            vec![rewrite_rule("telemetry.vendor.example", None, None, true)],
+        )
+        .await;
+        let resp = query(
+            harness.port,
+            "telemetry.vendor.example.",
+            ProtoRecordType::A,
+        )
+        .await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
+        assert!(resp.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rewrite_address_wrong_family_is_nodata_not_upstream() {
+        // A-pinned name queried for AAAA → NODATA (NoError, empty). It must
+        // NOT fall through to the bogus upstream (which would SERVFAIL).
+        let harness = build_rewrite_harness(
+            vec![],
+            vec![rewrite_rule(
+                "pinned.example.com",
+                Some("10.0.0.20"),
+                None,
+                false,
+            )],
+        )
+        .await;
+        let resp = query(harness.port, "pinned.example.com.", ProtoRecordType::AAAA).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "pinned name must NODATA for the wrong family, not SERVFAIL upstream"
+        );
+        assert!(resp.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rewrite_cname_returns_cname() {
+        let harness = build_rewrite_harness(
+            vec![],
+            vec![rewrite_rule(
+                "cdn.example.com",
+                None,
+                Some("internal-cdn.lan"),
+                false,
+            )],
+        )
+        .await;
+        let resp = query(harness.port, "cdn.example.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::CNAME(t) => assert_eq!(t.to_string(), "internal-cdn.lan."),
+            other => panic!("expected CNAME, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_wins_over_rewrite() {
+        // A static record AND a rewrite for the same name: authority is first
+        // in the pipeline, so it answers and the rewrite never runs.
+        let harness = build_rewrite_harness(
+            vec![static_a("host.lab.example.com", "10.0.0.5")],
+            vec![rewrite_rule(
+                "host.lab.example.com",
+                Some("9.9.9.9"),
+                None,
+                false,
+            )],
+        )
+        .await;
+        let resp = query(harness.port, "host.lab.example.com.", ProtoRecordType::A).await;
+        assert!(resp.metadata.authoritative, "authority must answer");
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::A(a) => assert_eq!(
+                a.0.to_string(),
+                "10.0.0.5",
+                "authority record must win over the rewrite"
+            ),
+            other => panic!("expected A, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1185,6 +1440,7 @@ mod tests {
             metrics: Default::default(),
             rate_limit: Default::default(),
             policy: Vec::new(),
+            rewrite: Vec::new(),
         };
         dns_config.upstream.dnssec_validation = false;
         let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
@@ -1203,6 +1459,7 @@ mod tests {
             query_log,
             rate_limiter,
             &policies,
+            &[],
         )
         .expect("handler")
     }
@@ -1669,6 +1926,7 @@ mod tests {
             metrics: Default::default(),
             rate_limit: Default::default(),
             policy: Vec::new(),
+            rewrite: Vec::new(),
         };
         dns_config.privacy.randomize_upstream_selection = false;
         dns_config.upstream.dnssec_validation = false;
@@ -1687,6 +1945,7 @@ mod tests {
             metrics,
             query_log,
             rate_limiter,
+            &[],
             &[],
         )
         .unwrap();

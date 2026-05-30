@@ -141,6 +141,73 @@ pub struct DnsConfig {
     /// Per-Rustynet-node DNS policy. Use `[[policy]]` in TOML.
     #[serde(default)]
     pub policy: Vec<NodePolicy>,
+    /// DNS rewrites / local cloaking map. Use `[[rewrite]]` in TOML. Each
+    /// entry pins a name (outside the authority zones) to a local answer, a
+    /// CNAME target, or NXDOMAIN. Applied after authority, before blocklist.
+    #[serde(default)]
+    pub rewrite: Vec<RewriteRule>,
+}
+
+// ---------------------------------------------------------------------------
+// DNS rewrite / local cloaking map
+// ---------------------------------------------------------------------------
+
+/// A single DNS rewrite rule: a name pinned to a local answer.
+///
+/// Declared as `[[rewrite]]` in TOML. Unlike `[[authority.static_records]]`
+/// (which define zones the daemon is *authoritative* for), a rewrite overrides
+/// a name in **someone else's** zone — pin an internal service, override a CDN
+/// to a LAN address, or blackhole a domain without a blocklist. Rewrites are
+/// consulted **after** the authority (authority wins) and **before** the
+/// blocklist and resolver.
+///
+/// Exactly one of `address`, `target`, or `block` must be set:
+///
+/// ```toml
+/// # Pin a name to an IP (A/AAAA synthesised locally):
+/// [[rewrite]]
+/// name    = "grafana.corp.example.com"
+/// address = "10.0.0.20"
+///
+/// # Redirect to another name (CNAME; the client follows it):
+/// [[rewrite]]
+/// name   = "cdn.example.com"
+/// target = "internal-cdn.lan."
+///
+/// # Blackhole a domain (NXDOMAIN), no blocklist needed:
+/// [[rewrite]]
+/// name  = "telemetry.vendor.example"
+/// block = true
+///
+/// # Wildcard: all subdomains (NOT the apex):
+/// [[rewrite]]
+/// name    = "*.ads.example.com"
+/// block   = true
+/// ```
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteRule {
+    /// Name to rewrite. Exact match, or a `*.example.com` / `.example.com`
+    /// wildcard suffix that matches all subdomains but not the apex.
+    /// Normalised (lowercased, trailing dot handled) at load time.
+    pub name: String,
+
+    /// Replacement IPv4/IPv6 address — synthesises an A (or AAAA) answer for
+    /// the matching query type; the other family returns NODATA so the pinned
+    /// name never leaks upstream. Mutually exclusive with `target`/`block`.
+    #[serde(default)]
+    pub address: Option<String>,
+
+    /// Replacement target name — synthesises a CNAME to this name (the client
+    /// then resolves the target, which re-enters the pipeline). Mutually
+    /// exclusive with `address`/`block`.
+    #[serde(default)]
+    pub target: Option<String>,
+
+    /// Blackhole the name: every query type returns NXDOMAIN. Mutually
+    /// exclusive with `address`/`target`. Default: `false`.
+    #[serde(default = "default_false")]
+    pub block: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,6 +1535,70 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         }
     }
 
+    // --- DNS rewrites ------------------------------------------------------------
+
+    for (idx, rule) in cfg.rewrite.iter().enumerate() {
+        if rule.name.trim().is_empty() {
+            return Err(crate::RustyDnsError::Config(format!(
+                "rewrite[{idx}].name is empty — every rewrite must name a domain"
+            )));
+        }
+
+        // Exactly one action of {address, target, block}.
+        let action_count = usize::from(rule.address.is_some())
+            + usize::from(rule.target.is_some())
+            + usize::from(rule.block);
+        if action_count == 0 {
+            return Err(crate::RustyDnsError::Config(format!(
+                "rewrite[{idx}] (`{}`) sets no action — set exactly one of `address`, \
+                 `target`, or `block = true`",
+                rule.name
+            )));
+        }
+        if action_count > 1 {
+            return Err(crate::RustyDnsError::Config(format!(
+                "rewrite[{idx}] (`{}`) sets more than one of `address`/`target`/`block` — \
+                 they are mutually exclusive",
+                rule.name
+            )));
+        }
+
+        if let Some(addr) = &rule.address
+            && addr.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(crate::RustyDnsError::Config(format!(
+                "rewrite[{idx}].address `{addr}` is not a valid IPv4 or IPv6 address"
+            )));
+        }
+        if let Some(target) = &rule.target
+            && target.trim().is_empty()
+        {
+            return Err(crate::RustyDnsError::Config(format!(
+                "rewrite[{idx}].target is empty"
+            )));
+        }
+
+        // A wildcard rewrite must keep at least two labels so it can't hijack
+        // an entire TLD (e.g. `*.com`) — same guard as the allowlist.
+        let bare = rule
+            .name
+            .trim()
+            .trim_start_matches("*.")
+            .trim_start_matches('.')
+            .trim_end_matches('.');
+        let is_wildcard = rule.name.trim().starts_with("*.") || rule.name.trim().starts_with('.');
+        if is_wildcard {
+            let labels = bare.split('.').filter(|l| !l.is_empty()).count();
+            if labels <= 1 {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "rewrite[{idx}].name `{}` is a single-label or TLD-level wildcard. \
+                     A wildcard rewrite must have at least two labels (e.g. `*.example.com`).",
+                    rule.name
+                )));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1491,6 +1622,7 @@ mod tests {
             metrics: MetricsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             policy: Vec::new(),
+            rewrite: Vec::new(),
         }
     }
 
@@ -1941,5 +2073,74 @@ mod tests {
         p.client_ip = Some("10.0.0.5".to_string());
         cfg.policy = vec![p];
         validate_config(&cfg).expect("both identifiers set must validate");
+    }
+
+    // --- rewrites ---------------------------------------------------
+
+    fn rewrite(
+        name: &str,
+        address: Option<&str>,
+        target: Option<&str>,
+        block: bool,
+    ) -> RewriteRule {
+        RewriteRule {
+            name: name.to_string(),
+            address: address.map(str::to_string),
+            target: target.map(str::to_string),
+            block,
+        }
+    }
+
+    #[test]
+    fn rewrite_address_rule_passes() {
+        let mut cfg = baseline();
+        cfg.rewrite = vec![rewrite("svc.example.com", Some("10.0.0.5"), None, false)];
+        validate_config(&cfg).expect("a valid address rewrite must pass");
+    }
+
+    #[test]
+    fn rewrite_block_and_cname_pass() {
+        let mut cfg = baseline();
+        cfg.rewrite = vec![
+            rewrite("bad.example.com", None, None, true),
+            rewrite("cdn.example.com", None, Some("internal.lan."), false),
+            rewrite("*.ads.example.com", None, None, true),
+        ];
+        validate_config(&cfg).expect("block / cname / wildcard rewrites must pass");
+    }
+
+    #[test]
+    fn rewrite_no_action_rejected() {
+        let mut cfg = baseline();
+        cfg.rewrite = vec![rewrite("svc.example.com", None, None, false)];
+        assert_config_err(validate_config(&cfg), "sets no action");
+    }
+
+    #[test]
+    fn rewrite_multiple_actions_rejected() {
+        let mut cfg = baseline();
+        cfg.rewrite = vec![rewrite("svc.example.com", Some("10.0.0.5"), None, true)];
+        assert_config_err(validate_config(&cfg), "more than one");
+    }
+
+    #[test]
+    fn rewrite_bad_address_rejected() {
+        let mut cfg = baseline();
+        cfg.rewrite = vec![rewrite("svc.example.com", Some("not-an-ip"), None, false)];
+        assert_config_err(validate_config(&cfg), "not a valid IPv4 or IPv6");
+    }
+
+    #[test]
+    fn rewrite_tld_wildcard_rejected() {
+        let mut cfg = baseline();
+        cfg.rewrite = vec![rewrite("*.com", None, None, true)];
+        assert_config_err(validate_config(&cfg), "single-label or TLD-level wildcard");
+    }
+
+    #[test]
+    fn rewrite_empty_name_rejected() {
+        let mut cfg = baseline();
+        cfg.rewrite = vec![rewrite("", Some("10.0.0.5"), None, false)];
+        assert_config_err(validate_config(&cfg), "name is empty");
     }
 }

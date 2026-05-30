@@ -28,6 +28,12 @@ Security, privacy, and anonymity are first-class design constraints — not feat
          │ miss
          ▼
   ┌─────────────┐
+  │   Rewrite   │  — [[rewrite]] local-cloaking override?
+  │ (cloaking)  │    yes → pin to IP / CNAME / NXDOMAIN (NODATA on
+  └──────┬──────┘          wrong family); authority still wins above
+         │ no match
+         ▼
+  ┌─────────────┐
   │  Blocklist  │  — domain on blocklist?
   │   engine    │    yes → NXDOMAIN / REFUSED / sinkhole; log it
   └──────┬──────┘
@@ -39,7 +45,7 @@ Security, privacy, and anonymity are first-class design constraints — not feat
   └─────────────┘    (there is no stale-answer fallback mode)
 ```
 
-**Pipeline order is an invariant.** Rate-limit before authority; authority before blocklist; blocklist before resolver. This order must never change. The rate limiter runs first so that a flood of malformed queries from one source IP costs only an `AHashMap` lookup + token-bucket update.
+**Pipeline order is an invariant.** Rate-limit before authority; authority before rewrite; rewrite before blocklist; blocklist before resolver. This order must never change. The rate limiter runs first so that a flood of malformed queries from one source IP costs only an `AHashMap` lookup + token-bucket update. Rewrites sit after the authority (so the daemon's own zones always win) and before the blocklist/resolver (so an operator pin/blackhole takes precedence over a list and never leaks upstream).
 
 ## Crate responsibilities
 
@@ -112,7 +118,7 @@ The binary. Responsibilities:
 - Wire the request pipeline as a single `RequestHandler` impl (`DnsHandler`) that runs `Authority → Blocklist → Resolver` directly. Not a `tower::Service` stack — the pipeline is short enough that a hand-written async fn beats the layer-builder ceremony.
 - Serve the loopback management API on `metrics.listen` (default `127.0.0.1:9153`): `/metrics` (Prometheus), `/health` (JSON liveness), `/queries` (JSON snapshot of the in-memory ring buffer). All three refuse to bind off-loopback; see [`operator-endpoints.md`](operator-endpoints.md).
 - Background tasks: periodic blocklist reload on `blocklist.reload_interval_secs`; periodic mesh-zone bundle reload on `authority.poll_interval_secs`; both swap their state via `ArcSwap` atomically on success.
-- Signal handling: `SIGHUP` re-reads blocklist content, the mesh-zone bundle, and `rustydns.toml`. Config reload hot-swaps the upstream resolver, per-client policy, and rate limiter atomically via `ArcSwap` (no dropped in-flight queries), and live-rebinds changed listeners on **unprivileged** ports — DNS UDP/TCP, DoT (incl. TLS cert rotation), DoH, and metrics — zero-drop via `SO_REUSEPORT` (a new generation serves before the old drains). Listeners on **privileged** ports (`:53`, `:853`) cannot be rebound after the startup capability drop and are logged as restart-required. Blocklist *sources* and the on-disk query log are also bound at startup. A config that fails to parse/validate leaves the running config untouched. `SIGTERM`/`SIGINT` runs the bounded graceful shutdown (`RUSTYDNS_SHUTDOWN_TIMEOUT_SECS`, default 10s); a second signal collapses the timeout to zero.
+- Signal handling: `SIGHUP` re-reads blocklist content, the mesh-zone bundle, and `rustydns.toml`. Config reload hot-swaps the upstream resolver, per-client policy, rate limiter, and DNS rewrite map atomically via `ArcSwap` (no dropped in-flight queries), and live-rebinds changed listeners on **unprivileged** ports — DNS UDP/TCP, DoT (incl. TLS cert rotation), DoH, and metrics — zero-drop via `SO_REUSEPORT` (a new generation serves before the old drains). Listeners on **privileged** ports (`:53`, `:853`) cannot be rebound after the startup capability drop and are logged as restart-required. Blocklist *sources* and the on-disk query log are also bound at startup. A config that fails to parse/validate leaves the running config untouched. `SIGTERM`/`SIGINT` runs the bounded graceful shutdown (`RUSTYDNS_SHUTDOWN_TIMEOUT_SECS`, default 10s); a second signal collapses the timeout to zero.
 - DoH listener: axum HTTP/2 server. **No TLS on the listener itself** — TLS is on upstream connections going out. If DoH is exposed externally, a TLS-terminating reverse proxy must be in front.
 - DoT listener (optional): requires `tls_cert_path` and `tls_key_path`; rejected by `validate_config` if either is missing.
 

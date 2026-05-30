@@ -391,3 +391,34 @@ path   = "/metrics"
 # [[policy]]
 # node_id          = "ed25519:AbCdEf..."
 # blocklist_bypass = false
+
+# ---------------------------------------------------------------------------
+# DNS rewrites / local cloaking map
+# ---------------------------------------------------------------------------
+# Override names OUTSIDE your authoritative zones: pin an internal service to
+# a LAN IP, redirect a CDN, or blackhole a domain without a blocklist.
+# Consulted AFTER the authority (authority wins) and BEFORE the blocklist and
+# resolver. Each [[rewrite]] sets exactly one of: address, target, block.
+# Hot-reloadable on SIGHUP. Use [[rewrite]] (TOML array of tables).
+
+# Pin a name to an IP (synthesises A/AAAA; the wrong family returns NODATA so
+# the pinned name never leaks upstream):
+# [[rewrite]]
+# name    = "grafana.corp.example.com"
+# address = "10.0.0.20"
+
+# Redirect to another name via CNAME (the client then resolves the target):
+# [[rewrite]]
+# name   = "cdn.example.com"
+# target = "internal-cdn.lan."
+
+# Blackhole a domain (NXDOMAIN), no blocklist entry needed:
+# [[rewrite]]
+# name  = "telemetry.vendor.example"
+# block = true
+
+# Wildcard: all subdomains (NOT the apex). TLD-level wildcards (e.g. "*.com")
+# are rejected at startup.
+# [[rewrite]]
+# name  = "*.ads.example.com"
+# block = true

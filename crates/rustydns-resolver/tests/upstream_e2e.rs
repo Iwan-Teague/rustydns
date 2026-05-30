@@ -172,6 +172,7 @@ fn plain_config(upstream_addr: &str) -> DnsConfig {
         metrics: MetricsConfig::default(),
         rate_limit: RateLimitConfig::default(),
         policy: Vec::new(),
+        rewrite: Vec::new(),
     }
 }
 

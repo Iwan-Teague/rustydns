@@ -63,6 +63,7 @@ Standard Prometheus exposition over the `prometheus` crate's
 |-----------------------------------------|---------|--------------------------------------------------|
 | `rustydns_dns_queries_total`            | counter | Every accepted query                             |
 | `rustydns_authority_hits_total`         | counter | Authority lookups returning records              |
+| `rustydns_rewrite_hits_total`           | counter | Queries answered by a `[[rewrite]]` rule          |
 | `rustydns_blocklist_hits_total`         | counter | Queries blocked by the blocklist                 |
 | `rustydns_blocklist_cname_cloaking_blocked_total` | counter | Queries blocked because an answer CNAME targeted a blocked domain |
 | `rustydns_resolver_queries_total`       | counter | Queries forwarded to an upstream                 |
@@ -170,7 +171,7 @@ Buffer size is `privacy.query_log_ring_size` (default 1000, max
 - `rcode` — wire-level DNS response code (`0`=NoError, `2`=ServFail,
   `3`=NXDomain, `5`=Refused).
 - `served_by` — which pipeline arm produced the answer:
-  `authority`, `blocklist`, `resolver`, `servfail`, or `rejected`.
+  `authority`, `rewrite`, `blocklist`, `resolver`, `servfail`, or `rejected`.
 
 ### Looking up a specific domain
 

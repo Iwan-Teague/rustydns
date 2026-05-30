@@ -22,6 +22,7 @@ pub struct Metrics {
     registry: Registry,
     dns_queries_total: IntCounter,
     authority_hits_total: IntCounter,
+    rewrite_hits_total: IntCounter,
     blocklist_hits_total: IntCounter,
     blocklist_cname_cloaking_blocked_total: IntCounter,
     resolver_queries_total: IntCounter,
@@ -59,6 +60,11 @@ impl Metrics {
             &registry,
             "rustydns_authority_hits_total",
             "Authority lookups that returned a result",
+        )?;
+        let rewrite_hits_total = register_counter(
+            &registry,
+            "rustydns_rewrite_hits_total",
+            "Queries answered by a [[rewrite]] rule (local cloaking map)",
         )?;
         let blocklist_hits_total = register_counter(
             &registry,
@@ -179,6 +185,7 @@ impl Metrics {
             registry,
             dns_queries_total,
             authority_hits_total,
+            rewrite_hits_total,
             blocklist_hits_total,
             blocklist_cname_cloaking_blocked_total,
             resolver_queries_total,
@@ -233,6 +240,11 @@ impl Metrics {
     /// Increment authority hit counter.
     pub fn inc_authority_hits(&self) {
         self.authority_hits_total.inc();
+    }
+
+    /// Increment the rewrite-hit counter (a query answered by a `[[rewrite]]`).
+    pub fn inc_rewrite_hits(&self) {
+        self.rewrite_hits_total.inc();
     }
 
     /// Increment blocklist hit counter.

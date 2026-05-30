@@ -301,6 +301,7 @@ mod tests {
             metrics: Default::default(),
             rate_limit: Default::default(),
             policy: Vec::new(),
+            rewrite: Vec::new(),
         };
         dns_config.privacy.randomize_upstream_selection = false;
         dns_config.upstream.dnssec_validation = false;
@@ -321,6 +322,7 @@ mod tests {
                 metrics,
                 query_log,
                 rate_limiter,
+                &[],
                 &[],
             )
             .unwrap(),

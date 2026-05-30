@@ -1383,6 +1383,7 @@ mod tests {
             metrics: Default::default(),
             rate_limit: Default::default(),
             policy: Vec::new(),
+            rewrite: Vec::new(),
         };
         cfg.upstream.resolvers.clear();
         let err = Resolver::new(cfg).await.unwrap_err();
