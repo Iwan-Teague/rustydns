@@ -33,7 +33,7 @@ hickory-proto    = "0.26"
 hickory-resolver = { version = "0.26", features = ["https-ring", "quic-ring", "dnssec-ring", "webpki-roots"] }
 
 # HTTP / TLS — rustls backend only, no openssl
-axum              = { version = "0.7", features = ["http2"] }
+axum              = { version = "0.8", features = ["http2"] }
 rustls            = { version = "0.23", features = ["ring"], default-features = false }
 rustls-native-certs = "0.7"
 tokio-rustls      = "0.26"
