@@ -92,7 +92,7 @@ prometheus = "0.14"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 
 # SHA-256 used by Rustynet's dns-zone watermark format.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Zeroize sensitive config fields on drop (tokens, keys)
 zeroize = { version = "1", features = ["derive"] }
