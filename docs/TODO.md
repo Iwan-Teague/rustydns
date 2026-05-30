@@ -80,14 +80,15 @@ design pass for the live-handover model. Privileged-port caveat (§4 of
   named helpers for readability and unit-testability of each stage.
 - **5.2 🟡 `free_port()` race in integration tests** — `tests/sighup_reload.rs`
   binds `:0`, reads the port, drops, then lets the daemon rebind. Tiny TOCTOU;
-  acceptable on loopback but could flake under heavy parallelism. Could pass the
-  bound listener fd via systemd-style activation, or retry on bind failure.
-- **5.3 🟡 Audit runtime `unwrap()/expect()`** — with `panic = "abort"` in
-  release, any reachable panic on malformed network input is a remote DoS.
-  Builder `.unwrap()`s on constant `Response`s are safe; do a focused pass over
-  `handler.rs`, `doh.rs`, `metrics.rs` to confirm none are reachable from
-  attacker-controlled input. (Spot-check done this session — looked clean — but
-  no systematic audit.)
+  acceptable on loopback but could flake under heavy parallelism. **Observed**
+  flaking once this session when a `cargo test --workspace` raced a concurrent
+  release build (passed in isolation). Could pass the bound listener fd via
+  systemd-style activation, or retry on bind failure.
+
+(5.3 done: systematic `unwrap()/expect()` audit across all network/parser paths
+— no reachable panic on attacker-controlled input; query-log mutex locks now
+recover on poison; audit conclusion recorded in `docs/security.md` §Panic
+Policy.)
 
 ---
 

@@ -423,6 +423,24 @@ cleanly rather than unwinding the stack, which eliminates a class of exploit pri
 that rely on stack unwinding side effects. The systemd unit is configured to restart the
 service on exit, so an abort is not a permanent denial of service.
 
+Because `panic = "abort"` turns any reachable panic on attacker-controlled input into a
+remote DoS, the runtime `unwrap()` / `expect()` surface has been audited along every path
+reachable from a network packet, a blocklist source file, or a mesh-zone bundle:
+
+- The request handler, DoH server, `/metrics` `/health` `/queries` endpoints, and the
+  rewrite map contain no `unwrap`/`expect`/`panic` on the data path. The HTTP `Response`
+  builders use only constant status codes and static header names, so their `.unwrap()`
+  is infallible.
+- The blocklist parser and the signed-bundle parser validate and bound their input with
+  `?`/`map_err` and never index or `unwrap` untrusted data (the bundle additionally caps
+  size and `record_count` before allocating).
+- The resolver's one config-time `unwrap` (IPv6-literal bracket parsing) is guarded by a
+  preceding `contains(']')` check and runs only over operator-supplied upstream URLs at
+  startup, never over query input.
+- The query-log mutex acquisitions recover the inner value on poison
+  (`unwrap_or_else(|e| e.into_inner())`) rather than propagating a panic, so they stay
+  panic-free even in a non-`abort` build.
+
 ---
 
 ## Additional Threats and Mitigations

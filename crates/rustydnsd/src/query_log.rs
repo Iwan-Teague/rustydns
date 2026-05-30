@@ -281,7 +281,7 @@ impl QueryLog {
         if self.capacity == 0 {
             return;
         }
-        let mut buf = self.inner.lock().expect("query log lock poisoned");
+        let mut buf = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if buf.len() == self.capacity {
             buf.pop_front();
         }
@@ -293,14 +293,14 @@ impl QueryLog {
     /// inspection endpoint and for tests.
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<QueryLogEntry> {
-        let buf = self.inner.lock().expect("query log lock poisoned");
+        let buf = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         buf.iter().rev().copied().collect()
     }
 
     /// Current entry count.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("query log lock poisoned").len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// True if the buffer holds no entries.
