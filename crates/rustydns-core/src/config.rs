@@ -575,6 +575,23 @@ pub struct BlocklistConfig {
     /// `.com` TLD. `validate_config` rejects single-label wildcard entries.
     #[serde(default)]
     pub allowlist: Vec<String>,
+
+    /// Defend against CNAME cloaking. Default: `true`.
+    ///
+    /// Trackers evade QNAME blocklists by pointing an innocuous first-party
+    /// name (e.g. `metrics.example.com`) at a CNAME like
+    /// `c.tracker-adnetwork.net`. The QNAME isn't on any list, so it slips
+    /// through. With this enabled, after the upstream answers, rustydns walks
+    /// the answer's CNAME chain and blocks the whole response (per
+    /// `block_response`) if any CNAME target is on the blocklist — closing
+    /// the evasion. Clients with `blocklist_bypass` are exempt, exactly as
+    /// for QNAME blocking.
+    ///
+    /// Set to `false` only if a legitimate CNAME of yours happens to target a
+    /// domain on an aggressive blocklist; prefer allowlisting that specific
+    /// target instead.
+    #[serde(default = "default_true")]
+    pub block_cname_cloaking: bool,
 }
 
 impl Default for BlocklistConfig {
@@ -589,6 +606,7 @@ impl Default for BlocklistConfig {
             fetch_timeout_ms: default_fetch_timeout_ms(),
             max_fetch_bytes: default_max_fetch_bytes(),
             allowlist: Vec::new(),
+            block_cname_cloaking: true,
         }
     }
 }

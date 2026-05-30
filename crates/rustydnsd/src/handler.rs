@@ -341,6 +341,43 @@ impl DnsHandler {
             _ => Vec::new(),
         }
     }
+
+    /// Build the `(response_code, answers)` for a blocked query per the
+    /// configured `block_response`. Shared by the QNAME-block path and the
+    /// CNAME-cloaking path so both honour `nxdomain` / `refused` / `sinkhole`
+    /// identically. `qname` is the original (cased) name so a sinkhole record
+    /// echoes the client's name.
+    fn build_block_response(&self, qname: &str, qtype: RecordType) -> (ResponseCode, Vec<Record>) {
+        match self.blocklist.block_response() {
+            BlockResponse::Nxdomain => (ResponseCode::NXDomain, Vec::new()),
+            BlockResponse::Refused => (ResponseCode::Refused, Vec::new()),
+            BlockResponse::Sinkhole => {
+                let answers = self.sinkhole_answers(qname, qtype);
+                if answers.is_empty() {
+                    (ResponseCode::NXDomain, Vec::new())
+                } else {
+                    (ResponseCode::NoError, answers)
+                }
+            }
+        }
+    }
+
+    /// CNAME-cloaking defence: returns `true` if any CNAME target in the
+    /// upstream answer is on the blocklist.
+    ///
+    /// Trackers evade QNAME blocklists by pointing an innocuous first-party
+    /// name at a CNAME like `c.tracker-adnetwork.net`. The QNAME isn't on any
+    /// list, so it passes the pre-resolution blocklist check — but the answer
+    /// reveals the blocked target. We check every CNAME target in the chain;
+    /// since the final A/AAAA owner name is always the last CNAME target,
+    /// checking targets covers the whole chain. Pure in-memory lookups — no
+    /// extra upstream queries.
+    fn cname_chain_blocked(&self, records: &[DnsRecord]) -> bool {
+        records.iter().any(|rec| match &rec.data {
+            RecordData::Cname(target) => self.blocklist.is_blocked(target),
+            _ => false,
+        })
+    }
 }
 
 #[async_trait]
@@ -553,18 +590,7 @@ impl RequestHandler for DnsHandler {
             self.metrics.inc_blocklist_hits();
             // PRIVACY: qname logged at debug only; do not enable debug in production.
             debug!(client = %client.anonymized(), qname = %qname, "query blocked");
-            let (code, answers) = match self.blocklist.block_response() {
-                BlockResponse::Nxdomain => (ResponseCode::NXDomain, Vec::new()),
-                BlockResponse::Refused => (ResponseCode::Refused, Vec::new()),
-                BlockResponse::Sinkhole => {
-                    let answers = self.sinkhole_answers(&qname, qtype);
-                    if answers.is_empty() {
-                        (ResponseCode::NXDomain, Vec::new())
-                    } else {
-                        (ResponseCode::NoError, answers)
-                    }
-                }
-            };
+            let (code, answers) = self.build_block_response(&qname, qtype);
 
             self.log_query(
                 &policy,
@@ -588,6 +614,40 @@ impl RequestHandler for DnsHandler {
             Ok(out) => {
                 self.metrics
                     .inc_private_rdata_dropped(out.private_rdata_dropped);
+
+                // CNAME-cloaking defence (TODO 8.1): a tracker can pass the
+                // pre-resolution QNAME blocklist check by CNAMEing a clean
+                // first-party name to a blocked tracker domain. Now that we
+                // have the answer, block the whole response if any CNAME
+                // target is on the blocklist — unless this client bypasses
+                // the blocklist (same exemption as QNAME blocking). The
+                // `&&` short-circuits so bypass clients pay nothing.
+                if self.blocklist.block_cname_cloaking()
+                    && !policy.blocklist_bypass
+                    && self.cname_chain_blocked(&out.records)
+                {
+                    self.metrics.inc_blocklist_hits();
+                    self.metrics.inc_blocklist_cname_cloaking_blocked();
+                    // PRIVACY: qname at debug only; do not enable debug in prod.
+                    debug!(
+                        client = %client.anonymized(),
+                        qname = %qname,
+                        "query blocked (CNAME cloaking)"
+                    );
+                    let (code, answers) = self.build_block_response(&qname, qtype);
+                    self.log_query(
+                        &policy,
+                        &client,
+                        &qname_canon,
+                        qtype_label,
+                        code,
+                        ServedBy::Blocklist,
+                    );
+                    return self
+                        .respond(request, response_handle, builder, code, false, answers)
+                        .await;
+                }
+
                 let answers = Self::dns_records_to_rrs(&out.records);
                 // Honour the upstream's NXDOMAIN vs NODATA distinction: a
                 // genuinely non-existent name returns NXDomain, not an empty
@@ -880,6 +940,215 @@ mod tests {
             query_log,
             _server: server,
         }
+    }
+
+    /// Spawn a tiny mock UDP DNS upstream that answers **any** A query for
+    /// `NAME` with the chain `NAME CNAME <cname_target>` + `<cname_target> A
+    /// 93.184.216.34`. Returns the bound port. Used by the CNAME-cloaking
+    /// tests so the handler sees a real CNAME chain in the answer.
+    async fn spawn_cname_mock(cname_target: &'static str) -> u16 {
+        use hickory_proto::rr::rdata::{A, CNAME};
+        use hickory_proto::rr::{RData, Record};
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+        let port = sock.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let (n, src) = match sock.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(q) = query.queries.first() else {
+                    continue;
+                };
+                let owner = q.name().clone();
+                let target = ProtoName::from_ascii(cname_target).unwrap();
+                let mut resp =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                resp.metadata.recursion_available = true;
+                resp.metadata.response_code = ResponseCode::NoError;
+                resp.add_query(q.clone());
+                resp.add_answer(Record::from_rdata(
+                    owner,
+                    300,
+                    RData::CNAME(CNAME(target.clone())),
+                ));
+                resp.add_answer(Record::from_rdata(
+                    target,
+                    300,
+                    RData::A(A("93.184.216.34".parse().unwrap())),
+                ));
+                if let Ok(bytes) = resp.to_bytes() {
+                    let _ = sock.send_to(&bytes, src).await;
+                }
+            }
+        });
+        port
+    }
+
+    /// Build a harness whose resolver forwards to a real plain-UDP upstream
+    /// at `127.0.0.1:upstream_port` (used with `spawn_cname_mock`), with the
+    /// CNAME-cloaking defence toggle and an optional client policy.
+    async fn build_cname_harness(
+        blocklist_lines: &str,
+        upstream_port: u16,
+        block_cname_cloaking: bool,
+        policies: Vec<NodePolicy>,
+    ) -> Harness {
+        use rustydns_core::config::UpstreamProtocol;
+
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: Vec::new(),
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+
+        let blocklist_cfg = BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            block_response: BlockResponse::Nxdomain,
+            block_cname_cloaking,
+            ..BlocklistConfig::default()
+        };
+        let blocklist = Arc::new(BlocklistEngine::new(blocklist_cfg));
+        if !blocklist_lines.is_empty() {
+            blocklist.load_trusted(blocklist_lines);
+        }
+
+        let mut dns_config = DnsConfig {
+            server: Default::default(),
+            upstream: UpstreamConfig {
+                resolvers: vec![format!("127.0.0.1:{upstream_port}")],
+                protocol: UpstreamProtocol::Plain,
+                timeout_ms: 1000,
+                ..UpstreamConfig::default()
+            },
+            authority: Default::default(),
+            blocklist: Default::default(),
+            privacy: Default::default(),
+            metrics: Default::default(),
+            rate_limit: Default::default(),
+            policy: Vec::new(),
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+
+        let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log.clone(),
+            rate_limiter,
+            &policies,
+        )
+        .expect("handler");
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let port = udp.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server.register_socket(udp);
+        Harness {
+            port,
+            query_log,
+            _server: server,
+        }
+    }
+
+    #[tokio::test]
+    async fn cname_cloaking_blocks_when_answer_targets_blocked_domain() {
+        // QNAME `metrics.example.com` is NOT on the blocklist, but it CNAMEs
+        // to `c.tracker-adnetwork.net`, which IS. Only the CNAME-cloaking
+        // defence can catch this → NXDOMAIN.
+        let port = spawn_cname_mock("c.tracker-adnetwork.net.").await;
+        let harness =
+            build_cname_harness("0.0.0.0 c.tracker-adnetwork.net\n", port, true, Vec::new()).await;
+
+        let resp = query(harness.port, "metrics.example.com.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NXDomain,
+            "a CNAME-cloaked tracker must be blocked"
+        );
+        assert!(resp.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cname_cloaking_allows_clean_chain() {
+        // CNAME target is a normal CDN, not on the blocklist → answer passes.
+        let port = spawn_cname_mock("cdn.cloudfront.net.").await;
+        let harness =
+            build_cname_harness("0.0.0.0 c.tracker-adnetwork.net\n", port, true, Vec::new()).await;
+
+        let resp = query(harness.port, "assets.example.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            !resp.answers.is_empty(),
+            "a clean CNAME chain must be returned unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn cname_cloaking_disabled_lets_blocked_target_through() {
+        // With the defence off, the cloaked tracker resolves normally.
+        let port = spawn_cname_mock("c.tracker-adnetwork.net.").await;
+        let harness =
+            build_cname_harness("0.0.0.0 c.tracker-adnetwork.net\n", port, false, Vec::new()).await;
+
+        let resp = query(harness.port, "metrics.example.com.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "with block_cname_cloaking = false the cloaked tracker is not blocked"
+        );
+        assert!(!resp.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cname_cloaking_bypassed_for_bypass_client() {
+        // A client with blocklist_bypass must reach the cloaked answer just
+        // as it bypasses QNAME blocking. Loopback is the query source.
+        let policy = NodePolicy {
+            node_id: None,
+            client_ip: Some("127.0.0.1".to_string()),
+            blocklist_bypass: true,
+            zones_allowed: Vec::new(),
+            log_all_queries: false,
+        };
+        let port = spawn_cname_mock("c.tracker-adnetwork.net.").await;
+        let harness = build_cname_harness(
+            "0.0.0.0 c.tracker-adnetwork.net\n",
+            port,
+            true,
+            vec![policy],
+        )
+        .await;
+
+        let resp = query(harness.port, "metrics.example.com.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "blocklist_bypass clients are exempt from CNAME-cloaking blocking too"
+        );
     }
 
     /// Build a bare `DnsHandler` (no sockets/server) for unit-testing the

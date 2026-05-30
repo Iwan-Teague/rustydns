@@ -247,6 +247,11 @@ impl BlocklistEngine {
     pub fn sinkhole_ip(&self) -> &str {
         &self.config.sinkhole_ip
     }
+
+    /// Whether CNAME-cloaking defence is enabled (`blocklist.block_cname_cloaking`).
+    pub fn block_cname_cloaking(&self) -> bool {
+        self.config.block_cname_cloaking
+    }
 }
 
 // ---------------------------------------------------------------------------

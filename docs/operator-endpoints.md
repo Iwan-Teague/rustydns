@@ -64,6 +64,7 @@ Standard Prometheus exposition over the `prometheus` crate's
 | `rustydns_dns_queries_total`            | counter | Every accepted query                             |
 | `rustydns_authority_hits_total`         | counter | Authority lookups returning records              |
 | `rustydns_blocklist_hits_total`         | counter | Queries blocked by the blocklist                 |
+| `rustydns_blocklist_cname_cloaking_blocked_total` | counter | Queries blocked because an answer CNAME targeted a blocked domain |
 | `rustydns_resolver_queries_total`       | counter | Queries forwarded to an upstream                 |
 | `rustydns_resolver_failures_total`      | counter | Resolver failures returned as SERVFAIL           |
 

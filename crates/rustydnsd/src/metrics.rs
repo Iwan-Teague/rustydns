@@ -23,6 +23,7 @@ pub struct Metrics {
     dns_queries_total: IntCounter,
     authority_hits_total: IntCounter,
     blocklist_hits_total: IntCounter,
+    blocklist_cname_cloaking_blocked_total: IntCounter,
     resolver_queries_total: IntCounter,
     resolver_failures_total: IntCounter,
     blocklist_reload_success_total: IntCounter,
@@ -63,6 +64,11 @@ impl Metrics {
             &registry,
             "rustydns_blocklist_hits_total",
             "Queries blocked by the blocklist",
+        )?;
+        let blocklist_cname_cloaking_blocked_total = register_counter(
+            &registry,
+            "rustydns_blocklist_cname_cloaking_blocked_total",
+            "Queries blocked because a CNAME in the answer pointed at a blocked domain",
         )?;
         let resolver_queries_total = register_counter(
             &registry,
@@ -174,6 +180,7 @@ impl Metrics {
             dns_queries_total,
             authority_hits_total,
             blocklist_hits_total,
+            blocklist_cname_cloaking_blocked_total,
             resolver_queries_total,
             resolver_failures_total,
             blocklist_reload_success_total,
@@ -231,6 +238,12 @@ impl Metrics {
     /// Increment blocklist hit counter.
     pub fn inc_blocklist_hits(&self) {
         self.blocklist_hits_total.inc();
+    }
+
+    /// Increment the CNAME-cloaking block counter (a query blocked because a
+    /// CNAME in the upstream answer pointed at a blocked domain).
+    pub fn inc_blocklist_cname_cloaking_blocked(&self) {
+        self.blocklist_cname_cloaking_blocked_total.inc();
     }
 
     /// Increment resolver query counter.

@@ -247,6 +247,15 @@ allowlist = [
     # "*.cdn.example.com",
 ]
 
+# CNAME-cloaking defence (default: true). Trackers evade QNAME blocklists by
+# pointing a clean first-party name (metrics.example.com) at a CNAME like
+# c.tracker-adnetwork.net. After the upstream answers, rustydns walks the
+# answer's CNAME chain and blocks the whole response (per block_response) if
+# any target is on the blocklist. Set to false only if a legitimate CNAME of
+# yours targets a domain on an aggressive blocklist (prefer allowlisting that
+# target instead).
+block_cname_cloaking = true
+
 # ---------------------------------------------------------------------------
 [privacy]
 # ---------------------------------------------------------------------------

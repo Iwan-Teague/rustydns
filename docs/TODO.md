@@ -183,19 +183,11 @@ privacy/security first, low-power). **rustydns already has** ad/tracker blocking
 NXDOMAIN/sinkhole/REFUSED responses, HTTPS-only sources, auto-reload),
 conditional forwarding, bounded LRU caching, DNSSEC, DoH/DoQ upstream + DoT/DoH
 inbound, randomised upstream selection, ECS stripping, per-client (IP) policy,
-rate limiting, and rebinding defence. The items below are what those projects
-have that we **don't**.
+rate limiting, rebinding defence, and CNAME-cloaking defence (§8.1, done). The
+items below are what those projects have that we **don't**.
 
 ### Worth adding (fits the constraints)
 
-- **8.1 🟠 Deep CNAME-chain blocking ("CNAME cloaking" defence) — M.** The single
-  best *ad-blocking* upgrade. Trackers evade QNAME blocklists by pointing
-  `metrics.example.com` at a CNAME like `c.tracker-adnetwork.net` (first-party
-  cloaking). We block only on the QNAME today, so these slip through. After the
-  resolver returns, walk the answer's CNAME chain and block (NXDOMAIN/sinkhole)
-  if any target is on the blocklist. blocky and AdGuard both do this. Pure logic,
-  no new deps, clear security/privacy win. Files: `crates/rustydnsd/src/handler.rs`
-  (resolver `Ok` arm), `crates/rustydns-blocklist`.
 - **8.2 🟠 DNS rewrite / local cloaking map — M.** A config-driven map that pins an
   arbitrary external domain to a local answer: `example.com → 10.0.0.5`, or to
   another name, or to NXDOMAIN. This is AdGuard's "DNS rewrites" and
@@ -261,9 +253,8 @@ have that we **don't**.
   database" invariant; query history stays in the bounded ring (+ opt-in hashed
   on-disk log).
 
-> Recommended first pick: **8.1 (deep CNAME blocking)** — it's the highest-impact
-> ad-blocking gap, fits perfectly, and is a security/privacy win, not just a
-> convenience.
+> Next pick after 8.1: **8.2 (DNS rewrite map)** — most-requested resolver
+> feature and the foundation 8.4 (safe search) builds on.
 
 ---
 

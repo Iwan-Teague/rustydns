@@ -98,6 +98,7 @@ Fast in-memory blocklist engine. Key properties:
 - **Four input formats** — hosts, plain domain list, RPZ, AdGuard/uBlock (auto-detected per source).
 - **Domain validation** — label length (63 bytes), total length (253 bytes), control character rejection.
 - **RPZ passthru isolation** — allow/passthru entries from untrusted remote sources are discarded with a warning. See `docs/security.md` for the threat this mitigates.
+- **CNAME-cloaking defence** — after the resolver answers, the handler walks the answer's CNAME chain and blocks the whole response (per `block_response`) if any CNAME target is on the blocklist, closing the first-party-cloaking evasion. Toggle: `blocklist.block_cname_cloaking` (default on). See `docs/security.md` §"CNAME Cloaking".
 
 **Startup behaviour on blocklist fetch failure:** if a remote source fails to fetch at startup, the daemon starts with whatever sources loaded successfully (potentially an empty blocklist if all fail). A warning is logged for each failed source. The daemon does NOT fail to start — DNS resolution must continue even if blocklist fetching is temporarily broken.
 

@@ -467,6 +467,24 @@ node could use RustyDNS as a DNS amplification vector to flood third parties. Mi
 - `MemoryDenyWriteExecute` and `SystemCallFilter` limit what a compromised process
   can do even if it achieves code execution inside the daemon.
 
+### CNAME Cloaking (First-Party Tracker Evasion)
+
+A tracker evades QNAME-based blocklists by having a first-party subdomain the
+site controls (e.g. `metrics.example.com`) `CNAME` to a blocked tracker domain
+(e.g. `c.tracker-adnetwork.net`). The QNAME is not on any list, so it passes the
+pre-resolution blocklist check; only the *answer* reveals the blocked target.
+
+**Mitigation:** `blocklist.block_cname_cloaking = true` (the default). After the
+upstream answers, rustydns walks the answer's CNAME chain and blocks the whole
+response — using the same `block_response` (NXDOMAIN / sinkhole / REFUSED) as a
+QNAME block — if any CNAME target is on the blocklist. The check is pure
+in-memory lookups (no extra upstream queries) and short-circuits for clients
+with `blocklist_bypass`, exactly as QNAME blocking does. Each such block
+increments `rustydns_blocklist_cname_cloaking_blocked_total`. The defence is a
+pure ad-blocking/privacy win and is enabled by default; an operator whose own
+CNAME legitimately targets a domain on an aggressive blocklist should allowlist
+that specific target rather than disabling the defence wholesale.
+
 ### Blocklist Source Compromise (Supply Chain)
 
 A maintainer's infrastructure is compromised and begins serving a blocklist that
