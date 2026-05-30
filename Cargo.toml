@@ -69,6 +69,11 @@ socket2 = { version = "0.6", features = ["all"] }
 # Fast, DoS-resistant hashing (randomised seed per process)
 ahash = "0.8"
 
+# Linear-time regex (finite automata — NO catastrophic backtracking / ReDoS)
+# for custom block rules. `default-features = false` drops the Unicode tables
+# (domains are ASCII-only here), keeping the binary small on Pi-class targets.
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
+
 # Async trait helpers
 async-trait = "0.1"
 

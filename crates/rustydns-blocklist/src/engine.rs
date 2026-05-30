@@ -27,8 +27,8 @@ use ahash::AHashSet;
 use arc_swap::ArcSwap;
 use tracing::{error, info, warn};
 
-use rustydns_core::IpDenylist;
 use rustydns_core::config::BlocklistConfig;
+use rustydns_core::{IpDenylist, RegexRules};
 
 use crate::allowlist::Allowlist;
 use crate::parser::{ParsedEntry, parse};
@@ -50,6 +50,9 @@ struct BlocklistState {
     domains: AHashSet<String>,
     wildcard_parents: AHashSet<String>,
     allowlist: Allowlist,
+    /// Compiled regex block rules (startup-fixed; cloned in from the engine on
+    /// every reload so the allowlist-wins ordering in `is_blocked` holds).
+    regex_rules: RegexRules,
     entry_count: usize,
     heap_bytes: usize,
     loaded_at: SystemTime,
@@ -62,6 +65,7 @@ impl BlocklistState {
             domains: AHashSet::new(),
             wildcard_parents: AHashSet::new(),
             allowlist,
+            regex_rules: RegexRules::default(),
             entry_count: 0,
             heap_bytes: 0,
             loaded_at: SystemTime::now(),
@@ -107,7 +111,10 @@ impl BlocklistState {
             }
         }
 
-        false
+        // Regex rules last (the exact/wildcard sets are O(1) and far more
+        // common; the allowlist above already short-circuited an allowed name,
+        // so the allowlist still wins over a regex match).
+        self.regex_rules.is_match(domain)
     }
 }
 
@@ -124,15 +131,18 @@ pub struct BlocklistEngine {
     config: BlocklistConfig,
     /// Parsed response-IP denylist (startup-fixed, like the blocklist sources).
     response_ip_denylist: IpDenylist,
+    /// Compiled regex block rules (startup-fixed). Cloned into each new
+    /// [`BlocklistState`] on reload (cheap — the automaton is shared).
+    regex_rules: RegexRules,
 }
 
 impl BlocklistEngine {
     /// Create a new engine from config with an empty blocklist.
     pub fn new(config: BlocklistConfig) -> Self {
         let allowlist = Allowlist::from_entries(&config.allowlist);
-        // `validate_config` already rejected malformed entries; parse
-        // defensively and fall back to an empty denylist on the
-        // can't-happen error path rather than panicking.
+        // `validate_config` already rejected malformed entries; parse/compile
+        // defensively and fall back to empty on the can't-happen error path
+        // rather than panicking.
         let response_ip_denylist = match IpDenylist::parse(&config.response_ip_denylist) {
             Ok(d) => d,
             Err(e) => {
@@ -143,10 +153,20 @@ impl BlocklistEngine {
                 IpDenylist::default()
             }
         };
+        let regex_rules = match RegexRules::compile(&config.regex_rules) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "invalid blocklist.regex_rules — regex blocking disabled");
+                RegexRules::default()
+            }
+        };
+        let mut initial = BlocklistState::new_empty(allowlist);
+        initial.regex_rules = regex_rules.clone();
         Self {
-            state: ArcSwap::from_pointee(BlocklistState::new_empty(allowlist)),
+            state: ArcSwap::from_pointee(initial),
             config,
             response_ip_denylist,
+            regex_rules,
         }
     }
 
@@ -192,6 +212,10 @@ impl BlocklistEngine {
         if !trusted_allows.is_empty() {
             state.allowlist.extend_exact(trusted_allows);
         }
+
+        // Carry the (startup-fixed) regex rules into the new state so a
+        // content reload doesn't drop them.
+        state.regex_rules = self.regex_rules.clone();
 
         state.entry_count = state.domains.len() + state.wildcard_parents.len();
         // ~30 bytes average domain + ~50 bytes AHashSet overhead per entry
@@ -405,5 +429,50 @@ mod tests {
         ]);
         assert!(e.is_blocked("ads.example.com"));
         assert!(e.is_blocked("tracker.example.net"));
+    }
+
+    // --- regex block rules (TODO 8.7) ---------------------------------
+
+    #[test]
+    fn regex_rule_blocks_matching_qname() {
+        let cfg = BlocklistConfig {
+            regex_rules: vec![r"^ads?\d*\.".to_string()],
+            ..BlocklistConfig::default()
+        };
+        let e = BlocklistEngine::new(cfg);
+        assert!(e.is_blocked("ads3.example.com"));
+        assert!(e.is_blocked("ad.example.net"));
+        assert!(!e.is_blocked("safe.example.com"));
+    }
+
+    #[test]
+    fn allowlist_wins_over_regex() {
+        let cfg = BlocklistConfig {
+            allowlist: vec!["safe.ads.example.com".to_string()],
+            regex_rules: vec![r"ads".to_string()],
+            ..BlocklistConfig::default()
+        };
+        let e = BlocklistEngine::new(cfg);
+        // regex matches and not allowlisted → blocked
+        assert!(e.is_blocked("tracker.ads.example.com"));
+        // allowlisted → the allowlist wins over the regex
+        assert!(!e.is_blocked("safe.ads.example.com"));
+    }
+
+    #[test]
+    fn regex_survives_content_reload() {
+        let cfg = BlocklistConfig {
+            regex_rules: vec!["tracker".to_string()],
+            ..BlocklistConfig::default()
+        };
+        let e = BlocklistEngine::new(cfg);
+        assert!(e.is_blocked("x.tracker.net"));
+        // A content reload (sources) must not drop the regex rules.
+        e.load("0.0.0.0 ads.example.com\n");
+        assert!(
+            e.is_blocked("x.tracker.net"),
+            "regex rules must survive a content reload"
+        );
+        assert!(e.is_blocked("ads.example.com"));
     }
 }

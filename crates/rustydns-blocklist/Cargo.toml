@@ -14,6 +14,7 @@ ahash         = { workspace = true }
 arc-swap      = { workspace = true }
 tracing       = { workspace = true }
 thiserror     = { workspace = true }
+regex         = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

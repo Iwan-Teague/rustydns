@@ -15,6 +15,8 @@ pub mod config;
 pub mod error;
 pub mod ip_denylist;
 pub mod record;
+pub mod regex_rules;
 
 pub use error::RustyDnsError;
 pub use ip_denylist::IpDenylist;
+pub use regex_rules::RegexRules;

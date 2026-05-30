@@ -201,12 +201,6 @@ Safe Search (§8.4, done). The items below are what those projects have that we
   "guest gets the strict list"). Extends the existing policy model rather than
   adding a subsystem. Files: `config.rs`, `blocklist` engine (multiple named
   sets), `handler.rs`.
-- **8.7 🟡 Regex / wildcard custom block rules — M (with ReDoS guard).** We have
-  exact + RPZ wildcard matching; blocky adds regex rules for power users. Useful
-  but must bound matching cost (anchored patterns, length caps, no catastrophic
-  backtracking — prefer a regex engine with linear guarantees like `regex`).
-  Files: `crates/rustydns-blocklist/src/{parser,engine}.rs`.
-
 ### High anonymity value — promoted to its own item
 
 - **8.8 → see §7.3 🟠 Oblivious DoH (ODoH, RFC 9230).** The flagship anonymity
@@ -236,9 +230,9 @@ Safe Search (§8.4, done). The items below are what those projects have that we
   database" invariant; query history stays in the bounded ring (+ opt-in hashed
   on-disk log).
 
-> 8.1 (CNAME blocking), 8.2 (DNS rewrite map), 8.3 (response-IP blocklists), and
-> 8.4 (safe search) are done. Remaining: 8.5 (scheduled rules), 8.6 (per-client
-> groups), 8.7 (regex rules).
+> Done: 8.1 (CNAME blocking), 8.2 (DNS rewrite map), 8.3 (response-IP
+> blocklists), 8.4 (safe search), 8.7 (regex rules). Remaining: 8.5 (scheduled
+> rules), 8.6 (per-client groups).
 
 ---
 

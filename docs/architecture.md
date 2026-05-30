@@ -100,6 +100,7 @@ Fast in-memory blocklist engine. Key properties:
 - **O(1) lookup** via `AHashSet` (randomised hash seed per process).
 - **Lock-free hot-reload** via `arc-swap` — readers never block during reload.
 - **Wildcard blocking** — RPZ `*.example.com` and AdGuard `||example.com^` rules.
+- **Regex block rules** — `blocklist.regex_rules` (power users) match the QNAME with a **linear-time** finite-automata engine (`regex`, no ReDoS); bounded by pattern length (≤ 512 B), count (≤ 1000), and compiled size (1 MiB). Checked alongside the exact/wildcard sets; the allowlist still wins.
 - **Suffix-aware allowlist** — `*.example.com` whitelists all subdomains; exact match does not.
 - **Four input formats** — hosts, plain domain list, RPZ, AdGuard/uBlock (auto-detected per source).
 - **Domain validation** — label length (63 bytes), total length (253 bytes), control character rejection.
@@ -223,6 +224,7 @@ Running on Raspberry Pi Zero 2 W:
 | `anyhow` | Error handling in the binary |
 | `arc-swap` | Lock-free hot-reload |
 | `ahash` | Fast, DoS-resistant hashing |
+| `regex` | Linear-time (ReDoS-safe) custom block rules; built without Unicode tables (ASCII domains) |
 | `moka` | Bounded LRU cache for resolver |
 | `zeroize` | Clear sensitive config values on drop |
 | `rand` | Upstream randomisation |

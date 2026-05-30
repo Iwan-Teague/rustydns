@@ -777,7 +777,30 @@ pub struct BlocklistConfig {
     /// Malformed entries are rejected at startup.
     #[serde(default)]
     pub response_ip_denylist: Vec<String>,
+
+    /// Regex block rules for power users. Default: empty.
+    ///
+    /// A query whose QNAME matches any pattern is blocked (per
+    /// `block_response`), checked alongside the exact/wildcard lists; the
+    /// allowlist still wins. Matching uses the `regex` crate — a finite-
+    /// automata engine with **linear-time** guarantees, so there is no
+    /// catastrophic backtracking / ReDoS even on operator-supplied patterns.
+    /// Patterns are ASCII (domains are ASCII here) and matched case-
+    /// insensitively against the lowercased QNAME (no trailing dot).
+    ///
+    /// Each pattern must compile and be ≤ [`MAX_REGEX_PATTERN_LEN`] bytes;
+    /// at most [`MAX_REGEX_RULES`] patterns are allowed. Both bounds are
+    /// enforced at startup so a pathological config cannot blow up compile
+    /// time or memory.
+    #[serde(default)]
+    pub regex_rules: Vec<String>,
 }
+
+/// Maximum length (bytes) of a single `blocklist.regex_rules` pattern.
+pub const MAX_REGEX_PATTERN_LEN: usize = 512;
+
+/// Maximum number of `blocklist.regex_rules` patterns.
+pub const MAX_REGEX_RULES: usize = 1000;
 
 impl Default for BlocklistConfig {
     fn default() -> Self {
@@ -793,6 +816,7 @@ impl Default for BlocklistConfig {
             allowlist: Vec::new(),
             block_cname_cloaking: true,
             response_ip_denylist: Vec::new(),
+            regex_rules: Vec::new(),
         }
     }
 }
@@ -1492,6 +1516,15 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         )));
     }
 
+    // Regex block rules must compile and stay within the count/length/size
+    // bounds (linear-time engine, so no ReDoS — these bounds just cap startup
+    // compile cost and memory).
+    if let Err(e) = crate::regex_rules::RegexRules::compile(&cfg.blocklist.regex_rules) {
+        return Err(crate::RustyDnsError::Config(format!(
+            "blocklist.regex_rules is invalid: {e}"
+        )));
+    }
+
     // Warn on overbroad allowlist entries
     for entry in &cfg.blocklist.allowlist {
         let entry = entry
@@ -2035,6 +2068,20 @@ mod tests {
         let mut cfg = baseline();
         cfg.blocklist.response_ip_denylist = vec!["not-an-ip".to_string()];
         assert_config_err(validate_config(&cfg), "response_ip_denylist");
+    }
+
+    #[test]
+    fn regex_rules_valid_pattern_passes() {
+        let mut cfg = baseline();
+        cfg.blocklist.regex_rules = vec![r"^ads?\d*\.".to_string(), "doubleclick".to_string()];
+        validate_config(&cfg).expect("valid regex rules must pass");
+    }
+
+    #[test]
+    fn regex_rules_invalid_pattern_rejected() {
+        let mut cfg = baseline();
+        cfg.blocklist.regex_rules = vec!["(unclosed".to_string()];
+        assert_config_err(validate_config(&cfg), "regex_rules is invalid");
     }
 
     // --- privacy ----------------------------------------------------
