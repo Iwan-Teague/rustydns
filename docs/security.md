@@ -132,10 +132,11 @@ rustydns invariants itself:
   answer fails closed (`SERVFAIL`); `Secure` and `Insecure` (unsigned zone) answers are
   served — DNSSEC rejects forgeries, it doesn't require every zone to be signed. With
   `dnssec_validation = false`, no chain is checked and integrity rests on a validating
-  target. The validation reuses hickory's audited validator; the rustydns-owned wiring
-  (the oblivious `DnsHandle` round-trip) is covered by offline tests, and the end-to-end
-  `Secure`/`Bogus` behaviour against real signed zones is confirmed with the real root
-  anchor at runtime.
+  target. The validation reuses hickory's audited validator; offline tests cover the
+  oblivious `DnsHandle` round-trip **and** the full path against a test-signed zone — a
+  real ECDSA-P256-signed answer validates `Secure` (served) and a forged one is `Bogus`
+  (fails closed), with the validator's DNSKEY lookup also flowing obliviously. Behaviour
+  against the real IANA root anchor is confirmed at runtime.
 
 **Trust model the operator must honour:** the anonymity holds only if the proxy is operated
 **independently** of the target — if one party controls both, it can correlate IP with

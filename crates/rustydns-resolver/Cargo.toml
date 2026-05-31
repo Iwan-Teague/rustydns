@@ -42,3 +42,6 @@ tokio        = { workspace = true }
 # messages and tokio-util gives us a CancellationToken for clean
 # server shutdown between tests.
 tokio-util   = { workspace = true }
+# `time` (matches hickory's pin) for RRSIG inception/expiration timestamps when
+# the DNSSEC-over-ODoH test signs a throwaway zone with hickory's signer.
+time         = "0.3"

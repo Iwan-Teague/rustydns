@@ -7,20 +7,24 @@
 //! transport and TLS-floor enforcement) is third-party code configured in
 //! [`super::build_http_client`]; the rustydns-owned protocol logic is.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use hickory_proto::dnssec::TrustAnchors;
+use hickory_proto::dnssec::crypto::EcdsaSigningKey;
+use hickory_proto::dnssec::rdata::{DNSKEY, DNSSECRData, RRSIG};
+use hickory_proto::dnssec::{Algorithm, DnssecSigner, PublicKeyBuf, SigningKey, TrustAnchors};
 use hickory_proto::op::{DnsRequestOptions, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
-use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordSet, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use hickory_resolver::net::xfer::{DnsHandle, FirstAnswer};
 use odoh_rs::{
     ObliviousDoHConfig, ObliviousDoHConfigs, ObliviousDoHKeyPair, ObliviousDoHMessage,
     ObliviousDoHMessagePlaintext, ResponseNonce, compose, decrypt_query, encrypt_response, parse,
 };
+use time::OffsetDateTime;
 
 use rustydns_core::record::RecordData;
 
@@ -46,6 +50,9 @@ enum MockMode {
     /// Always reject with a 4xx — the arm must refetch + retry once, then fail
     /// closed (the retry is bounded, not an infinite loop).
     AlwaysReject,
+    /// Serve a pre-built (DNSSEC-signed) zone: answer each query with the
+    /// records in `MockRelay::responses` for its qtype. Used by the DNSSEC tests.
+    SignedZone,
 }
 
 /// Mutable target state, so a test can rotate the key mid-exchange.
@@ -60,6 +67,9 @@ struct MockState {
 pub(crate) struct MockRelay {
     state: std::sync::Mutex<MockState>,
     mode: MockMode,
+    /// For `MockMode::SignedZone`: the records to return per query type (e.g.
+    /// `A -> [A, RRSIG(A)]`, `DNSKEY -> [DNSKEY, RRSIG(DNSKEY)]`).
+    responses: std::collections::HashMap<RecordType, Vec<Record>>,
 }
 
 /// Fresh HPKE keypair plus its serialised `ObliviousDoHConfigs` bytes.
@@ -75,6 +85,18 @@ fn fresh_keypair() -> (ObliviousDoHKeyPair, Vec<u8>) {
 
 impl MockRelay {
     fn new(mode: MockMode) -> Self {
+        Self::with_responses(mode, std::collections::HashMap::new())
+    }
+
+    /// A signed-zone mock: every query is answered from `responses[qtype]`.
+    fn signed(responses: std::collections::HashMap<RecordType, Vec<Record>>) -> Self {
+        Self::with_responses(MockMode::SignedZone, responses)
+    }
+
+    fn with_responses(
+        mode: MockMode,
+        responses: std::collections::HashMap<RecordType, Vec<Record>>,
+    ) -> Self {
         let (keypair, configs) = fresh_keypair();
         MockRelay {
             state: std::sync::Mutex::new(MockState {
@@ -83,6 +105,7 @@ impl MockRelay {
                 rotated: false,
             }),
             mode,
+            responses,
         }
     }
 
@@ -129,7 +152,11 @@ impl MockRelay {
 
         let query_msg = Message::from_bytes(&q_plain.clone().into_msg())
             .map_err(|e| OdohError::Mock(e.to_string()))?;
-        let resp_wire = build_mock_response(self.mode, &query_msg)?;
+        let resp_wire = if matches!(self.mode, MockMode::SignedZone) {
+            build_signed_response(&self.responses, &query_msg)?
+        } else {
+            build_mock_response(self.mode, &query_msg)?
+        };
 
         let r_plain = ObliviousDoHMessagePlaintext::new(resp_wire, 0);
         let nonce: ResponseNonce = [0u8; 16];
@@ -160,6 +187,26 @@ fn build_mock_response(mode: MockMode, query: &Message) -> Result<Vec<u8>, OdohE
         MockMode::ServFail => resp.metadata.response_code = ResponseCode::ServFail,
         MockMode::RelayError | MockMode::Garbage | MockMode::AlwaysReject => {
             unreachable!("handled before crypto")
+        }
+        MockMode::SignedZone => unreachable!("handled by build_signed_response"),
+    }
+    resp.to_bytes().map_err(|e| OdohError::Mock(e.to_string()))
+}
+
+/// Answer a query from a pre-built signed zone: return `responses[qtype]` (the
+/// RRset + its RRSIG) as an authoritative NoError answer.
+fn build_signed_response(
+    responses: &std::collections::HashMap<RecordType, Vec<Record>>,
+    query: &Message,
+) -> Result<Vec<u8>, OdohError> {
+    let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+    resp.metadata.recursion_available = true;
+    resp.metadata.authoritative = true;
+    resp.metadata.response_code = ResponseCode::NoError;
+    if let Some(q) = query.queries.first() {
+        resp.queries.push(q.clone());
+        if let Some(records) = responses.get(&q.query_type()) {
+            resp.answers.extend(records.iter().cloned());
         }
     }
     resp.to_bytes().map_err(|e| OdohError::Mock(e.to_string()))
@@ -424,6 +471,118 @@ async fn odoh_validated_path_fails_closed_when_unvalidatable() {
         .resolve("validate.example.", RecordType::A, false)
         .await
         .expect_err("an answer that fails DNSSEC validation must fail closed");
+    assert!(
+        matches!(err.kind_label(), "bogus" | "validation"),
+        "expected a DNSSEC failure, got {}",
+        err.kind_label()
+    );
+}
+
+/// Build a throwaway DNSSEC-signed single zone (its own DNSKEY is the trust
+/// anchor, so no parent chain is needed). Returns the per-qtype answer records
+/// (A+RRSIG, DNSKEY+RRSIG) and the apex public key to seed the trust anchor.
+fn build_signed_zone(apex: &str, ip: Ipv4Addr) -> (HashMap<RecordType, Vec<Record>>, PublicKeyBuf) {
+    let name = Name::from_ascii(apex).expect("apex name");
+    // ECDSA P-256 KSK (zone-key + SEP via DNSKEY::from_key).
+    let pkcs8 = EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256).expect("gen key");
+    let key = EcdsaSigningKey::from_pkcs8(&pkcs8, Algorithm::ECDSAP256SHA256).expect("load key");
+    let public_key = key.to_public_key().expect("public key");
+    let dnskey = DNSKEY::from_key(&public_key);
+    let signer = DnssecSigner::new(
+        dnskey.clone(),
+        Box::new(key),
+        name.clone(),
+        std::time::Duration::from_secs(30 * 24 * 3600),
+    );
+    // Inception an hour ago so the signature is valid "now".
+    let inception = OffsetDateTime::now_utc() - time::Duration::hours(1);
+
+    // A RRset + its RRSIG.
+    let a_record = Record::from_rdata(name.clone(), 300, RData::A(A(ip)));
+    let mut a_rrset = RecordSet::new(name.clone(), RecordType::A, 0);
+    a_rrset.insert(a_record.clone(), 0);
+    let a_rrsig = RRSIG::from_rrset(&a_rrset, DNSClass::IN, inception, &signer).expect("sign A");
+    let a_rrsig_rec =
+        Record::from_rdata(name.clone(), 300, RData::from(DNSSECRData::RRSIG(a_rrsig)));
+
+    // DNSKEY RRset + its (self-)RRSIG.
+    let dnskey_rec = Record::from_rdata(name.clone(), 300, RData::from(dnskey.clone()));
+    let mut dnskey_rrset = RecordSet::new(name.clone(), RecordType::DNSKEY, 0);
+    dnskey_rrset.insert(dnskey_rec.clone(), 0);
+    let dnskey_rrsig =
+        RRSIG::from_rrset(&dnskey_rrset, DNSClass::IN, inception, &signer).expect("sign DNSKEY");
+    let dnskey_rrsig_rec = Record::from_rdata(
+        name.clone(),
+        300,
+        RData::from(DNSSECRData::RRSIG(dnskey_rrsig)),
+    );
+
+    let mut responses = HashMap::new();
+    responses.insert(RecordType::A, vec![a_record, a_rrsig_rec]);
+    responses.insert(RecordType::DNSKEY, vec![dnskey_rec, dnskey_rrsig_rec]);
+    (responses, public_key)
+}
+
+/// A validating ODoH arm whose trust anchor is the signed zone's apex key.
+fn arm_with_signed_zone(
+    responses: HashMap<RecordType, Vec<Record>>,
+    public_key: &PublicKeyBuf,
+) -> OdohArm {
+    let mut anchor = TrustAnchors::empty();
+    anchor.insert(public_key);
+    let target = OdohTarget::parse("https://target.test/dns-query").expect("parse target");
+    OdohArm {
+        transport: Arc::new(OdohTransport {
+            targets: vec![target],
+            proxy_urls: vec!["https://proxy.test/".to_string()],
+            http: OdohHttp::Mock(Arc::new(MockRelay::signed(responses))),
+            randomize: false,
+            pad_queries: false,
+        }),
+        trust_anchor: Some(Arc::new(anchor)),
+    }
+}
+
+#[tokio::test]
+async fn odoh_validated_path_accepts_a_signed_answer() {
+    // The capstone: a correctly DNSSEC-signed answer, validated by hickory's
+    // validator running over our oblivious handle (the DNSKEY lookup also flows
+    // through it), against a trust anchor we control — must validate Secure and
+    // be served. This proves the Secure path end to end, offline.
+    let (responses, pubkey) = build_signed_zone("secure.example.", Ipv4Addr::new(192, 0, 2, 53));
+    let arm = arm_with_signed_zone(responses, &pubkey);
+    let outcome = arm
+        .resolve("secure.example.", RecordType::A, false)
+        .await
+        .expect("a correctly-signed answer must validate Secure and be served");
+    assert_eq!(outcome.records.len(), 1);
+    match &outcome.records[0].data {
+        RecordData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(192, 0, 2, 53)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn odoh_validated_path_rejects_a_forged_answer() {
+    // Same signed zone, but the A record's address is swapped while keeping the
+    // original (now-mismatched) RRSIG — a forgery. The validator must mark it
+    // BOGUS and the arm must fail closed (never serve forged data).
+    let (mut responses, pubkey) =
+        build_signed_zone("secure.example.", Ipv4Addr::new(192, 0, 2, 53));
+    let name = Name::from_ascii("secure.example.").unwrap();
+    let orig_rrsig = responses[&RecordType::A][1].clone();
+    responses.insert(
+        RecordType::A,
+        vec![
+            Record::from_rdata(name, 300, RData::A(A(Ipv4Addr::new(203, 0, 113, 99)))),
+            orig_rrsig,
+        ],
+    );
+    let arm = arm_with_signed_zone(responses, &pubkey);
+    let err = arm
+        .resolve("secure.example.", RecordType::A, false)
+        .await
+        .expect_err("a forged (signature-mismatched) answer must fail closed");
     assert!(
         matches!(err.kind_label(), "bogus" | "validation"),
         "expected a DNSSEC failure, got {}",

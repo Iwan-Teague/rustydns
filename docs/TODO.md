@@ -199,16 +199,16 @@ matrix added to `docs/operator-endpoints.md`.)
     against an in-process mock target (genuine `odoh-rs` server side) — success,
     NXDOMAIN, target-SERVFAIL→error, relay-failure→error, garbage→error,
     key-rotation recovery, multi-relay, rebinding filter, config caching, a
-    direct `DnsHandle` round-trip, **and the validated path driven end-to-end**
-    (the validator runs over the oblivious handle — chain lookups flow through it
-    — and a non-Secure result fails closed). The DNSSEC *validation logic* is
-    hickory's audited validator (its own tests); the rustydns-owned parts (the
-    `DnsHandle` wiring + fail-closed shaping) are covered — end-to-end
-    Secure/Insecure-served vs Bogus-rejected against real signed zones is
-    confirmed at runtime with the real root anchor. reqwest's HTTPS transport + TLS floor are third-party code
-    configured in `odoh::build_http_client`. Docs: `docs/security.md`,
-    `docs/architecture.md`, `docs/roadmap.md`, `rustydns.example.toml`.
-    Supersedes §8.8.
+    direct `DnsHandle` round-trip, and — the capstone — **DNSSEC validated end
+    to end against a test-signed zone**: a real ECDSA-P256-signed answer
+    validates **Secure** (served) and a forged one is **Bogus** (fails closed),
+    with hickory's validator running over the oblivious handle (the DNSKEY lookup
+    flows through it too) and a trust anchor we control. The DNSSEC *validation
+    logic* is hickory's audited validator (its own tests); behaviour against the
+    real IANA root anchor is confirmed at runtime. reqwest's HTTPS transport + TLS
+    floor are third-party code configured in `odoh::build_http_client`. Docs:
+    `docs/security.md`, `docs/architecture.md`, `docs/roadmap.md`,
+    `rustydns.example.toml`. Supersedes §8.8.
   - **Relay diversity (done):** `upstream.odoh_proxies` takes a list of relays;
     the resolver picks one at random per query, so no single relay sees all your
     encrypted traffic.
