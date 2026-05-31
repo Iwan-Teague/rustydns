@@ -184,28 +184,34 @@ matrix added to `docs/operator-endpoints.md`.)
     a 4xx (RFC 9230) or a response that won't decrypt — drops the cached config,
     refetches, and retries **once**; the retry is bounded (then fails closed),
     and other failures (5xx, network, malformed) fail closed immediately.
-  - **DNSSEC:** the oblivious arm does **not** do *client-side* DNSSEC
-    validation (that lives in hickory-resolver, which this arm bypasses). Rather
-    than let the flag mean nothing, `validate_config` **and** `Resolver::new`
-    reject `protocol = "odoh"` + `dnssec_validation = true`; operators set
-    `dnssec_validation = false` and rely on a validating target. A one-time
-    startup `warn!` discloses this + the proxy-independence requirement.
+  - **Client-side DNSSEC (done, optional):** with `dnssec_validation = true`,
+    the arm exposes the oblivious transport as a hickory `DnsHandle`
+    (`odoh::OdohHandle`) and wraps it in hickory's own `DnssecDnsHandle`, so the
+    validator's DNSKEY/DS chain lookups **also** travel obliviously and the
+    answer is validated to the IANA root anchor. A BOGUS answer fails closed;
+    Secure/Insecure (unsigned) answers are served. With validation off, integrity
+    rests on a validating target. A one-time startup `warn!` discloses the
+    posture + proxy-independence requirement.
   - **Deps:** `odoh-rs` (Cloudflare, BSD-2) + `hpke` 0.13, pinned in workspace
     deps, `cargo deny` clean (advisories/licenses/bans/sources ok). `rand 0.9`
     pinned locally in the resolver (hpke needs a rand_core-0.9 CSPRNG).
   - **Verified offline:** `odoh.rs` tests drive the **real** HPKE round-trip
     against an in-process mock target (genuine `odoh-rs` server side) — success,
     NXDOMAIN, target-SERVFAIL→error, relay-failure→error, garbage→error,
-    rebinding filter, and config caching. What is *not* covered (reqwest's HTTPS
-    transport + TLS floor) is third-party code configured in
-    `odoh::build_http_client`. Docs: `docs/security.md`, `docs/architecture.md`,
-    `docs/roadmap.md`, `rustydns.example.toml`. Supersedes §8.8.
+    key-rotation recovery, multi-relay, rebinding filter, config caching, **and a
+    direct `DnsHandle` round-trip** (the wiring the validator drives). The DNSSEC
+    *validation logic* is hickory's audited validator (its own tests); the
+    rustydns-owned part is the `DnsHandle` wiring (covered) — end-to-end
+    Secure/Bogus against real signed zones is confirmed at runtime with the real
+    root anchor. reqwest's HTTPS transport + TLS floor are third-party code
+    configured in `odoh::build_http_client`. Docs: `docs/security.md`,
+    `docs/architecture.md`, `docs/roadmap.md`, `rustydns.example.toml`.
+    Supersedes §8.8.
   - **Relay diversity (done):** `upstream.odoh_proxies` takes a list of relays;
     the resolver picks one at random per query, so no single relay sees all your
     encrypted traffic.
-  - **Future enhancements (not blocking):** client-side DNSSEC over the
-    oblivious arm; pinning the target `ODoHConfig` in config instead of fetching
-    `/.well-known`.
+  - **Future enhancements (not blocking):** pinning the target `ODoHConfig` in
+    config instead of fetching `/.well-known`.
 
 ---
 

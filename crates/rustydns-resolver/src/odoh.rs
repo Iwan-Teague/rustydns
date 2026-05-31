@@ -25,10 +25,12 @@
 //!   to querying the target directly; either would de-anonymise the operator,
 //!   which is the entire thing ODoH exists to prevent.
 //! - **No EDNS Client Subnet.** The query we build carries no ECS option.
-//! - **No client-side DNSSEC.** The oblivious arm does not validate the chain
-//!   (that lives inside hickory-resolver). `validate_config` rejects
-//!   `protocol = "odoh"` together with `dnssec_validation = true` so the knob
-//!   never silently means nothing — integrity rests on a validating target.
+//! - **Client-side DNSSEC (optional).** When `upstream.dnssec_validation` is on,
+//!   queries run through hickory's own [`DnssecDnsHandle`] wrapping our oblivious
+//!   [`OdohHandle`], so the validator's DNSKEY/DS chain lookups *also* travel
+//!   obliviously and the answer is validated to the IANA root anchor. A BOGUS
+//!   answer fails closed. With validation off, no chain is checked (integrity
+//!   then rests on choosing a validating target).
 //! - **Rebinding defence.** Private/loopback rdata is stripped from default-arm
 //!   answers exactly as on the doh/doq arms.
 //!
@@ -46,9 +48,16 @@ use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::dnssec::{DnssecSummary, TrustAnchors};
+use hickory_proto::op::{
+    DnsRequest, DnsRequestOptions, DnsResponse, Message, MessageType, OpCode, Query, ResponseCode,
+};
+use hickory_proto::rr::{Name, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use hickory_resolver::net::NetError;
+use hickory_resolver::net::dnssec::DnssecDnsHandle;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::xfer::{DnsHandle, DnsResponseStream, FirstAnswer};
 use odoh_rs::{
     ObliviousDoHConfigContents, ObliviousDoHConfigs, ObliviousDoHMessage,
     ObliviousDoHMessagePlaintext, compose, decrypt_response, encrypt_query, parse,
@@ -95,6 +104,10 @@ pub(crate) enum OdohError {
     DnsParse(String),
     #[error("target returned response code {0:?}")]
     TargetRcode(ResponseCode),
+    #[error("DNSSEC validation failed: {0}")]
+    Validation(String),
+    #[error("DNSSEC validation: answer is BOGUS (signed but failed verification)")]
+    Bogus,
     #[cfg(test)]
     #[error("mock transport error: {0}")]
     Mock(String),
@@ -117,6 +130,8 @@ impl OdohError {
             OdohError::Decrypt(_) => "decrypt",
             OdohError::DnsParse(_) => "dns_parse",
             OdohError::TargetRcode(_) => "target_rcode",
+            OdohError::Validation(_) => "validation",
+            OdohError::Bogus => "bogus",
             #[cfg(test)]
             OdohError::Mock(_) => "mock",
         }
@@ -254,9 +269,10 @@ impl OdohHttp {
     }
 }
 
-/// The oblivious upstream arm (global default only — ODoH is not offered on
-/// conditional-forwarding routes).
-pub(crate) struct OdohArm {
+/// Shared oblivious transport state. Held behind an `Arc` so it can back both
+/// [`OdohArm`] (the resolver-facing API) and [`OdohHandle`] (the hickory
+/// `DnsHandle` the DNSSEC validator drives).
+struct OdohTransport {
     targets: Vec<OdohTarget>,
     /// Oblivious relay URLs. One is chosen per query (random when
     /// `randomize_upstream_selection`), so several independent relays spread the
@@ -269,6 +285,24 @@ pub(crate) struct OdohArm {
     /// leaks the exact query length. Unlike the doh/doq arms — where hickory
     /// 0.26 can't pad — ODoH can, because odoh-rs pads the plaintext directly.
     pad_queries: bool,
+}
+
+/// The oblivious upstream arm (global default only — ODoH is not offered on
+/// conditional-forwarding routes).
+pub(crate) struct OdohArm {
+    transport: Arc<OdohTransport>,
+    /// `Some` when `upstream.dnssec_validation` is on: queries run through
+    /// hickory's own DNSSEC validator (chaining to this anchor) over the
+    /// oblivious transport — every DNSKEY/DS lookup the validator makes also
+    /// travels obliviously. `None` = no client-side validation.
+    trust_anchor: Option<Arc<TrustAnchors>>,
+}
+
+/// A hickory [`DnsHandle`] over the oblivious transport, so hickory's own DNSSEC
+/// validator can drive it. Cloneable + `Send`/`Sync` via the shared `Arc`.
+#[derive(Clone)]
+struct OdohHandle {
+    transport: Arc<OdohTransport>,
 }
 
 impl OdohArm {
@@ -297,12 +331,24 @@ impl OdohArm {
             Duration::from_millis(config.upstream.timeout_ms),
             test_roots,
         )?);
-        Ok(OdohArm {
+        let transport = Arc::new(OdohTransport {
             targets,
             proxy_urls,
             http,
             randomize: config.privacy.randomize_upstream_selection,
             pad_queries: config.privacy.upstream_padding,
+        });
+        // Client-side DNSSEC over the oblivious arm: run queries through
+        // hickory's validator chaining to the IANA root anchor. The validator's
+        // own DNSKEY/DS lookups travel obliviously through the same handle.
+        let trust_anchor = if config.upstream.dnssec_validation {
+            Some(Arc::new(TrustAnchors::default()))
+        } else {
+            None
+        };
+        Ok(OdohArm {
+            transport,
+            trust_anchor,
         })
     }
 
@@ -314,37 +360,107 @@ impl OdohArm {
         qtype: RecordType,
         block_private_rdata: bool,
     ) -> Result<ResolveOutcome, OdohError> {
-        let target = self.select_target();
-        let query_wire = build_query_wire(name, qtype)?;
-        let response_wire = self.exchange(target, &query_wire).await?;
-
-        let msg =
-            Message::from_bytes(&response_wire).map_err(|e| OdohError::DnsParse(e.to_string()))?;
-        match msg.metadata.response_code {
-            ResponseCode::NoError => {
-                let mut records = lookup_to_dns_records(&msg.answers);
-                let mut dropped = 0;
-                if block_private_rdata {
-                    dropped = filter_private_rdata(&mut records);
-                }
-                Ok(ResolveOutcome {
-                    records,
-                    private_rdata_dropped: dropped,
-                    nxdomain: false,
-                })
+        match &self.trust_anchor {
+            Some(anchor) => {
+                self.resolve_validated(name, qtype, block_private_rdata, anchor)
+                    .await
             }
-            // A genuine "name does not exist" — an answer, not a failure.
-            ResponseCode::NXDomain => Ok(ResolveOutcome {
-                records: Vec::new(),
-                private_rdata_dropped: 0,
-                nxdomain: true,
-            }),
-            // SERVFAIL/REFUSED/etc. from the target are upstream failures. Fail
-            // closed — never retry over a less-private path.
-            other => Err(OdohError::TargetRcode(other)),
+            None => self.resolve_plain(name, qtype, block_private_rdata).await,
         }
     }
 
+    /// Unvalidated oblivious resolution: build the query, do one oblivious
+    /// exchange, and shape the response into an outcome.
+    async fn resolve_plain(
+        &self,
+        name: &str,
+        qtype: RecordType,
+        block_private_rdata: bool,
+    ) -> Result<ResolveOutcome, OdohError> {
+        let target = self.transport.select_target();
+        let query_wire = build_query_wire(name, qtype)?;
+        let response_wire = self.transport.exchange(target, &query_wire).await?;
+        let msg =
+            Message::from_bytes(&response_wire).map_err(|e| OdohError::DnsParse(e.to_string()))?;
+        outcome_from_parts(
+            &msg.answers,
+            msg.metadata.response_code,
+            block_private_rdata,
+        )
+    }
+
+    /// DNSSEC-validated oblivious resolution: drive hickory's `DnssecDnsHandle`
+    /// over our oblivious handle. The validator fetches the DNSKEY/DS chain
+    /// (also obliviously), checks signatures up to `anchor`, and stamps each
+    /// record's proof. We fail closed on a BOGUS answer (signed but forged);
+    /// Secure and Insecure (unsigned zone) answers are both served — DNSSEC
+    /// rejects forgeries, it does not require every zone to be signed.
+    async fn resolve_validated(
+        &self,
+        name: &str,
+        qtype: RecordType,
+        block_private_rdata: bool,
+        anchor: &Arc<TrustAnchors>,
+    ) -> Result<ResolveOutcome, OdohError> {
+        let qname = Name::from_str(name)
+            .map_err(|e| OdohError::QueryBuild(format!("invalid query name: {e}")))?;
+        let handle = OdohHandle {
+            transport: self.transport.clone(),
+        };
+        let validating = DnssecDnsHandle::with_trust_anchor(handle, anchor.clone());
+        let response = validating
+            .lookup(Query::query(qname, qtype), DnsRequestOptions::default())
+            .first_answer()
+            .await
+            .map_err(|e| OdohError::Validation(e.to_string()))?;
+
+        if matches!(
+            DnssecSummary::from_records(response.answers.iter()),
+            DnssecSummary::Bogus
+        ) {
+            return Err(OdohError::Bogus);
+        }
+        outcome_from_parts(
+            &response.answers,
+            response.metadata.response_code,
+            block_private_rdata,
+        )
+    }
+}
+
+/// Shape a response's answers + rcode into a [`ResolveOutcome`], applying the
+/// rebinding-defence filter when requested. Shared by the plain and validated
+/// paths. A non-NoError/NXDomain rcode (SERVFAIL/REFUSED) is an upstream
+/// failure — fail closed, never retry over a less-private path.
+fn outcome_from_parts(
+    answers: &[Record],
+    response_code: ResponseCode,
+    block_private_rdata: bool,
+) -> Result<ResolveOutcome, OdohError> {
+    match response_code {
+        ResponseCode::NoError => {
+            let mut records = lookup_to_dns_records(answers);
+            let dropped = if block_private_rdata {
+                filter_private_rdata(&mut records)
+            } else {
+                0
+            };
+            Ok(ResolveOutcome {
+                records,
+                private_rdata_dropped: dropped,
+                nxdomain: false,
+            })
+        }
+        ResponseCode::NXDomain => Ok(ResolveOutcome {
+            records: Vec::new(),
+            private_rdata_dropped: 0,
+            nxdomain: true,
+        }),
+        other => Err(OdohError::TargetRcode(other)),
+    }
+}
+
+impl OdohTransport {
     /// Pick a target — random when `randomize_upstream_selection`, else the
     /// first. A single oblivious request goes to exactly one target.
     fn select_target(&self) -> &OdohTarget {
@@ -470,6 +586,35 @@ impl OdohArm {
     }
 }
 
+impl DnsHandle for OdohHandle {
+    type Response = DnsResponseStream;
+    type Runtime = TokioRuntimeProvider;
+
+    // `is_verifying_dnssec` keeps the default `false`: this is the leaf
+    // transport, not a validator. The wrapping `DnssecDnsHandle` is what
+    // verifies; claiming otherwise here would mislead it.
+
+    /// Send whatever query the validator hands us — the user's query OR a
+    /// DNSKEY/DS chain lookup — obliviously, and return the decrypted response.
+    /// The wrapping `DnssecDnsHandle` has already set the DO/CD/AD bits on
+    /// `request`; we just transmit it.
+    fn send(&self, request: DnsRequest) -> Self::Response {
+        let transport = self.transport.clone();
+        let fut = async move {
+            let query_wire = request
+                .to_bytes()
+                .map_err(|e| NetError::Msg(format!("odoh: encode request: {e}")))?;
+            let target = transport.select_target();
+            let response_wire = transport
+                .exchange(target, &query_wire)
+                .await
+                .map_err(|e| NetError::Msg(format!("odoh: {}: {e}", e.kind_label())))?;
+            DnsResponse::from_buffer(response_wire.to_vec()).map_err(NetError::from)
+        };
+        DnsResponseStream::from(Box::pin(fut))
+    }
+}
+
 impl std::fmt::Debug for OdohArm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Terse + secret-free: never print the HTTP client or cached configs.
@@ -477,13 +622,15 @@ impl std::fmt::Debug for OdohArm {
             .field(
                 "targets",
                 &self
+                    .transport
                     .targets
                     .iter()
                     .map(|t| &t.query_url)
                     .collect::<Vec<_>>(),
             )
-            .field("proxy_urls", &self.proxy_urls)
-            .field("randomize", &self.randomize)
+            .field("proxy_urls", &self.transport.proxy_urls)
+            .field("randomize", &self.transport.randomize)
+            .field("dnssec", &self.trust_anchor.is_some())
             .finish()
     }
 }

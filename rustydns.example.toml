@@ -81,9 +81,10 @@ resolvers = [
 #     the target (if one party runs both, it can correlate IP with query). List
 #     several independent relays and the resolver picks one at random per query,
 #     so no single relay sees all your traffic.
-#   - set dnssec_validation = false — the oblivious arm does NOT do client-side
-#     DNSSEC validation (you rely on a validating target instead). Use "doh"/"doq"
-#     if you want client-side DNSSEC.
+#   - dnssec_validation works on ODoH too: with it on (the default), queries are
+#     run through a real DNSSEC validator over the oblivious arm (the validator's
+#     DNSKEY/DS chain lookups also travel obliviously) and a BOGUS answer becomes
+#     SERVFAIL. Set it false to skip validation and rely on a validating target.
 # On any failure the ODoH arm returns SERVFAIL; it never falls back to plain DoH.
 protocol = "doh"
 

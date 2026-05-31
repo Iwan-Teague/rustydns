@@ -13,7 +13,7 @@
 //! |---------|-----|---------|------------|--------|
 //! | DNS-over-HTTPS upstream | RFC 8484 | ✓ | `upstream.protocol = "doh"` | implemented |
 //! | DNS-over-QUIC upstream | RFC 9250 | opt-in | `upstream.protocol = "doq"` | implemented (via hickory `quic-ring` feature → `NameServerConfig::quic`) |
-//! | Oblivious DoH upstream | RFC 9230 | opt-in | `upstream.protocol = "odoh"` | implemented — HPKE via `odoh-rs`, relayed through one of `upstream.odoh_proxies` (random per query); fail-closed, no client-side DNSSEC. See the [`odoh`] module. |
+//! | Oblivious DoH upstream | RFC 9230 | opt-in | `upstream.protocol = "odoh"` | implemented — HPKE via `odoh-rs`, relayed through one of `upstream.odoh_proxies` (random per query); fail-closed; optional client-side DNSSEC (chains over the oblivious arm). See the [`odoh`] module. |
 //! | TLS 1.3 minimum | RFC 8446 | ✓ | `upstream.min_tls_version = "1.3"` | implemented |
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
@@ -233,16 +233,15 @@ impl Resolver {
             );
         }
         if config.upstream.protocol == UpstreamProtocol::Odoh {
-            // Honest, one-time disclosure of the ODoH posture: the anonymity is
-            // real, but it hinges on proxy/target independence, and this arm
-            // does NOT do client-side DNSSEC validation.
+            // One-time disclosure of the ODoH posture. The anonymity guarantee
+            // hinges on proxy/target independence.
             tracing::warn!(
+                dnssec = config.upstream.dnssec_validation,
                 "upstream.protocol = \"odoh\" — queries are oblivious (the target never sees your \
-                 client IP, the proxy never sees your query). Two caveats: this arm does NOT \
-                 perform client-side DNSSEC validation (integrity rests on a validating target), \
-                 and the anonymity guarantee holds ONLY if each upstream.odoh_proxies relay is \
-                 operated \
-                 independently of the target."
+                 client IP, the proxy never sees your query). The anonymity guarantee holds ONLY \
+                 if each upstream.odoh_proxies relay is operated independently of the target. \
+                 Client-side DNSSEC validation is active when upstream.dnssec_validation = true \
+                 (the validator's DNSKEY/DS lookups also travel obliviously)."
             );
         }
         for r in &config.upstream.routes {
@@ -268,16 +267,6 @@ impl Resolver {
         // config lazily on first query (no startup network dependency on the
         // target), so construction is synchronous and cannot block boot.
         let default = if config.upstream.protocol == UpstreamProtocol::Odoh {
-            // Defence in depth behind validate_config: the oblivious arm does no
-            // client-side DNSSEC validation, so refuse to build it with
-            // dnssec_validation on rather than silently ignore the flag.
-            if config.upstream.dnssec_validation {
-                return Err(RustyDnsError::Config(
-                    "upstream.protocol = \"odoh\" requires upstream.dnssec_validation = false — \
-                     the oblivious arm does not perform client-side DNSSEC validation."
-                        .to_string(),
-                ));
-            }
             DefaultArm::Odoh(Box::new(
                 odoh::OdohArm::new(&config, test_roots)
                     .map_err(|e| RustyDnsError::Config(e.to_string()))?,
@@ -1489,29 +1478,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn odoh_with_dnssec_validation_rejected_at_new() {
-        // Defence in depth behind validate_config: an ODoH config that also asks
-        // for client-side DNSSEC is refused at construction — the oblivious arm
-        // does not validate, and we never silently ignore the flag.
+    async fn odoh_with_dnssec_validation_builds() {
+        // ODoH + client-side DNSSEC is supported: the arm runs queries through
+        // hickory's validator over the oblivious transport. Construction is
+        // synchronous (config fetched lazily), so this builds offline.
         let mut cfg = DnsConfig::default();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
-        cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
-        cfg.upstream.odoh_proxies = vec!["https://proxy.example".to_string()];
+        cfg.upstream.resolvers = vec!["https://odoh.invalid/dns-query".to_string()];
+        cfg.upstream.odoh_proxies = vec!["https://proxy.invalid/".to_string()];
         cfg.upstream.dnssec_validation = true;
-        let err = Resolver::new(cfg).await.unwrap_err();
-        match err {
-            RustyDnsError::Config(msg) => {
-                assert!(msg.contains("dnssec_validation = false"), "msg={msg}")
-            }
-            other => panic!("expected Config, got {other:?}"),
-        }
+        Resolver::new(cfg)
+            .await
+            .expect("ODoH + DNSSEC config must build the validating oblivious arm");
     }
 
     #[tokio::test]
-    async fn odoh_well_formed_builds_without_network() {
-        // A correctly-shaped ODoH config builds the oblivious arm. Construction
-        // is synchronous and fetches no config (that is lazy on first query),
-        // so this succeeds offline with an unreachable target/proxy.
+    async fn odoh_without_dnssec_builds_without_network() {
+        // A correctly-shaped ODoH config (no client-side DNSSEC) builds the
+        // oblivious arm. Construction is synchronous and fetches no config (that
+        // is lazy on first query), so this succeeds offline.
         let mut cfg = DnsConfig::default();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.invalid/dns-query".to_string()];

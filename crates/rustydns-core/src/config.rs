@@ -404,13 +404,14 @@ pub enum UpstreamProtocol {
     /// collapses.
     ///
     /// Requirements (enforced by `validate_config`): every target in
-    /// `upstream.resolvers` is an `https://` URL, `upstream.odoh_proxies` is set
-    /// (`https://`), and `upstream.dnssec_validation = false` — the oblivious
-    /// arm does not perform *client-side* DNSSEC validation (that bypasses
-    /// hickory-resolver), so integrity rests on choosing a validating target.
-    /// On any failure the arm fails closed (SERVFAIL); it never falls back to
-    /// plain DoH or the target directly, which would de-anonymise the operator.
-    /// Not available on conditional-forwarding routes.
+    /// `upstream.resolvers` is an `https://` URL and `upstream.odoh_proxies` is
+    /// non-empty (each `https://`). `upstream.dnssec_validation` may be either:
+    /// when `true`, queries are run through hickory's DNSSEC validator over the
+    /// oblivious arm (the validator's DNSKEY/DS chain lookups also travel
+    /// obliviously). On any failure — including a BOGUS DNSSEC answer — the arm
+    /// fails closed (SERVFAIL); it never falls back to plain DoH or the target
+    /// directly, which would de-anonymise the operator. Not available on
+    /// conditional-forwarding routes.
     Odoh,
 }
 
@@ -1425,25 +1426,10 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                 )));
             }
         }
-        // ODoH does NOT perform CLIENT-SIDE DNSSEC validation: the oblivious
-        // arm bypasses hickory-resolver (which is what validates on the
-        // doh/doq arms), and re-implementing chain validation over the
-        // oblivious transport is a separate, larger piece of work. Rather than
-        // let `dnssec_validation = true` silently mean nothing on this arm, we
-        // reject the combination — refusing to imply a guarantee we don't
-        // provide. Operators who want ODoH set `dnssec_validation = false`,
-        // acknowledging that integrity then rests on a validating target
-        // resolver (server-side) rather than on client-side checks.
-        if cfg.upstream.dnssec_validation {
-            return Err(crate::RustyDnsError::Config(
-                "upstream.protocol = \"odoh\" with upstream.dnssec_validation = true is not \
-                 supported: the oblivious arm does not perform client-side DNSSEC validation \
-                 (a future enhancement). Set dnssec_validation = false to use ODoH — you then \
-                 rely on a validating target resolver — or use \"doh\"/\"doq\" for client-side \
-                 DNSSEC validation."
-                    .to_string(),
-            ));
-        }
+        // ODoH supports client-side DNSSEC validation (the oblivious arm runs
+        // queries through hickory's validator; the DNSKEY/DS chain lookups also
+        // travel obliviously). Both dnssec_validation = true and false are
+        // valid here, so there is no extra ODoH-specific check.
     } else if !cfg.upstream.odoh_proxies.is_empty() {
         // odoh_proxies set without protocol = "odoh" would be silently ignored;
         // the operator almost certainly meant to enable ODoH. Reject rather than
@@ -2166,18 +2152,15 @@ mod tests {
     }
 
     #[test]
-    fn protocol_odoh_with_dnssec_validation_rejected() {
-        // ODoH does not do client-side DNSSEC validation; we refuse to imply a
-        // guarantee we don't provide rather than silently ignore the flag.
+    fn protocol_odoh_with_dnssec_validation_accepted() {
+        // ODoH supports client-side DNSSEC (validated over the oblivious arm),
+        // so dnssec_validation = true is a valid combination.
         let mut cfg = baseline();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
         cfg.upstream.odoh_proxies = vec!["https://proxy.example".to_string()];
         cfg.upstream.dnssec_validation = true;
-        assert_config_err(
-            validate_config(&cfg),
-            "dnssec_validation = true is not supported",
-        );
+        validate_config(&cfg).expect("ODoH + DNSSEC must validate");
     }
 
     #[test]

@@ -11,7 +11,10 @@ repository.workspace = true
 [dependencies]
 rustydns-core    = { path = "../rustydns-core", version = "0.1.0" }
 hickory-resolver = { workspace = true }
-hickory-proto    = { workspace = true }
+# `dnssec-ring` for the client-side DNSSEC validator the ODoH arm wraps
+# (TrustAnchors/DnssecSummary live behind it). hickory-resolver also enables it,
+# but pin it here so the resolver doesn't depend on feature unification.
+hickory-proto    = { workspace = true, features = ["dnssec-ring"] }
 tokio            = { workspace = true }
 tracing          = { workspace = true }
 thiserror        = { workspace = true }

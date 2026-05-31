@@ -127,18 +127,23 @@ A few fields remain restart-only **by design**, not for lack of work:
   fails closed); 5xx/network/malformed failures fail closed immediately.
   **Relay diversity:** `upstream.odoh_proxies` is a list; one relay is chosen at
   random per query, so no single relay sees all the client's traffic.
-- **DNSSEC caveat:** the oblivious arm does **not** perform *client-side* DNSSEC
-  validation (that lives in hickory-resolver). `validate_config` and
-  `Resolver::new` reject `protocol = "odoh"` + `dnssec_validation = true`;
-  operators set `dnssec_validation = false` and rely on a validating target. A
-  one-time startup `warn!` discloses this and the proxy-independence requirement.
-- **Verification:** the real HPKE round-trip is exercised offline against an
-  in-process mock target (`odoh.rs` tests): success, NXDOMAIN, target-SERVFAIL →
-  error, relay-failure → error, undecodable → error, rebinding filter, config
-  caching. `cargo deny` is clean for the new crypto deps.
-- **Future enhancements (not blocking):** client-side DNSSEC over the oblivious
-  arm; pinning the target config in `[upstream]` instead of fetching
-  `/.well-known`.
+- **Client-side DNSSEC (optional):** with `dnssec_validation = true`, the arm
+  wraps our oblivious `DnsHandle` in hickory's own `DnssecDnsHandle`, so the
+  validator's DNSKEY/DS chain lookups also travel obliviously and the answer is
+  validated to the IANA root anchor. A BOGUS answer fails closed; Secure and
+  Insecure (unsigned) answers are served. With validation off, integrity rests
+  on a validating target. A one-time startup `warn!` discloses the posture and
+  the proxy-independence requirement.
+- **Verification:** the real HPKE round-trip + the `DnsHandle` wiring (what the
+  validator drives) are exercised offline against an in-process mock target
+  (`odoh.rs` tests): success, NXDOMAIN, target-SERVFAIL → error, relay-failure →
+  error, undecodable → error, key-rotation recovery, multi-relay, rebinding
+  filter, config caching, and a direct `DnsHandle` round-trip. The DNSSEC
+  *validation logic* is hickory's audited validator (its own test suite);
+  end-to-end Secure/Bogus against real signed zones is confirmed at runtime with
+  the real root anchor. `cargo deny` is clean.
+- **Future enhancements (not blocking):** pinning the target config in
+  `[upstream]` instead of fetching `/.well-known`.
 - **Doc mentions:** `docs/security.md` §"Oblivious DoH"; `docs/architecture.md`
   resolver table; `crates/rustydns-resolver/src/lib.rs` crate-level table;
   `rustydns.example.toml` `[upstream]` block; `docs/TODO.md` §7.3.

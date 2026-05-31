@@ -125,11 +125,17 @@ rustydns invariants itself:
   operator who asked for anonymity.
 - **No ECS**, and the **rebinding-defence rdata filter** applies just as on the doh/doq
   default arm.
-- **No client-side DNSSEC.** Chain validation lives inside hickory-resolver, which this
-  arm bypasses. Rather than let `dnssec_validation = true` silently mean nothing, both
-  `validate_config` and `Resolver::new` **reject** `odoh` + `dnssec_validation = true`.
-  Set `dnssec_validation = false` (you then rely on a validating *target*) or use
-  `doh`/`doq` for client-side DNSSEC. A one-time startup `warn!` discloses this.
+- **Client-side DNSSEC (optional).** With `dnssec_validation = true`, the oblivious arm
+  runs queries through hickory's own DNSSEC validator (`DnssecDnsHandle`) wrapping our
+  oblivious `DnsHandle`, so the validator's DNSKEY/DS **chain lookups also travel
+  obliviously** and the answer is validated to the IANA root trust anchor. A **BOGUS**
+  answer fails closed (`SERVFAIL`); `Secure` and `Insecure` (unsigned zone) answers are
+  served — DNSSEC rejects forgeries, it doesn't require every zone to be signed. With
+  `dnssec_validation = false`, no chain is checked and integrity rests on a validating
+  target. The validation reuses hickory's audited validator; the rustydns-owned wiring
+  (the oblivious `DnsHandle` round-trip) is covered by offline tests, and the end-to-end
+  `Secure`/`Bogus` behaviour against real signed zones is confirmed with the real root
+  anchor at runtime.
 
 **Trust model the operator must honour:** the anonymity holds only if the proxy is operated
 **independently** of the target — if one party controls both, it can correlate IP with

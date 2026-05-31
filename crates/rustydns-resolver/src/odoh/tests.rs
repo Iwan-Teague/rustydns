@@ -11,10 +11,11 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{DnsRequestOptions, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use hickory_resolver::net::xfer::{DnsHandle, FirstAnswer};
 use odoh_rs::{
     ObliviousDoHConfig, ObliviousDoHConfigs, ObliviousDoHKeyPair, ObliviousDoHMessage,
     ObliviousDoHMessagePlaintext, ResponseNonce, compose, decrypt_query, encrypt_response, parse,
@@ -169,14 +170,32 @@ fn arm_with_mock(mode: MockMode) -> OdohArm {
 }
 
 fn arm_with_mock_opts(mode: MockMode, pad_queries: bool) -> OdohArm {
-    let target = OdohTarget::parse("https://target.test/dns-query").expect("parse target");
     OdohArm {
-        targets: vec![target],
-        proxy_urls: vec!["https://proxy.test/".to_string()],
-        http: OdohHttp::Mock(Arc::new(MockRelay::new(mode))),
-        randomize: false,
-        pad_queries,
+        transport: mock_transport(
+            mode,
+            pad_queries,
+            vec!["https://proxy.test/".to_string()],
+            false,
+        ),
+        trust_anchor: None,
     }
+}
+
+/// Build a shared mock transport (single target, mock relay) for tests.
+fn mock_transport(
+    mode: MockMode,
+    pad_queries: bool,
+    proxy_urls: Vec<String>,
+    randomize: bool,
+) -> Arc<OdohTransport> {
+    let target = OdohTarget::parse("https://target.test/dns-query").expect("parse target");
+    Arc::new(OdohTransport {
+        targets: vec![target],
+        proxy_urls,
+        http: OdohHttp::Mock(Arc::new(MockRelay::new(mode))),
+        randomize,
+        pad_queries,
+    })
 }
 
 #[test]
@@ -333,12 +352,15 @@ async fn odoh_config_is_cached_after_first_fetch() {
     // First resolve fetches + caches the target config; a second resolve reuses
     // it (the cache slot is populated). Both must answer.
     let arm = arm_with_mock(MockMode::AnswerA(Ipv4Addr::new(203, 0, 113, 9)));
-    assert!(arm.targets[0].config.load().is_none(), "cache starts empty");
+    assert!(
+        arm.transport.targets[0].config.load().is_none(),
+        "cache starts empty"
+    );
     arm.resolve("a.example.", RecordType::A, false)
         .await
         .expect("first resolve");
     assert!(
-        arm.targets[0].config.load().is_some(),
+        arm.transport.targets[0].config.load().is_some(),
         "config must be cached after the first fetch"
     );
     arm.resolve("b.example.", RecordType::A, false)
@@ -376,22 +398,47 @@ async fn odoh_bounded_retry_then_fails_closed() {
 }
 
 #[tokio::test]
+async fn odoh_dns_handle_round_trips_a_query() {
+    // The OdohHandle is what hickory's DNSSEC validator drives: a Query in,
+    // encoded + sent obliviously, the decrypted DnsResponse back out. This is
+    // the wiring the validated path depends on (the DNSSEC crypto on top is
+    // hickory's). Exercise it directly via the DnsHandle trait.
+    let transport = mock_transport(
+        MockMode::AnswerA(Ipv4Addr::new(203, 0, 113, 40)),
+        false,
+        vec!["https://proxy.test/".to_string()],
+        false,
+    );
+    let handle = OdohHandle { transport };
+    let query = Query::query(Name::from_ascii("handle.example.").unwrap(), RecordType::A);
+    let response = handle
+        .lookup(query, DnsRequestOptions::default())
+        .first_answer()
+        .await
+        .expect("the DnsHandle must round-trip a query obliviously");
+    assert_eq!(response.answers.len(), 1, "expected one A record");
+    match &response.answers[0].data {
+        RData::A(a) => assert_eq!(a.0, Ipv4Addr::new(203, 0, 113, 40)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn odoh_round_trips_across_multiple_proxies() {
     // With several relays + randomized selection, queries still succeed — the
     // arm picks a relay per query and the round-trip works regardless of which.
-    let target = OdohTarget::parse("https://target.test/dns-query").expect("parse target");
     let arm = OdohArm {
-        targets: vec![target],
-        proxy_urls: vec![
-            "https://relay-a.test/proxy".to_string(),
-            "https://relay-b.test/proxy".to_string(),
-            "https://relay-c.test/proxy".to_string(),
-        ],
-        http: OdohHttp::Mock(Arc::new(MockRelay::new(MockMode::AnswerA(Ipv4Addr::new(
-            203, 0, 113, 30,
-        ))))),
-        randomize: true,
-        pad_queries: false,
+        transport: mock_transport(
+            MockMode::AnswerA(Ipv4Addr::new(203, 0, 113, 30)),
+            false,
+            vec![
+                "https://relay-a.test/proxy".to_string(),
+                "https://relay-b.test/proxy".to_string(),
+                "https://relay-c.test/proxy".to_string(),
+            ],
+            true,
+        ),
+        trust_anchor: None,
     };
     for _ in 0..5 {
         let outcome = arm
