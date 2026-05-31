@@ -25,6 +25,7 @@ use rustydns_core::record::RecordData;
 use super::*;
 
 /// How the mock target answers (or fails), so a test can drive every branch.
+#[derive(Clone, Copy)]
 enum MockMode {
     /// Answer the query with this A record (NoError).
     AnswerA(Ipv4Addr),
@@ -36,35 +37,56 @@ enum MockMode {
     RelayError,
     /// Return undecryptable garbage (→ fail closed, never surfaced).
     Garbage,
+    /// Rotate the HPKE key on the FIRST request and reject the (now stale-key)
+    /// query with a 4xx, like a real target at key rotation; answer with this A
+    /// on the retry after the client refetches the config.
+    RotateThenAnswer(Ipv4Addr),
+    /// Always reject with a 4xx — the arm must refetch + retry once, then fail
+    /// closed (the retry is bounded, not an infinite loop).
+    AlwaysReject,
+}
+
+/// Mutable target state, so a test can rotate the key mid-exchange.
+struct MockState {
+    keypair: ObliviousDoHKeyPair,
+    configs: Vec<u8>,
+    rotated: bool,
 }
 
 /// In-process ODoH target + relay. Holds a real HPKE keypair and answers with
 /// genuine `odoh-rs` server-side encryption.
 pub(crate) struct MockRelay {
-    keypair: ObliviousDoHKeyPair,
-    configs: Vec<u8>,
+    state: std::sync::Mutex<MockState>,
     mode: MockMode,
+}
+
+/// Fresh HPKE keypair plus its serialised `ObliviousDoHConfigs` bytes.
+fn fresh_keypair() -> (ObliviousDoHKeyPair, Vec<u8>) {
+    let mut rng = rand::rng();
+    let keypair = ObliviousDoHKeyPair::new(&mut rng);
+    let config: ObliviousDoHConfig = keypair.public().clone().into();
+    let configs = compose(&ObliviousDoHConfigs::from(vec![config]))
+        .expect("compose ObliviousDoHConfigs")
+        .to_vec();
+    (keypair, configs)
 }
 
 impl MockRelay {
     fn new(mode: MockMode) -> Self {
-        let mut rng = rand::rng();
-        let keypair = ObliviousDoHKeyPair::new(&mut rng);
-        let config: ObliviousDoHConfig = keypair.public().clone().into();
-        let configs = compose(&ObliviousDoHConfigs::from(vec![config]))
-            .expect("compose ObliviousDoHConfigs")
-            .to_vec();
+        let (keypair, configs) = fresh_keypair();
         MockRelay {
-            keypair,
-            configs,
+            state: std::sync::Mutex::new(MockState {
+                keypair,
+                configs,
+                rotated: false,
+            }),
             mode,
         }
     }
 
-    /// Serve the target's published `ObliviousDoHConfigs` (the `/.well-known`
-    /// endpoint).
-    pub(super) fn fetch_configs(&self) -> Result<Vec<u8>, String> {
-        Ok(self.configs.clone())
+    /// Serve the target's currently-published `ObliviousDoHConfigs`.
+    pub(super) fn fetch_configs(&self) -> Result<Vec<u8>, OdohError> {
+        Ok(self.state.lock().unwrap().configs.clone())
     }
 
     /// Relay + target: decrypt the oblivious query, answer per [`MockMode`], and
@@ -74,51 +96,71 @@ impl MockRelay {
         _target_host: &str,
         _target_path: &str,
         body: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, OdohError> {
         match self.mode {
-            MockMode::RelayError => return Err("simulated proxy/network failure".into()),
+            MockMode::RelayError => {
+                return Err(OdohError::Http("simulated proxy/network failure".into()));
+            }
             MockMode::Garbage => return Ok(vec![0xde, 0xad, 0xbe, 0xef]),
+            MockMode::AlwaysReject => return Err(OdohError::RelayStatus(401)),
+            MockMode::RotateThenAnswer(_) => {
+                let mut st = self.state.lock().unwrap();
+                if !st.rotated {
+                    // First request: rotate the key, publish the new config, and
+                    // reject the stale-key query the way a real target would.
+                    let (keypair, configs) = fresh_keypair();
+                    st.keypair = keypair;
+                    st.configs = configs;
+                    st.rotated = true;
+                    return Err(OdohError::RelayStatus(401));
+                }
+            }
             _ => {}
         }
 
+        let st = self.state.lock().unwrap();
         let mut b = Bytes::copy_from_slice(body);
-        let qmsg: ObliviousDoHMessage = parse(&mut b).map_err(|e| e.to_string())?;
-        let (q_plain, secret) = decrypt_query(&qmsg, &self.keypair).map_err(|e| e.to_string())?;
+        let qmsg: ObliviousDoHMessage =
+            parse(&mut b).map_err(|e| OdohError::Mock(e.to_string()))?;
+        let (q_plain, secret) =
+            decrypt_query(&qmsg, &st.keypair).map_err(|e| OdohError::Mock(e.to_string()))?;
 
-        let query_msg =
-            Message::from_bytes(&q_plain.clone().into_msg()).map_err(|e| e.to_string())?;
-        let resp_wire = self.build_response(&query_msg)?;
+        let query_msg = Message::from_bytes(&q_plain.clone().into_msg())
+            .map_err(|e| OdohError::Mock(e.to_string()))?;
+        let resp_wire = build_mock_response(self.mode, &query_msg)?;
 
         let r_plain = ObliviousDoHMessagePlaintext::new(resp_wire, 0);
         let nonce: ResponseNonce = [0u8; 16];
-        let rmsg =
-            encrypt_response(&q_plain, &r_plain, secret, nonce).map_err(|e| e.to_string())?;
-        Ok(compose(&rmsg).map_err(|e| e.to_string())?.to_vec())
+        let rmsg = encrypt_response(&q_plain, &r_plain, secret, nonce)
+            .map_err(|e| OdohError::Mock(e.to_string()))?;
+        Ok(compose(&rmsg)
+            .map_err(|e| OdohError::Mock(e.to_string()))?
+            .to_vec())
     }
+}
 
-    fn build_response(&self, query: &Message) -> Result<Vec<u8>, String> {
-        let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-        resp.metadata.recursion_available = true;
-        let name: Option<Name> = query.queries.first().map(|q| q.name().clone());
-        if let Some(q) = query.queries.first() {
-            resp.queries.push(q.clone());
-        }
-        match self.mode {
-            MockMode::AnswerA(ip) => {
-                resp.metadata.response_code = ResponseCode::NoError;
-                if let Some(name) = name {
-                    resp.answers
-                        .push(Record::from_rdata(name, 60, RData::A(A(ip))));
-                }
-            }
-            MockMode::Nxdomain => resp.metadata.response_code = ResponseCode::NXDomain,
-            MockMode::ServFail => resp.metadata.response_code = ResponseCode::ServFail,
-            MockMode::RelayError | MockMode::Garbage => {
-                unreachable!("handled before crypto")
-            }
-        }
-        resp.to_bytes().map_err(|e| e.to_string())
+fn build_mock_response(mode: MockMode, query: &Message) -> Result<Vec<u8>, OdohError> {
+    let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+    resp.metadata.recursion_available = true;
+    let name: Option<Name> = query.queries.first().map(|q| q.name().clone());
+    if let Some(q) = query.queries.first() {
+        resp.queries.push(q.clone());
     }
+    match mode {
+        MockMode::AnswerA(ip) | MockMode::RotateThenAnswer(ip) => {
+            resp.metadata.response_code = ResponseCode::NoError;
+            if let Some(name) = name {
+                resp.answers
+                    .push(Record::from_rdata(name, 60, RData::A(A(ip))));
+            }
+        }
+        MockMode::Nxdomain => resp.metadata.response_code = ResponseCode::NXDomain,
+        MockMode::ServFail => resp.metadata.response_code = ResponseCode::ServFail,
+        MockMode::RelayError | MockMode::Garbage | MockMode::AlwaysReject => {
+            unreachable!("handled before crypto")
+        }
+    }
+    resp.to_bytes().map_err(|e| OdohError::Mock(e.to_string()))
 }
 
 /// Build an `OdohArm` wired to a mock target (no reqwest, no TLS).
@@ -213,7 +255,7 @@ async fn odoh_relay_failure_is_an_error() {
         .resolve("example.com.", RecordType::A, false)
         .await
         .expect_err("relay failure must surface as an error");
-    assert_eq!(err.kind_label(), "mock");
+    assert_eq!(err.kind_label(), "http");
 }
 
 #[tokio::test]
@@ -265,4 +307,33 @@ async fn odoh_config_is_cached_after_first_fetch() {
     arm.resolve("b.example.", RecordType::A, false)
         .await
         .expect("second resolve reuses cached config");
+}
+
+#[tokio::test]
+async fn odoh_recovers_from_target_key_rotation() {
+    // The target rotates its HPKE key on the first request and rejects the
+    // stale-key query with a 4xx (RFC 9230). The arm must drop the cached
+    // config, refetch the new one, and succeed on the retry.
+    let arm = arm_with_mock(MockMode::RotateThenAnswer(Ipv4Addr::new(203, 0, 113, 22)));
+    let outcome = arm
+        .resolve("rotated.example.", RecordType::A, false)
+        .await
+        .expect("the arm must recover from a target key rotation");
+    assert_eq!(outcome.records.len(), 1);
+    match &outcome.records[0].data {
+        RecordData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 22)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn odoh_bounded_retry_then_fails_closed() {
+    // A target that ALWAYS rejects with a 4xx must not loop forever: the arm
+    // refetches + retries exactly once, then fails closed.
+    let arm = arm_with_mock(MockMode::AlwaysReject);
+    let err = arm
+        .resolve("rejected.example.", RecordType::A, false)
+        .await
+        .expect_err("a persistently-rejecting target must fail closed");
+    assert_eq!(err.kind_label(), "relay_status");
 }

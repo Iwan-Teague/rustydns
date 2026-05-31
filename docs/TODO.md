@@ -178,8 +178,11 @@ matrix added to `docs/operator-endpoints.md`.)
     **RFC 8467 query padding** (honours `privacy.upstream_padding` — odoh-rs pads
     the plaintext to 128-byte blocks, so the ciphertext size no longer leaks the
     query length; this is the one arm where the padding knob actually applies);
-    NXDOMAIN vs NODATA from the decrypted rcode. Key rotation is handled by
-    clearing the cached config and retrying once on a decrypt failure.
+    NXDOMAIN vs NODATA from the decrypted rcode. **Key-rotation recovery:** a
+    stale-key signal on the first attempt — the target rejecting the query with
+    a 4xx (RFC 9230) or a response that won't decrypt — drops the cached config,
+    refetches, and retries **once**; the retry is bounded (then fails closed),
+    and other failures (5xx, network, malformed) fail closed immediately.
   - **DNSSEC:** the oblivious arm does **not** do *client-side* DNSSEC
     validation (that lives in hickory-resolver, which this arm bypasses). Rather
     than let the flag mean nothing, `validate_config` **and** `Resolver::new`

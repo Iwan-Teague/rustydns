@@ -121,8 +121,10 @@ A few fields remain restart-only **by design**, not for lack of work:
   `odoh-rs` (Cloudflare, BSD-2,
   `hpke` 0.13); the DNS wire stays `hickory-proto`; the relay hop is `reqwest`
   with the TLS-version floor + `https_only`. The target's `ObliviousDoHConfig`
-  is fetched lazily from `/.well-known/odohconfigs` and cached (refreshed on a
-  decrypt failure → key rotation).
+  is fetched lazily from `/.well-known/odohconfigs` and cached. Key rotation is
+  handled: a stale-key signal on the first attempt (a target 4xx or a response
+  that won't decrypt) refetches the config and retries once (bounded — then
+  fails closed); 5xx/network/malformed failures fail closed immediately.
 - **DNSSEC caveat:** the oblivious arm does **not** perform *client-side* DNSSEC
   validation (that lives in hickory-resolver). `validate_config` and
   `Resolver::new` reject `protocol = "odoh"` + `dnssec_validation = true`;

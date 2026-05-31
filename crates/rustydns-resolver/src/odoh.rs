@@ -125,8 +125,8 @@ impl OdohError {
 
 /// One ODoH target resolver: its query URL plus a lazily-fetched, refreshable
 /// `ObliviousDoHConfig`. The config is cached in an [`ArcSwapOption`] so a key
-/// rotation (signalled by a decrypt failure) clears and refetches it without a
-/// lock.
+/// rotation (signalled by a target 4xx or a response that won't decrypt) clears
+/// and refetches it without a lock.
 struct OdohTarget {
     /// Full target query URL — kept only for logging (`debug`).
     query_url: String,
@@ -213,7 +213,7 @@ impl OdohHttp {
                 Ok(bytes.to_vec())
             }
             #[cfg(test)]
-            OdohHttp::Mock(m) => m.fetch_configs().map_err(OdohError::Mock),
+            OdohHttp::Mock(m) => m.fetch_configs(),
         }
     }
 
@@ -249,9 +249,7 @@ impl OdohHttp {
                 Ok(bytes.to_vec())
             }
             #[cfg(test)]
-            OdohHttp::Mock(m) => m
-                .relay(target_host, target_path, &body)
-                .map_err(OdohError::Mock),
+            OdohHttp::Mock(m) => m.relay(target_host, target_path, &body),
         }
     }
 }
@@ -354,11 +352,19 @@ impl OdohArm {
     }
 
     /// One oblivious round-trip: fetch/cached config → encrypt → relay POST →
-    /// decrypt. On a decrypt failure (most likely a rotated target key) the
-    /// cached config is cleared and the whole exchange is retried **once**.
+    /// decrypt.
+    ///
+    /// Targets rotate their HPKE key periodically. If the **first** attempt hits
+    /// a *stale-key* signal — the target rejecting our query with a 4xx (RFC
+    /// 9230's rotation signal) or a response that won't decrypt — the cached
+    /// config is dropped and the exchange is retried **once** with a freshly
+    /// fetched config. Any other failure (5xx, network, malformed response)
+    /// fails closed immediately: a config refetch wouldn't help. After two
+    /// attempts we give up — still fail-closed, never a less-private fallback.
     async fn exchange(&self, target: &OdohTarget, query_wire: &[u8]) -> Result<Bytes, OdohError> {
-        let mut last_decrypt_err: Option<String> = None;
+        let mut last_err: Option<OdohError> = None;
         for attempt in 0..2u8 {
+            let may_retry = attempt == 0;
             let config = self.config_for(target).await?;
             let query = ObliviousDoHMessagePlaintext::new(
                 query_wire,
@@ -376,7 +382,7 @@ impl OdohArm {
                 .map_err(|e| OdohError::Compose(e.to_string()))?
                 .to_vec();
 
-            let resp_bytes = self
+            match self
                 .http
                 .post_oblivious(
                     &self.proxy_url,
@@ -384,27 +390,43 @@ impl OdohArm {
                     &target.target_path,
                     body,
                 )
-                .await?;
-
-            let mut rb = Bytes::from(resp_bytes);
-            let resp_msg: ObliviousDoHMessage =
-                parse(&mut rb).map_err(|e| OdohError::ResponseParse(e.to_string()))?;
-            match decrypt_response(&query, &resp_msg, secret) {
-                Ok(plain) => return Ok(plain.into_msg()),
-                Err(e) => {
-                    last_decrypt_err = Some(e.to_string());
-                    if attempt == 0 {
-                        // Possible key rotation: drop the cached config and try
-                        // a fresh one before giving up.
-                        target.config.store(None);
-                        continue;
+                .await
+            {
+                Ok(resp_bytes) => {
+                    let mut rb = Bytes::from(resp_bytes);
+                    match parse::<ObliviousDoHMessage, _>(&mut rb) {
+                        Ok(resp_msg) => match decrypt_response(&query, &resp_msg, secret) {
+                            Ok(plain) => return Ok(plain.into_msg()),
+                            // The response did not decrypt — possibly a rotated
+                            // key. Drop the cached config and retry once.
+                            Err(e) => {
+                                last_err = Some(OdohError::Decrypt(e.to_string()));
+                                if may_retry {
+                                    target.config.store(None);
+                                    continue;
+                                }
+                            }
+                        },
+                        // A malformed oblivious response is not a stale-key
+                        // signal — fail closed, don't retry.
+                        Err(e) => last_err = Some(OdohError::ResponseParse(e.to_string())),
                     }
                 }
+                // RFC 9230 key rotation: the target rejected our (stale-key)
+                // query with a 4xx. Refetch the config and retry once.
+                Err(OdohError::RelayStatus(code)) if may_retry && (400..500).contains(&code) => {
+                    last_err = Some(OdohError::RelayStatus(code));
+                    target.config.store(None);
+                    continue;
+                }
+                // 5xx, network, config errors: a refetch won't help — fail closed.
+                Err(e) => last_err = Some(e),
             }
+            // Reached only on a non-retriable failure (or the second attempt):
+            // stop looping and fail closed below.
+            break;
         }
-        Err(OdohError::Decrypt(
-            last_decrypt_err.unwrap_or_else(|| "decrypt failed".into()),
-        ))
+        Err(last_err.unwrap_or_else(|| OdohError::Decrypt("oblivious exchange failed".into())))
     }
 
     /// Return the cached target config, fetching + parsing it on a cache miss.
