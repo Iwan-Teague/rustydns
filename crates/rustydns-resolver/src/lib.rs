@@ -13,7 +13,7 @@
 //! |---------|-----|---------|------------|--------|
 //! | DNS-over-HTTPS upstream | RFC 8484 | ✓ | `upstream.protocol = "doh"` | implemented |
 //! | DNS-over-QUIC upstream | RFC 9250 | opt-in | `upstream.protocol = "doq"` | implemented (via hickory `quic-ring` feature → `NameServerConfig::quic`) |
-//! | Oblivious DoH upstream | RFC 9230 | opt-in | `upstream.protocol = "odoh"` | implemented — HPKE via `odoh-rs`, relayed through `upstream.odoh_proxy`; fail-closed, no client-side DNSSEC. See the [`odoh`] module. |
+//! | Oblivious DoH upstream | RFC 9230 | opt-in | `upstream.protocol = "odoh"` | implemented — HPKE via `odoh-rs`, relayed through one of `upstream.odoh_proxies` (random per query); fail-closed, no client-side DNSSEC. See the [`odoh`] module. |
 //! | TLS 1.3 minimum | RFC 8446 | ✓ | `upstream.min_tls_version = "1.3"` | implemented |
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
@@ -155,7 +155,7 @@ pub struct Resolver {
     /// route over a `internal.` route).
     ///
     /// Routes are always hickory arms — ODoH is offered only on the global
-    /// default (it needs `upstream.odoh_proxy`), never on a route.
+    /// default (it needs `upstream.odoh_proxies`), never on a route.
     routes: Vec<RouteArm>,
 }
 
@@ -240,7 +240,8 @@ impl Resolver {
                 "upstream.protocol = \"odoh\" — queries are oblivious (the target never sees your \
                  client IP, the proxy never sees your query). Two caveats: this arm does NOT \
                  perform client-side DNSSEC validation (integrity rests on a validating target), \
-                 and the anonymity guarantee holds ONLY if upstream.odoh_proxy is operated \
+                 and the anonymity guarantee holds ONLY if each upstream.odoh_proxies relay is \
+                 operated \
                  independently of the target."
             );
         }
@@ -1495,7 +1496,7 @@ mod tests {
         let mut cfg = DnsConfig::default();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
-        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        cfg.upstream.odoh_proxies = vec!["https://proxy.example".to_string()];
         cfg.upstream.dnssec_validation = true;
         let err = Resolver::new(cfg).await.unwrap_err();
         match err {
@@ -1514,7 +1515,7 @@ mod tests {
         let mut cfg = DnsConfig::default();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.invalid/dns-query".to_string()];
-        cfg.upstream.odoh_proxy = Some("https://proxy.invalid/".to_string());
+        cfg.upstream.odoh_proxies = vec!["https://proxy.invalid/".to_string()];
         cfg.upstream.dnssec_validation = false;
         Resolver::new(cfg)
             .await

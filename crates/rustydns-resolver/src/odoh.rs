@@ -258,7 +258,10 @@ impl OdohHttp {
 /// conditional-forwarding routes).
 pub(crate) struct OdohArm {
     targets: Vec<OdohTarget>,
-    proxy_url: String,
+    /// Oblivious relay URLs. One is chosen per query (random when
+    /// `randomize_upstream_selection`), so several independent relays spread the
+    /// client's encrypted traffic — no single relay sees it all.
+    proxy_urls: Vec<String>,
     http: OdohHttp,
     randomize: bool,
     /// Pad the oblivious query plaintext to a fixed block (RFC 8467 style) when
@@ -276,10 +279,12 @@ impl OdohArm {
         config: &DnsConfig,
         test_roots: &[CertificateDer<'static>],
     ) -> Result<Self, OdohError> {
-        let proxy_url =
-            config.upstream.odoh_proxy.clone().ok_or_else(|| {
-                OdohError::Build("upstream.odoh_proxy is required for ODoH".into())
-            })?;
+        let proxy_urls = config.upstream.odoh_proxies.clone();
+        if proxy_urls.is_empty() {
+            return Err(OdohError::Build(
+                "upstream.odoh_proxies must list at least one oblivious relay for ODoH".into(),
+            ));
+        }
         let mut targets = Vec::with_capacity(config.upstream.resolvers.len());
         for url in &config.upstream.resolvers {
             targets.push(OdohTarget::parse(url)?);
@@ -294,7 +299,7 @@ impl OdohArm {
         )?);
         Ok(OdohArm {
             targets,
-            proxy_url,
+            proxy_urls,
             http,
             randomize: config.privacy.randomize_upstream_selection,
             pad_queries: config.privacy.upstream_padding,
@@ -351,6 +356,19 @@ impl OdohArm {
         }
     }
 
+    /// Pick the oblivious relay for this query — random when
+    /// `randomize_upstream_selection`, else the first. Spreading queries across
+    /// independent relays (so no single relay sees all your traffic) is the
+    /// whole point of configuring more than one.
+    fn select_proxy(&self) -> &str {
+        if self.randomize && self.proxy_urls.len() > 1 {
+            let idx = (rand::random::<u32>() as usize) % self.proxy_urls.len();
+            &self.proxy_urls[idx]
+        } else {
+            &self.proxy_urls[0]
+        }
+    }
+
     /// One oblivious round-trip: fetch/cached config → encrypt → relay POST →
     /// decrypt.
     ///
@@ -362,6 +380,10 @@ impl OdohArm {
     /// fails closed immediately: a config refetch wouldn't help. After two
     /// attempts we give up — still fail-closed, never a less-private fallback.
     async fn exchange(&self, target: &OdohTarget, query_wire: &[u8]) -> Result<Bytes, OdohError> {
+        // One relay for the whole exchange (both attempts) — a different relay
+        // wouldn't change a key-rotation outcome, and keeping it stable avoids
+        // fanning a single query across relays.
+        let proxy = self.select_proxy();
         let mut last_err: Option<OdohError> = None;
         for attempt in 0..2u8 {
             let may_retry = attempt == 0;
@@ -384,12 +406,7 @@ impl OdohArm {
 
             match self
                 .http
-                .post_oblivious(
-                    &self.proxy_url,
-                    &target.target_host,
-                    &target.target_path,
-                    body,
-                )
+                .post_oblivious(proxy, &target.target_host, &target.target_path, body)
                 .await
             {
                 Ok(resp_bytes) => {
@@ -465,7 +482,7 @@ impl std::fmt::Debug for OdohArm {
                     .map(|t| &t.query_url)
                     .collect::<Vec<_>>(),
             )
-            .field("proxy_url", &self.proxy_url)
+            .field("proxy_urls", &self.proxy_urls)
             .field("randomize", &self.randomize)
             .finish()
     }

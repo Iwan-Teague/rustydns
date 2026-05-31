@@ -113,9 +113,11 @@ client IP — no single party can correlate "who asked what." This is the highes
 *anonymity* upgrade for rustydns and a direct fit for its #1 design goal.
 
 Enable it with `upstream.protocol = "odoh"`, `upstream.resolvers = ["https://<target>/dns-query"]`,
-and `upstream.odoh_proxy = "https://<proxy>/"`. The arm lives in
-`crates/rustydns-resolver/src/odoh.rs` as a *parallel* upstream that bypasses
-`hickory-resolver`, and re-applies the rustydns invariants itself:
+and `upstream.odoh_proxies = ["https://<relay>/"]` (list several independent
+relays and the resolver picks one at random per query, so no single relay sees
+all your traffic). The arm lives in `crates/rustydns-resolver/src/odoh.rs` as a
+*parallel* upstream that bypasses `hickory-resolver`, and re-applies the
+rustydns invariants itself:
 
 - **Fail-closed.** Every failure — config fetch, HPKE encrypt, the relay POST, decrypt,
   DNS parse, or a target SERVFAIL/REFUSED — returns `SERVFAIL`. rustydns **never** falls

@@ -125,6 +125,8 @@ A few fields remain restart-only **by design**, not for lack of work:
   handled: a stale-key signal on the first attempt (a target 4xx or a response
   that won't decrypt) refetches the config and retries once (bounded — then
   fails closed); 5xx/network/malformed failures fail closed immediately.
+  **Relay diversity:** `upstream.odoh_proxies` is a list; one relay is chosen at
+  random per query, so no single relay sees all the client's traffic.
 - **DNSSEC caveat:** the oblivious arm does **not** perform *client-side* DNSSEC
   validation (that lives in hickory-resolver). `validate_config` and
   `Resolver::new` reject `protocol = "odoh"` + `dnssec_validation = true`;
@@ -135,8 +137,8 @@ A few fields remain restart-only **by design**, not for lack of work:
   error, relay-failure → error, undecodable → error, rebinding filter, config
   caching. `cargo deny` is clean for the new crypto deps.
 - **Future enhancements (not blocking):** client-side DNSSEC over the oblivious
-  arm; multiple independent proxies / rotation; pinning the target config in
-  `[upstream]` instead of fetching `/.well-known`.
+  arm; pinning the target config in `[upstream]` instead of fetching
+  `/.well-known`.
 - **Doc mentions:** `docs/security.md` §"Oblivious DoH"; `docs/architecture.md`
   resolver table; `crates/rustydns-resolver/src/lib.rs` crate-level table;
   `rustydns.example.toml` `[upstream]` block; `docs/TODO.md` §7.3.

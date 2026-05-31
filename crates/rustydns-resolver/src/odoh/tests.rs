@@ -172,7 +172,7 @@ fn arm_with_mock_opts(mode: MockMode, pad_queries: bool) -> OdohArm {
     let target = OdohTarget::parse("https://target.test/dns-query").expect("parse target");
     OdohArm {
         targets: vec![target],
-        proxy_url: "https://proxy.test/".to_string(),
+        proxy_urls: vec!["https://proxy.test/".to_string()],
         http: OdohHttp::Mock(Arc::new(MockRelay::new(mode))),
         randomize: false,
         pad_queries,
@@ -336,4 +336,31 @@ async fn odoh_bounded_retry_then_fails_closed() {
         .await
         .expect_err("a persistently-rejecting target must fail closed");
     assert_eq!(err.kind_label(), "relay_status");
+}
+
+#[tokio::test]
+async fn odoh_round_trips_across_multiple_proxies() {
+    // With several relays + randomized selection, queries still succeed — the
+    // arm picks a relay per query and the round-trip works regardless of which.
+    let target = OdohTarget::parse("https://target.test/dns-query").expect("parse target");
+    let arm = OdohArm {
+        targets: vec![target],
+        proxy_urls: vec![
+            "https://relay-a.test/proxy".to_string(),
+            "https://relay-b.test/proxy".to_string(),
+            "https://relay-c.test/proxy".to_string(),
+        ],
+        http: OdohHttp::Mock(Arc::new(MockRelay::new(MockMode::AnswerA(Ipv4Addr::new(
+            203, 0, 113, 30,
+        ))))),
+        randomize: true,
+        pad_queries: false,
+    };
+    for _ in 0..5 {
+        let outcome = arm
+            .resolve("multi.example.", RecordType::A, false)
+            .await
+            .expect("resolve across rotating relays");
+        assert_eq!(outcome.records.len(), 1);
+    }
 }

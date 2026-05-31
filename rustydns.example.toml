@@ -75,20 +75,25 @@ resolvers = [
 #
 # "odoh" (Oblivious DoH, RFC 9230) is the strongest anonymity option: the query
 # is HPKE-encrypted to the target resolver and relayed through an oblivious
-# proxy (odoh_proxy below), so the target never learns your client IP and the
+# proxy (odoh_proxies below), so the target never learns your client IP and the
 # proxy never learns your query. Requirements when protocol = "odoh":
-#   - set odoh_proxy to an https:// proxy operated INDEPENDENTLY of the target
-#     (if one party runs both, it can correlate IP with query);
+#   - set odoh_proxies to one or more https:// proxies operated INDEPENDENTLY of
+#     the target (if one party runs both, it can correlate IP with query). List
+#     several independent relays and the resolver picks one at random per query,
+#     so no single relay sees all your traffic.
 #   - set dnssec_validation = false — the oblivious arm does NOT do client-side
 #     DNSSEC validation (you rely on a validating target instead). Use "doh"/"doq"
 #     if you want client-side DNSSEC.
 # On any failure the ODoH arm returns SERVFAIL; it never falls back to plain DoH.
 protocol = "doh"
 
-# Oblivious proxy URL for ODoH. Required when protocol = "odoh"; ignored
-# otherwise (and rejected if set without protocol = "odoh"). Choose a proxy
-# operationally independent from the target resolver.
-# odoh_proxy = "https://odoh-proxy.example/proxy"
+# Oblivious relay URLs for ODoH. Required (non-empty) when protocol = "odoh";
+# must be empty otherwise (rejected if set without protocol = "odoh"). Each must
+# be operationally independent from the target resolver.
+# odoh_proxies = [
+#   "https://odoh-relay-a.example/proxy",
+#   "https://odoh-relay-b.example/proxy",
+# ]
 
 # Return SERVFAIL when all upstreams fail.
 # ⚠ SECURITY: Do not set to false. Disabling fail-closed allows the resolver

@@ -397,14 +397,14 @@ pub enum UpstreamProtocol {
     /// Oblivious DNS-over-HTTPS (ODoH, RFC 9230).
     ///
     /// ODoH HPKE-encrypts the query to the *target* resolver and relays it
-    /// through an *oblivious proxy* (`upstream.odoh_proxy`), so the proxy sees
+    /// through an *oblivious proxy* (`upstream.odoh_proxies`), so the proxy sees
     /// the client IP but not the query, and the target sees the query but not
     /// the client IP — no single party can correlate "who asked what." The
     /// proxy MUST be operated independently of the target or the guarantee
     /// collapses.
     ///
     /// Requirements (enforced by `validate_config`): every target in
-    /// `upstream.resolvers` is an `https://` URL, `upstream.odoh_proxy` is set
+    /// `upstream.resolvers` is an `https://` URL, `upstream.odoh_proxies` is set
     /// (`https://`), and `upstream.dnssec_validation = false` — the oblivious
     /// arm does not perform *client-side* DNSSEC validation (that bypasses
     /// hickory-resolver), so integrity rests on choosing a validating target.
@@ -525,16 +525,19 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub routes: Vec<UpstreamRoute>,
 
-    /// Oblivious proxy URL for ODoH (RFC 9230) — **reserved, not yet wired.**
+    /// Oblivious proxy URLs for ODoH (RFC 9230). Required (non-empty) when
+    /// `protocol = "odoh"`; must be empty otherwise.
     ///
-    /// When ODoH lands, this is the `https://` oblivious-proxy endpoint that
-    /// relays the HPKE-encrypted query to the target resolver (the `resolvers`
-    /// entries act as the ODoH *target*). Choose a proxy operationally
-    /// independent from the target, or the anonymity guarantee collapses. The
-    /// field is reserved now for forward-compatible configs; see
-    /// [`UpstreamProtocol::Odoh`]. Default: `None`.
+    /// Each entry is an `https://` oblivious-proxy endpoint that relays the
+    /// HPKE-encrypted query to the target resolver (the `resolvers` entries are
+    /// the ODoH *targets*). On every query the resolver picks one proxy at
+    /// random, so configuring **several independent** relays spreads your
+    /// (encrypted) traffic across them — no single relay sees it all. Every
+    /// proxy MUST be operated independently of the target, or the anonymity
+    /// guarantee collapses (one party seeing both client IP and query can
+    /// correlate them). See [`UpstreamProtocol::Odoh`]. Default: empty.
     #[serde(default)]
-    pub odoh_proxy: Option<String>,
+    pub odoh_proxies: Vec<String>,
 }
 
 impl Default for UpstreamConfig {
@@ -549,7 +552,7 @@ impl Default for UpstreamConfig {
             max_cache_entries: default_max_cache_entries(),
             block_private_rdata: false,
             routes: Vec::new(),
-            odoh_proxy: None,
+            odoh_proxies: Vec::new(),
         }
     }
 }
@@ -1406,22 +1409,21 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                 )));
             }
         }
-        match &cfg.upstream.odoh_proxy {
-            None => {
-                return Err(crate::RustyDnsError::Config(
-                    "upstream.protocol = \"odoh\" requires upstream.odoh_proxy (the oblivious \
-                     proxy URL that relays the encrypted query to the target). For the anonymity \
-                     guarantee to hold, the proxy MUST be operated independently of the target — \
-                     if one party controls both, it can correlate client IP with query."
-                        .to_string(),
-                ));
-            }
-            Some(p) if !p.starts_with("https://") => {
+        if cfg.upstream.odoh_proxies.is_empty() {
+            return Err(crate::RustyDnsError::Config(
+                "upstream.protocol = \"odoh\" requires at least one upstream.odoh_proxies entry \
+                 (the oblivious proxy URLs that relay the encrypted query to the target). For the \
+                 anonymity guarantee to hold, every proxy MUST be operated independently of the \
+                 target — if one party controls both, it can correlate client IP with query."
+                    .to_string(),
+            ));
+        }
+        for p in &cfg.upstream.odoh_proxies {
+            if !p.starts_with("https://") {
                 return Err(crate::RustyDnsError::Config(format!(
-                    "upstream.odoh_proxy `{p}` must be an https:// URL."
+                    "upstream.odoh_proxies entry `{p}` must be an https:// URL."
                 )));
             }
-            Some(_) => {}
         }
         // ODoH does NOT perform CLIENT-SIDE DNSSEC validation: the oblivious
         // arm bypasses hickory-resolver (which is what validates on the
@@ -1442,13 +1444,13 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                     .to_string(),
             ));
         }
-    } else if cfg.upstream.odoh_proxy.is_some() {
-        // An odoh_proxy set without protocol = "odoh" would be silently
-        // ignored; the operator almost certainly meant to enable ODoH. Reject
-        // rather than quietly drop the proxy (and the anonymity it implies).
+    } else if !cfg.upstream.odoh_proxies.is_empty() {
+        // odoh_proxies set without protocol = "odoh" would be silently ignored;
+        // the operator almost certainly meant to enable ODoH. Reject rather than
+        // quietly drop the proxies (and the anonymity they imply).
         return Err(crate::RustyDnsError::Config(
-            "upstream.odoh_proxy is set but upstream.protocol is not \"odoh\". The oblivious \
-             proxy is only used by the ODoH arm; set protocol = \"odoh\" or remove odoh_proxy."
+            "upstream.odoh_proxies is set but upstream.protocol is not \"odoh\". The oblivious \
+             proxies are only used by the ODoH arm; set protocol = \"odoh\" or remove them."
                 .to_string(),
         ));
     }
@@ -1611,7 +1613,7 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                 UpstreamProtocol::Odoh => {
                     return Err(crate::RustyDnsError::Config(format!(
                         "upstream.routes[{idx}].protocol = \"odoh\" is not supported — ODoH (RFC \
-                         9230) applies only to the global upstream (it needs upstream.odoh_proxy), \
+                         9230) applies only to the global upstream (it needs upstream.odoh_proxies), \
                          not to a conditional-forwarding route."
                     )));
                 }
@@ -2138,8 +2140,11 @@ mod tests {
         let mut cfg = baseline();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
-        cfg.upstream.odoh_proxy = None;
-        assert_config_err(validate_config(&cfg), "requires upstream.odoh_proxy");
+        cfg.upstream.odoh_proxies = Vec::new();
+        assert_config_err(
+            validate_config(&cfg),
+            "requires at least one upstream.odoh_proxies",
+        );
     }
 
     #[test]
@@ -2147,7 +2152,7 @@ mod tests {
         let mut cfg = baseline();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["quic://odoh.example".to_string()];
-        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        cfg.upstream.odoh_proxies = vec!["https://proxy.example".to_string()];
         assert_config_err(validate_config(&cfg), "not an https://");
     }
 
@@ -2156,7 +2161,7 @@ mod tests {
         let mut cfg = baseline();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
-        cfg.upstream.odoh_proxy = Some("http://proxy.example".to_string());
+        cfg.upstream.odoh_proxies = vec!["http://proxy.example".to_string()];
         assert_config_err(validate_config(&cfg), "must be an https://");
     }
 
@@ -2167,7 +2172,7 @@ mod tests {
         let mut cfg = baseline();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
-        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        cfg.upstream.odoh_proxies = vec!["https://proxy.example".to_string()];
         cfg.upstream.dnssec_validation = true;
         assert_config_err(
             validate_config(&cfg),
@@ -2182,19 +2187,34 @@ mod tests {
         let mut cfg = baseline();
         cfg.upstream.protocol = UpstreamProtocol::Odoh;
         cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
-        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
+        cfg.upstream.odoh_proxies = vec!["https://proxy.example".to_string()];
         cfg.upstream.dnssec_validation = false;
         validate_config(&cfg).expect("well-formed ODoH config must validate");
     }
 
     #[test]
-    fn odoh_proxy_without_odoh_protocol_rejected() {
-        // A stray odoh_proxy on a doh/doq config is a misconfig — the proxy
-        // would be silently ignored. Reject so the operator notices.
+    fn odoh_proxies_without_odoh_protocol_rejected() {
+        // Stray odoh_proxies on a doh/doq config is a misconfig — they would be
+        // silently ignored. Reject so the operator notices.
         let mut cfg = baseline();
         cfg.upstream.protocol = UpstreamProtocol::Doh;
-        cfg.upstream.odoh_proxy = Some("https://proxy.example".to_string());
-        assert_config_err(validate_config(&cfg), "odoh_proxy is set but");
+        cfg.upstream.odoh_proxies = vec!["https://proxy.example".to_string()];
+        assert_config_err(validate_config(&cfg), "odoh_proxies is set but");
+    }
+
+    #[test]
+    fn protocol_odoh_multiple_proxies_accepted() {
+        // Several independent relays are the recommended ODoH posture — they
+        // must all validate (each https).
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Odoh;
+        cfg.upstream.resolvers = vec!["https://odoh.example/dns-query".to_string()];
+        cfg.upstream.odoh_proxies = vec![
+            "https://relay-a.example/proxy".to_string(),
+            "https://relay-b.example/proxy".to_string(),
+        ];
+        cfg.upstream.dnssec_validation = false;
+        validate_config(&cfg).expect("multiple https proxies must validate");
     }
 
     #[test]

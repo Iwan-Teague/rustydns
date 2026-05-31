@@ -162,7 +162,8 @@ matrix added to `docs/operator-endpoints.md`.)
 
 - **7.3 ✅ Oblivious DoH (ODoH, RFC 9230) upstream transport — DONE.** The
   flagship anonymity feature: the query is HPKE-encrypted to the **target**
-  resolver and relayed through an **oblivious proxy** (`upstream.odoh_proxy`),
+  resolver and relayed through an **oblivious proxy** (`upstream.odoh_proxies`,
+  random relay per query),
   so the proxy sees the client IP but not the query and the target sees the
   query but not the client IP — no single party can correlate "who asked what."
   - **Where:** new `crates/rustydns-resolver/src/odoh.rs` (the `OdohArm`:
@@ -199,9 +200,12 @@ matrix added to `docs/operator-endpoints.md`.)
     transport + TLS floor) is third-party code configured in
     `odoh::build_http_client`. Docs: `docs/security.md`, `docs/architecture.md`,
     `docs/roadmap.md`, `rustydns.example.toml`. Supersedes §8.8.
+  - **Relay diversity (done):** `upstream.odoh_proxies` takes a list of relays;
+    the resolver picks one at random per query, so no single relay sees all your
+    encrypted traffic.
   - **Future enhancements (not blocking):** client-side DNSSEC over the
-    oblivious arm; multiple independent proxies / proxy rotation; pinning the
-    target `ODoHConfig` in config instead of fetching `/.well-known`.
+    oblivious arm; pinning the target `ODoHConfig` in config instead of fetching
+    `/.well-known`.
 
 ---
 
