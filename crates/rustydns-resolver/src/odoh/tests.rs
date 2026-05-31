@@ -180,6 +180,43 @@ fn arm_with_mock_opts(mode: MockMode, pad_queries: bool) -> OdohArm {
 }
 
 #[test]
+fn odoh_target_parse_splits_host_path_and_configs() {
+    let t = OdohTarget::parse("https://odoh.example/dns-query").unwrap();
+    assert_eq!(t.target_host, "odoh.example");
+    assert_eq!(t.target_path, "/dns-query");
+    assert_eq!(
+        t.configs_url,
+        "https://odoh.example/.well-known/odohconfigs"
+    );
+}
+
+#[test]
+fn odoh_target_parse_keeps_explicit_port() {
+    let t = OdohTarget::parse("https://odoh.example:8443/q").unwrap();
+    assert_eq!(t.target_host, "odoh.example:8443");
+    assert_eq!(t.target_path, "/q");
+    assert_eq!(
+        t.configs_url,
+        "https://odoh.example:8443/.well-known/odohconfigs"
+    );
+}
+
+#[test]
+fn odoh_target_parse_brackets_ipv6_authority() {
+    // The ?targethost= authority must keep the brackets on an IPv6 literal, or
+    // the host:port is ambiguous and the proxy can't reach the target.
+    let t = OdohTarget::parse("https://[2606:4700::1111]:8443/dns-query").unwrap();
+    assert_eq!(t.target_host, "[2606:4700::1111]:8443");
+}
+
+#[test]
+fn odoh_target_parse_rejects_non_https() {
+    assert!(OdohTarget::parse("http://odoh.example/").is_err());
+    assert!(OdohTarget::parse("quic://odoh.example/").is_err());
+    assert!(OdohTarget::parse("not a url").is_err());
+}
+
+#[test]
 fn query_padding_rounds_up_to_128_byte_blocks() {
     assert_eq!(query_padding(0, true), 0);
     assert_eq!(query_padding(1, true), 127);
