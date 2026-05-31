@@ -11,6 +11,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use hickory_proto::dnssec::TrustAnchors;
 use hickory_proto::op::{DnsRequestOptions, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -395,6 +396,39 @@ async fn odoh_bounded_retry_then_fails_closed() {
         .await
         .expect_err("a persistently-rejecting target must fail closed");
     assert_eq!(err.kind_label(), "relay_status");
+}
+
+#[tokio::test]
+async fn odoh_validated_path_fails_closed_when_unvalidatable() {
+    // Drive the *validated* resolve path (trust_anchor = Some) end to end. This
+    // proves the whole plumbing: resolve_validated wraps the oblivious handle in
+    // hickory's DnssecDnsHandle, the validator's chain lookups travel through our
+    // handle (obliviously), the response comes back, and DnssecSummary is checked.
+    //
+    // The mock is not a real signed DNS hierarchy and the trust anchor is empty,
+    // so the validator cannot establish a valid chain and the answer comes back
+    // BOGUS — the arm MUST fail closed (never serve it, never fall back to a
+    // less-private path). In production, a real chain to the real root anchor is
+    // what distinguishes Secure / Insecure (served) from Bogus (rejected); that
+    // distinction is hickory's validator's job and is confirmed at runtime.
+    let arm = OdohArm {
+        transport: mock_transport(
+            MockMode::AnswerA(Ipv4Addr::new(203, 0, 113, 50)),
+            false,
+            vec!["https://proxy.test/".to_string()],
+            false,
+        ),
+        trust_anchor: Some(Arc::new(TrustAnchors::empty())),
+    };
+    let err = arm
+        .resolve("validate.example.", RecordType::A, false)
+        .await
+        .expect_err("an answer that fails DNSSEC validation must fail closed");
+    assert!(
+        matches!(err.kind_label(), "bogus" | "validation"),
+        "expected a DNSSEC failure, got {}",
+        err.kind_label()
+    );
 }
 
 #[tokio::test]

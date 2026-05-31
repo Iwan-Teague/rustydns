@@ -198,12 +198,14 @@ matrix added to `docs/operator-endpoints.md`.)
   - **Verified offline:** `odoh.rs` tests drive the **real** HPKE round-trip
     against an in-process mock target (genuine `odoh-rs` server side) — success,
     NXDOMAIN, target-SERVFAIL→error, relay-failure→error, garbage→error,
-    key-rotation recovery, multi-relay, rebinding filter, config caching, **and a
-    direct `DnsHandle` round-trip** (the wiring the validator drives). The DNSSEC
-    *validation logic* is hickory's audited validator (its own tests); the
-    rustydns-owned part is the `DnsHandle` wiring (covered) — end-to-end
-    Secure/Bogus against real signed zones is confirmed at runtime with the real
-    root anchor. reqwest's HTTPS transport + TLS floor are third-party code
+    key-rotation recovery, multi-relay, rebinding filter, config caching, a
+    direct `DnsHandle` round-trip, **and the validated path driven end-to-end**
+    (the validator runs over the oblivious handle — chain lookups flow through it
+    — and a non-Secure result fails closed). The DNSSEC *validation logic* is
+    hickory's audited validator (its own tests); the rustydns-owned parts (the
+    `DnsHandle` wiring + fail-closed shaping) are covered — end-to-end
+    Secure/Insecure-served vs Bogus-rejected against real signed zones is
+    confirmed at runtime with the real root anchor. reqwest's HTTPS transport + TLS floor are third-party code
     configured in `odoh::build_http_client`. Docs: `docs/security.md`,
     `docs/architecture.md`, `docs/roadmap.md`, `rustydns.example.toml`.
     Supersedes §8.8.

@@ -138,10 +138,12 @@ A few fields remain restart-only **by design**, not for lack of work:
   validator drives) are exercised offline against an in-process mock target
   (`odoh.rs` tests): success, NXDOMAIN, target-SERVFAIL → error, relay-failure →
   error, undecodable → error, key-rotation recovery, multi-relay, rebinding
-  filter, config caching, and a direct `DnsHandle` round-trip. The DNSSEC
-  *validation logic* is hickory's audited validator (its own test suite);
-  end-to-end Secure/Bogus against real signed zones is confirmed at runtime with
-  the real root anchor. `cargo deny` is clean.
+  filter, config caching, a direct `DnsHandle` round-trip, and the validated
+  path driven end-to-end (the validator runs over the oblivious handle and a
+  non-Secure result fails closed). The DNSSEC *validation logic* is hickory's
+  audited validator (its own test suite); end-to-end Secure/Bogus against real
+  signed zones is confirmed at runtime with the real root anchor. `cargo deny`
+  is clean.
 - **Future enhancements (not blocking):** pinning the target config in
   `[upstream]` instead of fetching `/.well-known`.
 - **Doc mentions:** `docs/security.md` §"Oblivious DoH"; `docs/architecture.md`
