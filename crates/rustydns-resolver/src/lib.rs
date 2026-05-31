@@ -1528,4 +1528,110 @@ mod tests {
             other => panic!("expected Config, got {other:?}"),
         }
     }
+
+    // --- TLS 1.3 floor (upstream.min_tls_version) -------------------------
+    //
+    // `build_tls_client_config` is the single place where
+    // `upstream.min_tls_version` is turned into a rustls version set, so the
+    // whole TLS floor rests on it. This differential test stands up ONE
+    // TLS-1.2-only listener and proves the floor actually bites: the client
+    // config built with `Tls13` refuses the handshake, while the one built
+    // with `Tls12` completes it against the same server. There is no
+    // DoH/HTTP/DNS plumbing — the property under test is purely the negotiated
+    // TLS version, which is exactly what an attacker downgrading an upstream
+    // to TLS 1.2 would exploit.
+    //
+    // Self-signed EC P-256 leaf for `localhost` (CA:FALSE, SAN=localhost,
+    // EKU=serverAuth, ~100y validity) generated offline with openssl. It is
+    // both the served leaf and the injected trust root, so webpki validates a
+    // clean one-cert chain — no fixture files, no network. CA:FALSE matters:
+    // webpki refuses a CA cert used as an end-entity (`CaUsedAsEndEntity`).
+    const FLOOR_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBpjCCAU2gAwIBAgIUH4msZODlyUITY4qNh4Zy3iQ6GmgwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDUzMTIyNTg1MVoYDzIxMjYwNTA3
+MjI1ODUxWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAAQi321SoibBr5yqX+f8XO1mPhaahr1568soaw6eFothmwpv2BKVytPt
+M++E6xpBmIdD4mhTu3uvhg3wqibpkvYso3sweTAdBgNVHQ4EFgQUQMU/jc/PJ3gt
+R+iCyuMVlkuMPUQwHwYDVR0jBBgwFoAUQMU/jc/PJ3gtR+iCyuMVlkuMPUQwFAYD
+VR0RBA0wC4IJbG9jYWxob3N0MAwGA1UdEwEB/wQCMAAwEwYDVR0lBAwwCgYIKwYB
+BQUHAwEwCgYIKoZIzj0EAwIDRwAwRAIgGguAP9CRizUikjwkfgo8pEdRu/ZvI6cG
+threFGzaaJECIHXHcR7aMNF5wT6anz3/VndM0s1gnQtyWBITOHKZ0LYN
+-----END CERTIFICATE-----
+";
+    const FLOOR_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg3eneNckGaJqvOLfi
+3WH4EkMxC0+QnthrXihUDPWzdBWhRANCAAQi321SoibBr5yqX+f8XO1mPhaahr15
+68soaw6eFothmwpv2BKVytPtM++E6xpBmIdD4mhTu3uvhg3wqibpkvYs
+-----END PRIVATE KEY-----
+";
+
+    #[tokio::test]
+    async fn min_tls_version_floor_rejects_tls12_only_upstream() {
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+
+        let cert_der = CertificateDer::from_pem_slice(FLOOR_CERT_PEM.as_bytes())
+            .expect("embedded test cert must parse");
+        let key_der = PrivateKeyDer::from_pem_slice(FLOOR_KEY_PEM.as_bytes())
+            .expect("embedded test key must parse");
+
+        // Server that will ONLY negotiate TLS 1.2.
+        let server_cfg =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der.clone()], key_der)
+                .expect("server cert/key must load");
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acceptor.accept(stream).await {
+                        let _ = tls.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        let name = ServerName::try_from("localhost").unwrap();
+
+        // min_tls = 1.3 → the handshake against a 1.2-only server MUST fail.
+        let cfg13 = build_tls_client_config(TlsVersion::Tls13, std::slice::from_ref(&cert_der))
+            .expect("client config (1.3 floor) must build");
+        let attempt13 = TlsConnector::from(cfg13)
+            .connect(name.clone(), TcpStream::connect(addr).await.unwrap())
+            .await;
+        assert!(
+            attempt13.is_err(),
+            "min_tls_version = 1.3 must REFUSE a TLS-1.2-only upstream (no silent downgrade)"
+        );
+
+        // min_tls = 1.2 → the same server MUST be accepted. This is what makes
+        // the assertion above about the *floor* and not some unrelated failure
+        // (cert, port, name): only the client's minimum version changed.
+        let cfg12 = build_tls_client_config(TlsVersion::Tls12, std::slice::from_ref(&cert_der))
+            .expect("client config (1.2 floor) must build");
+        let attempt12 = TlsConnector::from(cfg12)
+            .connect(name, TcpStream::connect(addr).await.unwrap())
+            .await;
+        assert!(
+            attempt12.is_ok(),
+            "min_tls_version = 1.2 must ACCEPT a TLS-1.2 upstream: {:?}",
+            attempt12.err()
+        );
+    }
 }

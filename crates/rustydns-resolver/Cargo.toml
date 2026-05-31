@@ -45,3 +45,9 @@ tokio-util   = { workspace = true }
 # `time` (matches hickory's pin) for RRSIG inception/expiration timestamps when
 # the DNSSEC-over-ODoH test signs a throwaway zone with hickory's signer.
 time         = "0.3"
+# The TLS-1.3-floor test stands up a real TLS-1.2-only listener and drives the
+# client config `build_tls_client_config` produces against it (no DoH/HTTP — the
+# property under test is purely the negotiated TLS floor). The embedded
+# self-signed localhost cert is parsed via `rustls_pki_types::pem` (already a
+# resolver dependency).
+tokio-rustls = { workspace = true }

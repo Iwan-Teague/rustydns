@@ -87,14 +87,31 @@ posture (opt-in, same certificate, fail-closed when misconfigured).
   logged. DoH *add* is the startup default (`doh_listen` defaults to
   `127.0.0.1:8053`); DoH *remove* is not expressible in the TOML config (no
   null literal), so that unreachable branch is intentionally not tested.
-- **4.3 ✅ Resolver mock coverage — DONE for the testable cases.** Added a UDP
+- **4.3 ✅ Resolver mock coverage — DONE.** Added a UDP
   mock-upstream harness in `tests/upstream_e2e.rs` plus handler-level mock
   harnesses covering: fail-closed → SERVFAIL, ECS stripping (no EDNS Client
   Subnet on the wire even with EDNS0 on), NXDOMAIN vs NODATA, cache reuse,
   conditional-forwarding dispatch, rebinding-defence default-vs-route, CNAME
-  cloaking, response-IP denylist, and rewrites. **Remaining (need a TLS mock,
-  not a plain-UDP one):** DNSSEC *pass* with a signed zone, and TLS-1.3-floor
-  rejection of a 1.2-only upstream. Padding is upstream-blocked (§1.2).
+  cloaking, response-IP denylist, and rewrites.
+  - **TLS-1.3-floor rejection — DONE.** `lib.rs::tests::
+    min_tls_version_floor_rejects_tls12_only_upstream` is a differential test
+    at the rustls layer: one TLS-**1.2-only** listener, and the client config
+    `build_tls_client_config` produces with `min_tls_version = 1.3` **refuses**
+    the handshake while the `1.2` one **accepts** the same server. Only the
+    client's floor changes between the two halves, so the assertion is about the
+    negotiated TLS version and nothing else (no DoH/HTTP/DNS plumbing — a
+    downgrade to TLS 1.2 is exactly the attack the floor defends against).
+  - **DNSSEC *pass* over the plain hickory arm — covered elsewhere / not
+    separately testable here.** hickory-resolver validates against its built-in
+    IANA trust anchor and exposes **no** trust-anchor override on its DoH
+    resolver builder, so a test-signed zone cannot be validated *through the
+    hickory arm* offline. The equivalent guarantee is already proven end-to-end
+    on the **ODoH** arm (§7.3), where we drive hickory's `DnssecDnsHandle`
+    ourselves with a trust anchor we control: a real ECDSA-P256-signed answer
+    validates **Secure** and a forged one is **Bogus** (fails closed). That is a
+    strictly harder path than the plain arm, so the plain-arm DNSSEC behaviour
+    is exercised by the same audited validator. Padding is upstream-blocked
+    (§1.2).
 - **4.5 ✅ Property/fuzz tests for parsers — DONE (blocklist).** Dependency-free
   fuzz over the blocklist parser (5000 LCG-generated adversarial inputs across
   all four formats): no panic, and every emitted entry satisfies the domain
