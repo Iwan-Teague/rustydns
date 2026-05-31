@@ -81,20 +81,20 @@ SIGHUP reload (roadmap 3.2) is **done** — both phases shipped:
 - **Phase 1 (hot-swap):** `[upstream]` resolver, `[[policy]]`, and
   `[rate_limit]` swap atomically via `ArcSwap`.
 - **Phase 2 (live listener handover):** changed listeners on **unprivileged**
-  ports (DNS UDP/TCP, DoT incl. TLS cert rotation, DoH, metrics) rebind
+  ports (DNS UDP/TCP, DoT/DoQ incl. TLS cert rotation, DoH, metrics) rebind
   zero-drop via `SO_REUSEPORT`. See `ActiveListeners` in
   `crates/rustydnsd/src/main.rs`, `crates/rustydnsd/src/listeners.rs`, and
   `docs/design-sighup-reload.md`.
 
 A few fields remain restart-only **by design**, not for lack of work:
 
-- **Listeners on privileged ports (<1024)** — DNS `:53`, DoT `:853`. The
-  daemon drops `CAP_NET_BIND_SERVICE` (and the whole bounding set) right
-  after the initial bind, so it physically cannot rebind a privileged port;
-  `SO_REUSEPORT` does not bypass the privilege check. This is the
+- **Listeners on privileged ports (<1024)** — DNS `:53`, DoT `:853`, DoQ `:853`
+  (UDP). The daemon drops `CAP_NET_BIND_SERVICE` (and the whole bounding set)
+  right after the initial bind, so it physically cannot rebind a privileged
+  port; `SO_REUSEPORT` does not bypass the privilege check. This is the
   capability-discipline invariant working as intended (AGENTS.md). A change
   to such a listener is detected on reload and logged as restart-required.
-  Deployments that need live DNS/DoT listener changes can bind unprivileged
+  Deployments that need live DNS/DoT/DoQ listener changes can bind unprivileged
   ports and port-map at the orchestrator/firewall layer.
 - **Blocklist *source list*** — the loader + engine are built once at startup
   (SIGHUP still re-fetches content from the *current* sources).

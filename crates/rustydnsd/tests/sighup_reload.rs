@@ -609,3 +609,134 @@ fn sighup_rotates_dot_cert_on_path_change() {
     );
     drop(guard);
 }
+
+/// Offline daemon config with a DoQ (DNS-over-QUIC) listener + TLS cert.
+fn doq_config_body(dns: u16, metrics: u16, doh: u16, doq: u16, cert: &Path, key: &Path) -> String {
+    let cert = cert.display();
+    let key = key.display();
+    format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns}\"]\n\
+         mesh_zone = \"mesh.\"\n\
+         doh_listen = \"127.0.0.1:{doh}\"\n\
+         doq_listen = \"127.0.0.1:{doq}\"\n\
+         tls_cert_path = \"{cert}\"\n\
+         tls_key_path = \"{key}\"\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics}\"\n\
+         [blocklist]\n\
+         sources = []\n\
+         reload_interval_secs = 0\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:5353\"]\n\
+         [[authority.static_records]]\n\
+         name = \"probe.mesh\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n"
+    )
+}
+
+/// True if the DoQ listener on `port` answers a `probe.mesh` query. Drives a
+/// real quinn QUIC client with the `doq` ALPN and the RFC 9250 framing
+/// (2-byte length prefix, DNS message id 0, one query per bidirectional stream).
+fn doq_responds(port: u16) -> bool {
+    use std::sync::Arc;
+
+    let _ = tokio_rustls::rustls::crypto::CryptoProvider::install_default(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    );
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    rt.block_on(async move {
+        let mut crypto = tokio_rustls::rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![b"doq".to_vec()];
+        let Ok(qcc) = quinn::crypto::rustls::QuicClientConfig::try_from(crypto) else {
+            return false;
+        };
+        let Ok(mut endpoint) = quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into())
+        else {
+            return false;
+        };
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(qcc)));
+
+        let Ok(connecting) =
+            endpoint.connect((std::net::Ipv4Addr::LOCALHOST, port).into(), DOT_SNI)
+        else {
+            return false;
+        };
+        let conn = match tokio::time::timeout(Duration::from_millis(2500), connecting).await {
+            Ok(Ok(c)) => c,
+            _ => return false,
+        };
+        let Ok((mut send, mut recv)) = conn.open_bi().await else {
+            return false;
+        };
+
+        // RFC 9250: a query carries a 2-byte length prefix and its DNS message
+        // id MUST be 0 (QUIC streams provide the multiplexing).
+        let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(Name::from_ascii("probe.mesh.").unwrap())
+                .set_query_type(RecordType::A);
+            q
+        });
+        let Ok(wire) = msg.to_bytes() else {
+            return false;
+        };
+        let len = (wire.len() as u16).to_be_bytes();
+        if send.write_all(&len).await.is_err()
+            || send.write_all(&wire).await.is_err()
+            || send.finish().is_err()
+        {
+            return false;
+        }
+        let resp = match tokio::time::timeout(Duration::from_millis(2500), recv.read_to_end(65_535))
+            .await
+        {
+            Ok(Ok(r)) => r,
+            _ => return false,
+        };
+        // Response is also length-prefixed; the DNS message follows.
+        resp.len() >= 2 && Message::from_bytes(&resp[2..]).is_ok()
+    })
+}
+
+#[test]
+fn daemon_serves_doq_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let log = dir.path().join("daemon.log");
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, DOT_CERT_A).unwrap();
+    std::fs::write(&key, DOT_KEY_A).unwrap();
+
+    let (dns, metrics, doh, doq) = (free_port(), free_port(), free_port(), free_port());
+    std::fs::write(
+        &config,
+        doq_config_body(dns, metrics, doh, doq, &cert, &key),
+    )
+    .unwrap();
+    set_mode_600(&config);
+
+    let guard = spawn_daemon(&config, &log);
+
+    // DoQ must come up and answer a `probe.mesh` query over a real QUIC handshake.
+    assert!(
+        wait_until(Duration::from_secs(10), || doq_responds(doq)),
+        "DoQ listener never answered on {doq}\nlog:\n{}",
+        read_log(&log)
+    );
+    drop(guard);
+}

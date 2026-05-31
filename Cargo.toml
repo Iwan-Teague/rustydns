@@ -28,7 +28,7 @@ tokio      = { version = "1",   features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # DNS — hickory-* ONLY (trust-dns-* is unmaintained, do not add)
-hickory-server   = { version = "0.26", features = ["tls-ring"] }
+hickory-server   = { version = "0.26", features = ["tls-ring", "quic-ring"] }
 hickory-proto    = "0.26"
 hickory-resolver = { version = "0.26", features = ["https-ring", "quic-ring", "dnssec-ring", "webpki-roots"] }
 

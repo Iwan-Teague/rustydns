@@ -292,8 +292,8 @@ a change.
 | `[[rewrite]]`, `[safesearch]` | **Live** — rewrite map swapped |
 | Blocklist **content** (re-fetched from the *current* sources + local files) | **Live** — atomic content swap |
 | Mesh-zone bundle | **Live** — re-read (also polled every `poll_interval_secs`) |
-| Listeners on **unprivileged** ports (DNS UDP/TCP, DoT incl. TLS cert rotation, DoH, metrics) | **Live** — zero-drop rebind via `SO_REUSEPORT` |
-| Listeners on **privileged** ports (`:53`, `:853`) | **Restart** — `CAP_NET_BIND_SERVICE` is dropped after the initial bind |
+| Listeners on **unprivileged** ports (DNS UDP/TCP, DoT/DoQ incl. TLS cert rotation, DoH, metrics) | **Live** — zero-drop rebind via `SO_REUSEPORT` |
+| Listeners on **privileged** ports (`:53`, DoT/DoQ `:853`) | **Restart** — `CAP_NET_BIND_SERVICE` is dropped after the initial bind |
 | `blocklist.sources` / `blocklist.local_files` (the source *list*) | **Restart** |
 | `blocklist.allowlist` | **Restart** — rebuilt from the startup config on each content reload |
 | `blocklist.block_response` / `blocklist.sinkhole_ip` | **Restart** |

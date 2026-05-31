@@ -5,7 +5,7 @@ Reload `rustydns.toml` entirely on SIGHUP, updating upstreams, policies, and lis
 
 ## Challenges
 1. Socket re-binding if listeners change.
-2. TLS material reload for DoT/DoH.
+2. TLS material reload for DoT/DoQ.
 3. `hickory-server` does not natively support live-swapping `RequestHandler` or listeners without tearing down the server.
 
 ## Proposed Phased Architecture
@@ -68,7 +68,7 @@ forbids adding such a path "even if the operator explicitly requests it."
 Live, **zero-drop** handover for listeners on **unprivileged** ports (≥ 1024):
 
 - Each listener group is independently replaceable: the hickory `Server`
-  (UDP/TCP/DoT), the DoH axum server, and the metrics axum server.
+  (UDP/TCP/DoT/DoQ), the DoH axum server, and the metrics axum server.
 - New generations bind with `SO_REUSEADDR` + `SO_REUSEPORT`
   (`listeners::bind_udp` / `bind_tcp`) so the new socket binds the same port
   while the old one is still draining — no query is lost.
@@ -78,9 +78,9 @@ Live, **zero-drop** handover for listeners on **unprivileged** ports (≥ 1024):
   timeout; DoH/metrics tasks are cancelled via their per-generation child
   token). On a bind/TLS failure the old generation is kept and the error logged
   — the daemon never goes dark.
-- **DoT TLS cert rotation** works this way when DoT is on an unprivileged port:
-  changing `tls_cert_path`/`tls_key_path` rebuilds the DoT listener with the new
-  material.
+- **DoT/DoQ TLS cert rotation** works this way when the listener is on an
+  unprivileged port: changing `tls_cert_path`/`tls_key_path` rebuilds the DoT
+  (and DoQ — they share the certificate) listener with the new material.
 
 A change to a listener on a privileged port, or to blocklist *sources* / the
 on-disk query log, is detected and logged as restart-required

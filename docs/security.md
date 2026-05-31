@@ -178,13 +178,17 @@ TLS certificate validation is always enabled and is not configurable. There is n
 `verify_tls_certs = false` option and no plan to add one. Operators who need to trust
 a private CA should add it to the system trust store.
 
-### DNS-over-TLS Listener
+### DNS-over-TLS and DNS-over-QUIC Listeners
 
-For clients on the local network, RustyDNS supports a DoT listener (port 853),
-wired end-to-end against hickory-server 0.26's
-`register_tls_listener_with_tls_config`. This requires `tls_cert_path` and
-`tls_key_path` to be set in `[server]`. If `dot_listen` is configured without
-both paths, `validate_config` refuses to start the daemon.
+For clients on the local network, RustyDNS supports a DoT listener (port 853,
+TCP), wired end-to-end against hickory-server 0.26's
+`register_tls_listener_with_tls_config`, and a DoQ listener (DNS-over-QUIC,
+RFC 9250 — port 853, UDP) via `register_quic_listener_and_tls_config`. Both
+require `tls_cert_path` and `tls_key_path` to be set in `[server]`; the same
+certificate serves both. If `dot_listen` **or** `doq_listen` is configured
+without both paths, `validate_config` refuses to start the daemon. DoQ
+negotiates the `doq` ALPN, so a client that does not request it is rejected at
+the TLS handshake rather than being silently downgraded.
 
 Certificate and key files must be readable only by the `rustydns` user:
 
@@ -355,7 +359,7 @@ loopback.
 
 ### Linux Capabilities
 
-RustyDNS requires `CAP_NET_BIND_SERVICE` to bind to port 53 (and 853 for DoT). All
+RustyDNS requires `CAP_NET_BIND_SERVICE` to bind to port 53 (and 853 for DoT/DoQ). All
 other capabilities are unnecessary.
 
 The systemd unit (see `install/rustydns.service`) uses `AmbientCapabilities=CAP_NET_BIND_SERVICE`
@@ -683,9 +687,9 @@ Complete this checklist before putting RustyDNS on a network.
 - [ ] `max_cache_entries` ≤ 500,000
 - [ ] `reload_interval_secs` ≥ 300 (or 0 to disable auto-reload)
 
-### TLS (if using DoT listener)
+### TLS (if using DoT or DoQ listener)
 
-- [ ] `tls_cert_path` and `tls_key_path` are both set when `dot_listen` is configured
+- [ ] `tls_cert_path` and `tls_key_path` are both set when `dot_listen` and/or `doq_listen` is configured
 - [ ] `chmod 640 /etc/rustydns/tls.crt`, owner `rustydns:rustydns`
 - [ ] `chmod 600 /etc/rustydns/tls.key`, owner `rustydns:rustydns`
 - [ ] Certificate is from a trusted CA (not self-signed) or clients are configured to

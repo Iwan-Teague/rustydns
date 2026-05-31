@@ -26,13 +26,16 @@ services:
     restart: unless-stopped
 
     # Bind the DNS ports. UDP+TCP/53 for plain DNS, TCP/853 for DoT,
-    # TCP/8053 for DoH. The /metrics + /health + /queries endpoint on
-    # :9153 is intentionally NOT published — keep it loopback-only and
-    # scrape via a sidecar that joins this container's network namespace.
+    # TCP/8053 for DoH. DoQ (DNS-over-QUIC) is UDP/853 — uncomment the
+    # mapping below if you set `doq_listen` in rustydns.toml. The
+    # /metrics + /health + /queries endpoint on :9153 is intentionally
+    # NOT published — keep it loopback-only and scrape via a sidecar that
+    # joins this container's network namespace.
     ports:
       - "53:53/udp"
       - "53:53/tcp"
       - "853:853/tcp"
+      # - "853:853/udp"   # DoQ (RFC 9250); enable with server.doq_listen
       - "8053:8053/tcp"
 
     # Read-only rootfs. The daemon writes nothing to its image; the only

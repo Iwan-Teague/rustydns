@@ -56,3 +56,5 @@ tempfile = "3.27.0"
 # tokio-rustls. Workspace pin matches the runtime rustls 0.23.
 tokio-rustls = { workspace = true }
 webpki-roots = "1"
+# DoQ integration test drives a real QUIC client against the listener.
+quinn = { workspace = true }

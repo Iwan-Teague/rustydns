@@ -20,10 +20,11 @@ built in Rust. RustyDNS acts as a local DNS proxy that:
   full IPs are never logged by default
 - **Integrates with the Rusty Suite mesh** — signed dns-zone bundle with
   ed25519 verification + atomic hot-reload, IP-keyed per-client policy
-- **Listens on UDP, TCP, DNS-over-TLS, and DNS-over-HTTPS** out of the box;
-  exposes a loopback-only `/metrics`, `/health`, `/queries` for operators
+- **Listens on UDP, TCP, DNS-over-TLS, DNS-over-QUIC, and DNS-over-HTTPS**
+  (DoT/DoQ opt-in); exposes a loopback-only `/metrics`, `/health`, `/queries`
+  for operators
 - **Reloads live on `SIGHUP`** — upstream resolver, per-client policy, rate
-  limiter, blocklist content, and listeners on unprivileged ports (incl. DoT
+  limiter, blocklist content, and listeners on unprivileged ports (incl. DoT/DoQ
   cert rotation) swap in with zero dropped queries (`systemctl reload`)
 
 Security, privacy, and anonymity are first-class design constraints. All other
@@ -222,6 +223,7 @@ For a detailed description of each component, see [`docs/architecture.md`](docs/
 | DNS-over-HTTPS upstream                  | Implemented                             | RFC 8484  |
 | DNS-over-QUIC upstream                   | Implemented (via hickory `quic-ring`)   | RFC 9250  |
 | DNS-over-TLS listener                    | Implemented (`server.dot_listen`)       | RFC 7858  |
+| DNS-over-QUIC listener                   | Implemented (`server.doq_listen`)       | RFC 9250  |
 | DNS-over-HTTPS listener                  | Implemented (`server.doh_listen`)       | RFC 8484  |
 | TLS 1.3 floor for upstreams              | Implemented (`upstream.min_tls_version`)| RFC 8446  |
 | EDNS0 Client Subnet stripping            | Implemented (never set on upstreams)    | RFC 7871  |
@@ -289,7 +291,7 @@ rustydns/
 │   ├── rustydns-blocklist/       # Blocklist engine, parser, hot-reload, allowlist
 │   ├── rustydns-authority/       # Authoritative zones (static + signed Rustynet mesh bundle, CNAME chasing)
 │   ├── rustydns-resolver/        # DoH/DoQ upstream resolver (TLS 1.3 floor, fail-closed, DNSSEC, randomised selection)
-│   └── rustydnsd/                # Daemon: UDP/TCP/DoT/DoH listeners + /metrics, /health, /queries
+│   └── rustydnsd/                # Daemon: UDP/TCP/DoT/DoQ/DoH listeners + /metrics, /health, /queries
 ├── docs/
 │   ├── architecture.md
 │   ├── security.md

@@ -42,8 +42,15 @@ doh_listen = "127.0.0.1:8053"
 #   should be chmod 600 and owned by rustydns:rustydns.
 # dot_listen = "0.0.0.0:853"
 
-# Paths to the TLS certificate and private key for the DoT listener.
-# Required when dot_listen is set; ignored otherwise.
+# DNS-over-QUIC listener (RFC 9250; comment out to disable).
+# ⚠ SECURITY: Shares tls_cert_path/tls_key_path with the DoT listener — the
+#   same certificate serves both. The daemon will refuse to start if doq_listen
+#   is set without both paths. DoQ is QUIC over UDP, so this binds a UDP socket
+#   (port 853 by convention, the same number DoT uses over TCP).
+# doq_listen = "0.0.0.0:853"
+
+# Paths to the TLS certificate and private key for the DoT and DoQ listeners.
+# Required when dot_listen and/or doq_listen is set; ignored otherwise.
 # tls_cert_path = "/etc/rustydns/tls.crt"
 # tls_key_path  = "/etc/rustydns/tls.key"
 

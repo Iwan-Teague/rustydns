@@ -11,7 +11,7 @@ This file is the entry point for any AI agent or automated tool working in this 
 ## Repository status
 
 **Milestones 1–4 feature-complete.** All five crates ship; `rustydnsd` runs
-end-to-end on UDP, TCP, DoT, and DoH with the full privacy posture (TLS 1.3 floor,
+end-to-end on UDP, TCP, DoT, DoQ, and DoH with the full privacy posture (TLS 1.3 floor,
 DNSSEC, ECS strip, randomised upstream selection, fail-closed). The mesh-zone
 bundle is hot-reloaded via `ArcSwap`, the authority chases intra-zone CNAME
 chains (RFC 1034 §3.6.2), the daemon drops Linux capabilities in-process and
@@ -24,7 +24,7 @@ sets `umask(0o077)`, and three independent deployment paths are documented
 | `crates/rustydns-blocklist` | ✅ engine, parser (hosts/plain/RPZ/AdGuard auto-detect), allowlist with TLD-guard |
 | `crates/rustydns-authority` | ✅ static zones + signed Rustynet mesh bundle + intra-zone CNAME chasing |
 | `crates/rustydns-resolver`  | ✅ DoH/DoQ/plain upstream, TLS 1.3 floor, DNSSEC, fail-closed, randomised selection |
-| `crates/rustydnsd`          | ✅ UDP/TCP/DoT/DoH listeners, `/metrics` `/health` `/queries`, query-log ring buffer, per-client policy, bounded graceful shutdown, capability drop, umask |
+| `crates/rustydnsd`          | ✅ UDP/TCP/DoT/DoQ/DoH listeners, `/metrics` `/health` `/queries`, query-log ring buffer, per-client policy, bounded graceful shutdown, capability drop, umask |
 
 Doc surfaces:
 

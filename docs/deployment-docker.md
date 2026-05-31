@@ -18,8 +18,8 @@ $EDITOR rustydns.toml
 docker compose up -d
 ```
 
-Then point a client at the host on port 53 (UDP/TCP), 853 (DoT), or
-8053 (DoH).
+Then point a client at the host on port 53 (UDP/TCP), 853 (DoT over TCP and/or
+DoQ over UDP), or 8053 (DoH).
 
 ## Image layout
 
@@ -94,6 +94,7 @@ The compose file publishes:
 | 53 | 53 | UDP | Plain DNS |
 | 53 | 53 | TCP | Plain DNS (fallback / TC=1) |
 | 853 | 853 | TCP | DNS-over-TLS |
+| 853 | 853 | UDP | DNS-over-QUIC (RFC 9250) — opt-in; uncomment the mapping when `doq_listen` is set |
 | 8053 | 8053 | TCP | DNS-over-HTTPS |
 
 **The metrics endpoint (`:9153`) is intentionally not published.** It

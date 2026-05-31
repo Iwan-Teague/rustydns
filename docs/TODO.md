@@ -43,25 +43,28 @@ These live in `roadmap.md` too; repeated here for completeness. **Do not start**
 
 ## 2. Security & anonymity
 
-### 2.5 ⚪ Inbound DoQ (DNS-over-QUIC, RFC 9250) listener — **L**
+### 2.5 ✅ Inbound DoQ (DNS-over-QUIC, RFC 9250) listener — **DONE**
 
-DoQ is supported **upstream** only; the daemon listens on UDP/TCP/DoT/DoH. An
-inbound DoQ server would round out the encrypted-transport story for clients
-that prefer QUIC.
+The daemon now listens on UDP/TCP/DoT/**DoQ**/DoH. Inbound DoQ rounds out the
+encrypted-transport story for clients that prefer QUIC, mirroring the DoT
+posture (opt-in, same certificate, fail-closed when misconfigured).
 
-**Premise update (verified this session):** this is **no longer
-upstream-blocked**. `hickory-server 0.26` exposes
-`Server::register_quic_listener` / `register_quic_listener_and_tls_config`
-(behind the `quic-ring` feature, which the workspace currently enables only for
-`hickory-resolver`, not `hickory-server`). So it is now *implementable*, just
-unstarted. Remaining work: add `quic-ring` to the `hickory-server` dep (binary-
-size cost on Pi targets), a `server.doq_listen` config field requiring
-`tls_cert_path`/`tls_key_path` (mirror `dot_listen` validation), register the
-QUIC listener in `main.rs`, and a `quinn`-based DoQ handshake integration test
-(more plumbing than the tokio-rustls DoT test). DoQ runs on `:853` (privileged)
-so it is **restart-only** — the live-handover caveat (roadmap §3) applies. Left
-unstarted deliberately: it is a ⚪ feature whose binary-size cost + QUIC-client
-test burden aren't justified yet, not a blocked one.
+**What shipped:**
+- `quic-ring` added to the `hickory-server` dep; the listener is registered via
+  `Server::register_quic_listener_and_tls_config` in `listeners::build_dns_server`.
+- `server.doq_listen` config field (UDP socket). `validate_config` requires
+  `tls_cert_path`/`tls_key_path` whenever `dot_listen` **or** `doq_listen` is set
+  (one certificate serves both); unit test `doq_listen_without_cert_rejected`.
+- A dedicated DoQ TLS config carries the `doq` ALPN (`load_doq_tls_config`),
+  distinct from the DoT config (no ALPN).
+- SIGHUP live handover: `ActiveListeners.live_doq` + `reload_dns_group` rebind
+  the DoQ listener zero-drop via `SO_REUSEPORT` on **unprivileged** ports, like
+  DoT. On the conventional `:853` (privileged) it is restart-only — the
+  capability-discipline caveat (roadmap §3) applies.
+- E2e test `tests/sighup_reload.rs::daemon_serves_doq_queries`: a real `quinn`
+  QUIC client negotiates the `doq` ALPN, opens a bidirectional stream, sends an
+  RFC 9250-framed query (2-byte length prefix, message id 0), and parses the
+  response off the wire.
 
 ---
 
@@ -150,7 +153,7 @@ matrix added to `docs/operator-endpoints.md`.)
 - **7.2 ✅ Per-qtype / per-rcode metrics — DONE.** Added
   `rustydns_dns_queries_by_qtype_total{qtype}` (incremented at the query-receipt
   choke point) and `rustydns_dns_responses_by_rcode_total{rcode}` (incremented in
-  the single `respond()` send path, so every protocol — UDP/TCP/DoT/DoH — and
+  the single `respond()` send path, so every protocol — UDP/TCP/DoT/DoQ/DoH — and
   every response branch is counted exactly once). The cardinality concern is
   resolved by **bounded `&'static str` label sets**: `qtype` uses hickory's
   structurally-bounded `RecordType -> &'static str` (unknown types collapse to

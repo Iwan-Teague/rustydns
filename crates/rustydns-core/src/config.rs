@@ -116,7 +116,7 @@ fn default_true() -> bool {
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DnsConfig {
-    /// Network listener settings (UDP/TCP/DoT/DoH ports and TLS material).
+    /// Network listener settings (UDP/TCP/DoT/DoQ/DoH ports and TLS material).
     #[serde(default)]
     pub server: ServerConfig,
     /// Upstream DoH/DoQ resolver settings.
@@ -347,13 +347,22 @@ pub struct ServerConfig {
     #[serde(default)]
     pub dot_listen: Option<String>,
 
-    /// Path to the TLS certificate (PEM) for the DoT listener.
-    /// Required if `dot_listen` is set; ignored otherwise.
+    /// DNS-over-QUIC listener (UDP port 853, RFC 9250).
+    ///
+    /// Requires `tls_cert_path` and `tls_key_path` (shared with DoT — the same
+    /// cert serves both). The QUIC listener offers the `doq` ALPN. Disabled by
+    /// default (None). Note this is a **UDP** port: it can coexist with a DoT
+    /// listener on the same numeric port (TCP 853 vs UDP 853).
+    #[serde(default)]
+    pub doq_listen: Option<String>,
+
+    /// Path to the TLS certificate (PEM) for the DoT/DoQ listeners.
+    /// Required if `dot_listen` or `doq_listen` is set; ignored otherwise.
     #[serde(default)]
     pub tls_cert_path: Option<PathBuf>,
 
-    /// Path to the TLS private key (PEM) for the DoT listener.
-    /// Required if `dot_listen` is set; ignored otherwise.
+    /// Path to the TLS private key (PEM) for the DoT/DoQ listeners.
+    /// Required if `dot_listen` or `doq_listen` is set; ignored otherwise.
     /// The file must be readable only by the `rustydns` user (`chmod 400`).
     #[serde(default)]
     pub tls_key_path: Option<PathBuf>,
@@ -366,6 +375,7 @@ impl Default for ServerConfig {
             mesh_zone: default_mesh_zone(),
             doh_listen: default_doh_listen(),
             dot_listen: None,
+            doq_listen: None,
             tls_cert_path: None,
             tls_key_path: None,
         }
@@ -1364,13 +1374,13 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     }
 
     // DoT requires cert + key
-    if cfg.server.dot_listen.is_some()
+    if (cfg.server.dot_listen.is_some() || cfg.server.doq_listen.is_some())
         && (cfg.server.tls_cert_path.is_none() || cfg.server.tls_key_path.is_none())
     {
         return Err(crate::RustyDnsError::Config(
-            "server.dot_listen is set but server.tls_cert_path and/or \
-             server.tls_key_path are missing. DNS-over-TLS requires a TLS certificate. \
-             Set both fields to the PEM files, or remove dot_listen."
+            "server.dot_listen and/or server.doq_listen is set but server.tls_cert_path \
+             and/or server.tls_key_path are missing. DNS-over-TLS and DNS-over-QUIC require a \
+             TLS certificate. Set both fields to the PEM files, or remove the listener(s)."
                 .to_string(),
         ));
     }
@@ -2056,6 +2066,13 @@ mod tests {
     fn dot_listen_without_cert_rejected() {
         let mut cfg = baseline();
         cfg.server.dot_listen = Some("0.0.0.0:853".to_string());
+        assert_config_err(validate_config(&cfg), "tls_cert_path");
+    }
+
+    #[test]
+    fn doq_listen_without_cert_rejected() {
+        let mut cfg = baseline();
+        cfg.server.doq_listen = Some("0.0.0.0:853".to_string());
         assert_config_err(validate_config(&cfg), "tls_cert_path");
     }
 

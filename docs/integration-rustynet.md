@@ -198,4 +198,4 @@ client_filter = "external"       # served only to non-mesh clients
 - [ ] `/metrics` endpoint bound to `127.0.0.1:9153` (not public-facing)
 - [ ] `SIGHUP` wired into your service manager for config/blocklist reload
 - [ ] systemd unit with hardening directives deployed (`systemctl status rustydns`)
-- [ ] DoT listener: if enabled, `tls_cert_path` and `tls_key_path` are set and key file is `chmod 400 -o rustydns`
+- [ ] DoT/DoQ listener: if `dot_listen` and/or `doq_listen` is enabled, `tls_cert_path` and `tls_key_path` are set and key file is `chmod 400 -o rustydns`

@@ -114,9 +114,9 @@ fn set_reuse(socket: &Socket) -> Result<()> {
 }
 
 /// Build (and implicitly start) a hickory DNS server for one generation of
-/// listeners: UDP + TCP on each `listen` address, plus an optional DoT
-/// listener. All sockets use `SO_REUSEPORT` so this can be called for a new
-/// generation while the previous one is still draining.
+/// listeners: UDP + TCP on each `listen` address, plus optional DoT (TCP) and
+/// DoQ (UDP/QUIC) listeners. All sockets use `SO_REUSEPORT` so this can be
+/// called for a new generation while the previous one is still draining.
 ///
 /// The returned [`Server`] is already serving — `register_*` spawns the
 /// accept loops. Drain it with `shutdown_gracefully`.
@@ -125,6 +125,8 @@ pub fn build_dns_server(
     listen: &[SocketAddr],
     dot: Option<SocketAddr>,
     tls: Option<Arc<TlsServerConfig>>,
+    doq: Option<SocketAddr>,
+    doq_tls: Option<Arc<TlsServerConfig>>,
 ) -> Result<Server<DnsHandler>> {
     let mut server = Server::new(handler);
 
@@ -142,6 +144,17 @@ pub fn build_dns_server(
         server
             .register_tls_listener_with_tls_config(tcp, LISTENER_TIMEOUT, tls)
             .with_context(|| format!("failed to register DoT listener on {dot_addr}"))?;
+    }
+
+    if let Some(doq_addr) = doq {
+        // DoQ is QUIC → a UDP socket (bound with SO_REUSEPORT for zero-drop
+        // SIGHUP handover, like the others). The TLS config carries the `doq`
+        // ALPN.
+        let doq_tls = doq_tls.context("DoQ listener configured but no DoQ TLS config provided")?;
+        let udp = bind_udp(doq_addr)?;
+        server
+            .register_quic_listener_and_tls_config(udp, LISTENER_TIMEOUT, doq_tls)
+            .with_context(|| format!("failed to register DoQ listener on {doq_addr}"))?;
     }
 
     Ok(server)

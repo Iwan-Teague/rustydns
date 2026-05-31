@@ -11,7 +11,7 @@
 //! # Query pipeline
 //!
 //! ```text
-//! client (UDP/TCP/DoT/DoH)
+//! client (UDP/TCP/DoT/DoQ/DoH)
 //!   → Listener
 //!   → Authority  (mesh zone or static zone hit? → answer immediately)
 //!   → Blocklist  (domain on blocklist? → NXDOMAIN/sinkhole/REFUSED)
@@ -48,7 +48,7 @@
 //!
 //! # Status
 //!
-//! Milestone 4 feature-complete. UDP/TCP/DoT/DoH query pipeline,
+//! Milestone 4 feature-complete. UDP/TCP/DoT/DoQ/DoH query pipeline,
 //! metrics, mesh-zone bundle reload, blocklist reload, per-client
 //! policy, query log ring buffer, capability dropping, bounded
 //! graceful shutdown, and `--print-config` / `--validate-config`
@@ -299,8 +299,15 @@ async fn main() -> Result<()> {
             })?),
             None => None,
         };
+    let doq_addr =
+        match &config.server.doq_listen {
+            Some(s) => Some(s.parse::<SocketAddr>().with_context(|| {
+                format!("server.doq_listen `{s}` is not a valid socket address")
+            })?),
+            None => None,
+        };
 
-    // Build + start the initial DNS server (UDP/TCP + optional DoT). This
+    // Build + start the initial DNS server (UDP/TCP + optional DoT/DoQ). This
     // binds the privileged ports (53/853) while we STILL hold
     // CAP_NET_BIND_SERVICE — see the capability drop immediately below.
     let initial_tls = if dot_addr.is_some() {
@@ -308,14 +315,28 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let dns_server =
-        listeners::build_dns_server(handler.clone(), &listen_addrs, dot_addr, initial_tls)
-            .context("failed to bind DNS listeners")?;
+    let initial_doq_tls = if doq_addr.is_some() {
+        Some(load_doq_tls_config(&config.server)?)
+    } else {
+        None
+    };
+    let dns_server = listeners::build_dns_server(
+        handler.clone(),
+        &listen_addrs,
+        dot_addr,
+        initial_tls,
+        doq_addr,
+        initial_doq_tls,
+    )
+    .context("failed to bind DNS listeners")?;
     for addr in &listen_addrs {
         info!(listen = %addr, "listening for DNS queries (UDP+TCP)");
     }
     if let Some(dot) = dot_addr {
         info!(listen = %dot, "listening for DoT");
+    }
+    if let Some(doq) = doq_addr {
+        info!(listen = %doq, "listening for DoQ");
     }
 
     // --- Capability discipline -------------------------------------------
@@ -350,6 +371,7 @@ async fn main() -> Result<()> {
         dns_server,
         listen_addrs,
         dot_addr,
+        doq_addr,
         (
             config.server.tls_cert_path.clone(),
             config.server.tls_key_path.clone(),
@@ -630,7 +652,7 @@ fn parse_socket_addrs(addrs: &[String]) -> Result<Vec<SocketAddr>> {
 /// The currently-bound generation of network listeners plus the state
 /// needed for a live SIGHUP handover (roadmap 3.2, Phase 2).
 ///
-/// The hickory `Server` (UDP/TCP/DoT) and the two axum servers (DoH,
+/// The hickory `Server` (UDP/TCP/DoT/DoQ) and the two axum servers (DoH,
 /// metrics) are each replaceable independently. Replacement is **zero-drop**:
 /// the new generation binds with `SO_REUSEPORT` and starts serving before
 /// the old one is drained/cancelled. Listeners on privileged ports (<1024)
@@ -652,6 +674,7 @@ struct ActiveListeners {
     // What is actually bound right now (drives reload diffing).
     live_listen: Vec<SocketAddr>,
     live_dot: Option<SocketAddr>,
+    live_doq: Option<SocketAddr>,
     live_tls_paths: (Option<PathBuf>, Option<PathBuf>),
     live_doh: Option<SocketAddr>,
     live_metrics: Option<SocketAddr>,
@@ -668,6 +691,7 @@ impl ActiveListeners {
         dns_server: Server<DnsHandler>,
         live_listen: Vec<SocketAddr>,
         live_dot: Option<SocketAddr>,
+        live_doq: Option<SocketAddr>,
         live_tls_paths: (Option<PathBuf>, Option<PathBuf>),
     ) -> Self {
         Self {
@@ -680,6 +704,7 @@ impl ActiveListeners {
             metrics_token: None,
             live_listen,
             live_dot,
+            live_doq,
             live_tls_paths,
             live_doh: None,
             live_metrics: None,
@@ -785,12 +810,26 @@ impl ActiveListeners {
                 return;
             }
         };
+        let new_doq = match cfg
+            .server
+            .doq_listen
+            .as_deref()
+            .map(|s| s.parse::<SocketAddr>())
+            .transpose()
+        {
+            Ok(v) => v,
+            Err(_) => {
+                warn!("SIGHUP: server.doq_listen unparseable; DNS listeners unchanged");
+                return;
+            }
+        };
         let new_tls = (
             cfg.server.tls_cert_path.clone(),
             cfg.server.tls_key_path.clone(),
         );
         if new_listen == self.live_listen
             && new_dot == self.live_dot
+            && new_doq == self.live_doq
             && new_tls == self.live_tls_paths
         {
             return; // nothing changed
@@ -800,9 +839,12 @@ impl ActiveListeners {
         if let Some(d) = new_dot {
             group.push(d);
         }
+        if let Some(d) = new_doq {
+            group.push(d);
+        }
         if !listeners::all_unprivileged(&group) {
             warn!(
-                "SIGHUP: DNS/DoT listener change needs a process restart — the new config \
+                "SIGHUP: DNS/DoT/DoQ listener change needs a process restart — the new config \
                  binds a privileged port (<1024) and CAP_NET_BIND_SERVICE was dropped at \
                  startup. NOT applied; the previous listeners keep serving."
             );
@@ -820,16 +862,36 @@ impl ActiveListeners {
         } else {
             None
         };
+        let doq_tls = if new_doq.is_some() {
+            match load_doq_tls_config(&cfg.server) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    warn!(error = %e, "SIGHUP: DoQ TLS reload failed; keeping current DNS listeners");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
-        match listeners::build_dns_server(self.handler.clone(), &new_listen, new_dot, tls) {
+        match listeners::build_dns_server(
+            self.handler.clone(),
+            &new_listen,
+            new_dot,
+            tls,
+            new_doq,
+            doq_tls,
+        ) {
             Ok(new_server) => {
                 let old = self.dns_server.replace(new_server);
                 self.live_listen = new_listen.clone();
                 self.live_dot = new_dot;
+                self.live_doq = new_doq;
                 self.live_tls_paths = new_tls;
                 info!(
                     listen = ?new_listen,
                     dot = ?new_dot,
+                    doq = ?new_doq,
                     "SIGHUP: DNS listeners rebound live (zero-drop via SO_REUSEPORT)"
                 );
                 if let Some(old) = old {
@@ -1395,13 +1457,26 @@ fn drop_capabilities() {
 /// Build a rustls [`TlsServerConfig`] from the cert+key paths in
 /// `server`. Called when `dot_listen` is configured.
 fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
+    // DoT (TCP): no ALPN restriction — RFC 7858 doesn't require it, and pinning
+    // one would break clients that negotiate a different protocol name.
+    build_tls_server_config(server, &[])
+}
+
+/// Like [`load_tls_config`] but with the `doq` ALPN set, as RFC 9250 / hickory's
+/// QUIC server require. A separate config (not the DoT one) because the DoT
+/// listener must NOT advertise `doq`.
+fn load_doq_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
+    build_tls_server_config(server, &[b"doq"])
+}
+
+fn build_tls_server_config(server: &ServerConfig, alpn: &[&[u8]]) -> Result<Arc<TlsServerConfig>> {
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
     let cert_path = server.tls_cert_path.as_ref().ok_or_else(|| {
-        anyhow!("server.tls_cert_path must be set when server.dot_listen is enabled")
+        anyhow!("server.tls_cert_path must be set when a DoT/DoQ listener is enabled")
     })?;
     let key_path = server.tls_key_path.as_ref().ok_or_else(|| {
-        anyhow!("server.tls_key_path must be set when server.dot_listen is enabled")
+        anyhow!("server.tls_key_path must be set when a DoT/DoQ listener is enabled")
     })?;
 
     let certs = CertificateDer::pem_file_iter(cert_path)
@@ -1416,10 +1491,11 @@ fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
     let key = PrivateKeyDer::from_pem_file(key_path)
         .with_context(|| format!("failed to read or parse TLS private key {key_path:?}"))?;
 
-    let config = TlsServerConfig::builder()
+    let mut config = TlsServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| anyhow!("invalid TLS key or certificate: {e}"))?;
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
 
     Ok(Arc::new(config))
 }
