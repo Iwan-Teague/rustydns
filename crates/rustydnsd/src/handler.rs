@@ -446,6 +446,329 @@ impl DnsHandler {
             _ => false,
         })
     }
+
+    // --- Pipeline stages -------------------------------------------------
+    //
+    // `handle_request` runs these in order; each returns `Some(Reply)` to short-
+    // circuit (the first one that does wins) or `None` to fall through. The
+    // resolver stage always produces a `Reply`. Keeping each stage as a named
+    // method means the response is logged and sent in exactly ONE place
+    // ([`DnsHandler::finish`]) instead of being duplicated at every branch.
+
+    /// Per-source-IP rate limit. Loopback is exempt inside the limiter, so
+    /// local proxies are never penalised. Runs first so a flood costs only a
+    /// hash lookup + bucket update.
+    fn gate_rate_limit(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
+        if self.rate_limiter.load().check(ctx.src_ip) == LimitDecision::Refuse {
+            self.metrics.inc_policy_rate_limited();
+            warn!(
+                client = %ctx.client.anonymized(),
+                "policy denied: per-source-IP rate limit exceeded"
+            );
+            Some(Reply::reject(ResponseCode::Refused))
+        } else {
+            None
+        }
+    }
+
+    /// Only standard queries are served; anything else (UPDATE, NOTIFY, …) is
+    /// NOTIMP.
+    fn gate_opcode(&self, request: &Request, _ctx: &QueryCtx<'_>) -> Option<Reply> {
+        // hickory 0.26 exposes the opcode as a field on the deref'd request
+        // metadata (the `op_code()` accessor was dropped).
+        if request.metadata.op_code != OpCode::Query {
+            Some(Reply::reject(ResponseCode::NotImp))
+        } else {
+            None
+        }
+    }
+
+    /// Only the IN class is served; CHAOS/HESIOD/etc. are NOTIMP.
+    fn gate_class(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
+        if ctx.qclass != DNSClass::IN {
+            Some(Reply::reject(ResponseCode::NotImp))
+        } else {
+            None
+        }
+    }
+
+    /// Scheduled block window (TODO 8.5): if the client is inside an active
+    /// `[[policy.block_windows]]` window, refuse every query before the
+    /// pipeline (e.g. "kids' devices off after 22:00").
+    fn gate_schedule(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
+        if ctx.policy.schedule_blocked {
+            self.metrics.inc_policy_schedule_blocked();
+            warn!(
+                client = %ctx.client.anonymized(),
+                "policy denied: client is within a scheduled block window"
+            );
+            Some(Reply::reject(ResponseCode::Refused))
+        } else {
+            None
+        }
+    }
+
+    /// Zone allowlist: if the policy restricts this client to a set of zones,
+    /// refuse anything outside it before the pipeline. Mesh-local quarantine
+    /// clients never even probe the resolver / blocklist.
+    fn gate_zones(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
+        if !ctx.policy.zones_allowed.is_empty()
+            && !name_in_any_zone(ctx.qname_canon, &ctx.policy.zones_allowed)
+        {
+            self.metrics.inc_policy_zone_denied();
+            warn!(client = %ctx.client.anonymized(), "policy denied: name outside zones_allowed");
+            Some(Reply::reject(ResponseCode::Refused))
+        } else {
+            None
+        }
+    }
+
+    /// Authoritative answer (mesh zone or static zone). Wins over rewrite,
+    /// blocklist, and resolver.
+    fn gate_authority(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
+        let records = self.authority.lookup(ctx.qname_canon, ctx.qtype_label)?;
+        self.metrics.inc_authority_hits();
+        Some(Reply {
+            code: ResponseCode::NoError,
+            authoritative: true,
+            answers: Self::dns_records_to_rrs(&records),
+            served_by: ServedBy::Authority,
+        })
+    }
+
+    /// DNS rewrites / local cloaking map (TODO 8.2): operator overrides for
+    /// names outside our zones — pin to an IP, CNAME elsewhere, or blackhole.
+    /// After authority (authority wins), before blocklist/resolver.
+    fn gate_rewrite(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
+        // Bind to a local so the ArcSwap guard is released at the end of this
+        // statement (this stage is synchronous — nothing is held across await).
+        let decision = self.rewrites.load().lookup(ctx.qname_canon, ctx.qtype)?;
+        self.metrics.inc_rewrite_hits();
+        // PRIVACY: qname at debug only; do not enable debug in production.
+        debug!(client = %ctx.client.anonymized(), qname = %ctx.qname, "query rewritten");
+        let (code, authoritative, answers) = match decision {
+            RewriteDecision::Nxdomain => (ResponseCode::NXDomain, false, Vec::new()),
+            RewriteDecision::NoData => (ResponseCode::NoError, false, Vec::new()),
+            RewriteDecision::Answer(records) => (
+                ResponseCode::NoError,
+                false,
+                Self::dns_records_to_rrs(&records),
+            ),
+        };
+        Some(Reply {
+            code,
+            authoritative,
+            answers,
+            served_by: ServedBy::Rewrite,
+        })
+    }
+
+    /// QNAME blocklist (per-client group when assigned, else global), honouring
+    /// `blocklist_bypass`. The bypass metric is bumped only when bypass actually
+    /// changed the outcome (the name *would* have been blocked).
+    fn gate_blocklist(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
+        let group = ctx.policy.blocklist_group.as_deref();
+        let bypassed = ctx.policy.blocklist_bypass
+            && self.blocklist.is_blocked_for_group(ctx.qname_canon, group);
+        if bypassed {
+            self.metrics.inc_policy_blocklist_bypass();
+        }
+        if !ctx.policy.blocklist_bypass
+            && self.blocklist.is_blocked_for_group(ctx.qname_canon, group)
+        {
+            self.metrics.inc_blocklist_hits();
+            // PRIVACY: qname at debug only; do not enable debug in production.
+            debug!(client = %ctx.client.anonymized(), qname = %ctx.qname, "query blocked");
+            let (code, answers) = self.build_block_response(ctx.qname, ctx.qtype);
+            Some(Reply {
+                code,
+                authoritative: false,
+                answers,
+                served_by: ServedBy::Blocklist,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Forward to the upstream resolver, then apply the answer-time blocklist
+    /// defences (CNAME cloaking, response-IP denylist) and the NXDOMAIN-vs-
+    /// NODATA distinction. Always produces a `Reply` (this is the last stage):
+    /// on any upstream error it fails closed with SERVFAIL.
+    async fn stage_resolve(&self, ctx: &QueryCtx<'_>) -> Reply {
+        self.metrics.inc_resolver_queries();
+        // load_full() yields an owned Arc so the ArcSwap guard is not held
+        // across the .await (the guard is not Send). Raw `qname` (original
+        // case) goes to the upstream — unchanged behaviour.
+        let resolver = self.resolver.load_full();
+        match resolver.resolve(ctx.qname, ctx.qtype_label).await {
+            Ok(out) => {
+                self.metrics
+                    .inc_private_rdata_dropped(out.private_rdata_dropped);
+
+                // CNAME-cloaking defence (TODO 8.1): a tracker can pass the
+                // pre-resolution QNAME check by CNAMEing a clean first-party
+                // name to a blocked domain. Block the whole response if any
+                // CNAME target is blocked — unless this client bypasses the
+                // blocklist. The `&&` short-circuits so bypass clients pay
+                // nothing.
+                if self.blocklist.block_cname_cloaking()
+                    && !ctx.policy.blocklist_bypass
+                    && self.cname_chain_blocked(&out.records, ctx.policy.blocklist_group.as_deref())
+                {
+                    self.metrics.inc_blocklist_hits();
+                    self.metrics.inc_blocklist_cname_cloaking_blocked();
+                    // PRIVACY: qname at debug only; do not enable debug in prod.
+                    debug!(client = %ctx.client.anonymized(), qname = %ctx.qname, "query blocked (CNAME cloaking)");
+                    let (code, answers) = self.build_block_response(ctx.qname, ctx.qtype);
+                    return Reply {
+                        code,
+                        authoritative: false,
+                        answers,
+                        served_by: ServedBy::Blocklist,
+                    };
+                }
+
+                // Response-IP denylist (TODO 8.3): block if any resolved A/AAAA
+                // rdata is on the operator's IP/CIDR denylist. Same bypass
+                // exemption; the active guard short-circuits when no ranges are
+                // configured.
+                if self.blocklist.response_ip_denylist_active()
+                    && !ctx.policy.blocklist_bypass
+                    && self.response_ip_blocked(&out.records)
+                {
+                    self.metrics.inc_blocklist_hits();
+                    self.metrics.inc_blocklist_response_ip_blocked();
+                    // PRIVACY: qname at debug only; do not enable debug in prod.
+                    debug!(client = %ctx.client.anonymized(), qname = %ctx.qname, "query blocked (response-IP denylist)");
+                    let (code, answers) = self.build_block_response(ctx.qname, ctx.qtype);
+                    return Reply {
+                        code,
+                        authoritative: false,
+                        answers,
+                        served_by: ServedBy::Blocklist,
+                    };
+                }
+
+                let answers = Self::dns_records_to_rrs(&out.records);
+                // Honour the upstream's NXDOMAIN vs NODATA distinction. The
+                // `answers.is_empty()` guard ensures we never emit NXDomain
+                // alongside records (defensive — the resolver only sets
+                // `nxdomain` on the empty-answer path).
+                let code = if out.nxdomain && answers.is_empty() {
+                    ResponseCode::NXDomain
+                } else {
+                    ResponseCode::NoError
+                };
+                Reply {
+                    code,
+                    authoritative: false,
+                    answers,
+                    served_by: ServedBy::Resolver,
+                }
+            }
+            Err(err) => {
+                self.metrics.inc_resolver_failures();
+                match err {
+                    RustyDnsError::AllUpstreamsFailed => {
+                        warn!(client = %ctx.client.anonymized(), "all upstreams failed");
+                    }
+                    RustyDnsError::DnssecValidation { .. } => {
+                        warn!(client = %ctx.client.anonymized(), "DNSSEC validation failed");
+                    }
+                    RustyDnsError::Upstream { upstream, .. } => {
+                        warn!(client = %ctx.client.anonymized(), upstream = %upstream, "upstream error");
+                    }
+                    _ => {
+                        warn!(client = %ctx.client.anonymized(), "resolver error");
+                    }
+                }
+                Reply {
+                    code: ResponseCode::ServFail,
+                    authoritative: false,
+                    answers: Vec::new(),
+                    served_by: ServedBy::ServerFailure,
+                }
+            }
+        }
+    }
+
+    /// The single response choke point: log the query once (honouring
+    /// `log_all_queries`) and send the response. Every pipeline path ends here,
+    /// so logging and metric attribution happen in exactly one place.
+    async fn finish<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: R,
+        builder: MessageResponseBuilder<'_>,
+        ctx: &QueryCtx<'_>,
+        reply: Reply,
+    ) -> ResponseInfo {
+        self.log_query(
+            &ctx.policy,
+            &ctx.client,
+            ctx.qname_canon,
+            ctx.qtype_label,
+            reply.code,
+            reply.served_by,
+        );
+        self.respond(
+            request,
+            response_handle,
+            builder,
+            reply.code,
+            reply.authoritative,
+            reply.answers,
+        )
+        .await
+    }
+}
+
+/// Per-query context, assembled once and threaded by reference through the
+/// pipeline stages. Holds only borrows, `Copy` scalars, and the once-resolved
+/// policy — so building it allocates nothing beyond what the caller already did
+/// (the QNAME `String` and its canonical `Cow`, both owned by `handle_request`
+/// and borrowed here). This is what keeps a lowercase cache-hit query off the
+/// heap.
+struct QueryCtx<'a> {
+    src_ip: IpAddr,
+    client: ClientId,
+    policy: PolicyDecision,
+    /// Original-case QNAME (the client's bytes): used for the upstream query
+    /// and the sinkhole/ block-response owner, which preserve case, and for
+    /// debug logging.
+    qname: &'a str,
+    /// Lowercased QNAME, computed once. Handed to authority / blocklist /
+    /// allowlist / zones / query-log so the pipeline never re-lowercases.
+    qname_canon: &'a str,
+    qtype: RecordType,
+    /// `RecordType -> &'static str` (zero-alloc), used as the metric + log label.
+    qtype_label: &'static str,
+    qclass: DNSClass,
+}
+
+/// What a pipeline stage decided. Stages return this instead of writing the
+/// response themselves, so [`DnsHandler::finish`] is the one place that logs +
+/// sends — collapsing what used to be ~10 duplicated tail blocks into one.
+struct Reply {
+    code: ResponseCode,
+    authoritative: bool,
+    answers: Vec<Record>,
+    served_by: ServedBy,
+}
+
+impl Reply {
+    /// A rejection: no answers, not authoritative, attributed to `Rejected`.
+    /// (SERVFAIL is built directly in `stage_resolve` since it is attributed to
+    /// `ServerFailure`, not `Rejected`.)
+    fn reject(code: ResponseCode) -> Self {
+        Self {
+            code,
+            authoritative: false,
+            answers: Vec::new(),
+            served_by: ServedBy::Rejected,
+        }
+    }
 }
 
 #[async_trait]
@@ -488,390 +811,70 @@ impl RequestHandler for DnsHandler {
             }
         };
         let qname = info.query.name().to_string();
-        let qtype = info.query.query_type();
-        let qclass = info.query.query_class();
         // Canonicalise the QNAME ONCE: lowercased, borrowing when the client
-        // already sent lowercase (the common case). This single form is
-        // handed to the authority, blocklist, allowlist, and query log so the
-        // pipeline no longer re-lowercases at every stage. The raw `qname` is
-        // kept only for paths that should preserve the client's original case
-        // (the upstream query and the sinkhole record owner) and for
-        // debug-level logging.
+        // already sent lowercase (the common case). `QueryCtx` borrows this
+        // single form for authority / blocklist / allowlist / zones / log, so
+        // the pipeline never re-lowercases. The raw `qname` is kept for the
+        // paths that preserve the client's original case (upstream query and
+        // sinkhole/block-response owner) and for debug logging.
         let qname_canon = canonical_qname(&qname);
-        // Static qtype label via `RecordType -> &'static str` (zero-alloc);
-        // replaces a per-query `qtype.to_string()` and the old interning step.
-        let qtype_label: &'static str = qtype.into();
 
+        // Static qtype label via `RecordType -> &'static str` (zero-alloc),
+        // also used as the bounded metric label (attacker-chosen qtypes
+        // collapse to "Unknown" rather than inflating cardinality).
+        let qtype: RecordType = info.query.query_type();
+        let qtype_label: &'static str = qtype.into();
         self.metrics.inc_queries();
-        // Bounded label: `qtype_label` is hickory's structurally-bounded
-        // `RecordType -> &'static str`, so attacker-chosen qtypes collapse to
-        // "Unknown" rather than inflating cardinality.
         self.metrics.inc_query_qtype(qtype_label);
 
-        let client = ClientId::from_ip(info.src.ip());
+        // Assemble the per-query context once. `policy` is resolved BEFORE any
+        // rejection branch so every `log_query` (including early gates) honours
+        // `log_all_queries`. `QueryCtx` holds only borrows + `Copy` + the moved
+        // policy, so it adds no allocation.
+        let ctx = QueryCtx {
+            src_ip: info.src.ip(),
+            client: ClientId::from_ip(info.src.ip()),
+            policy: self.resolve_policy(info.src.ip()),
+            qname: &qname,
+            qname_canon: &qname_canon,
+            qtype,
+            qtype_label,
+            qclass: info.query.query_class(),
+        };
+        let builder = MessageResponseBuilder::from_message_request(request);
 
-        // Resolve policy ONCE per query, BEFORE any rejection branches,
-        // so every `log_query` call (including the early opcode and
-        // class rejections) honours `log_all_queries`.
-        let policy = self.resolve_policy(info.src.ip());
-
-        // Per-source-IP rate limiting. Runs BEFORE any pipeline work so
-        // a flood costs only an `AHashMap` lookup + bucket update. The
-        // limiter exempts loopback internally so local proxies aren't
-        // penalised. See `crate::rate_limiter` for the algorithm.
-        if self.rate_limiter.load().check(info.src.ip()) == LimitDecision::Refuse {
-            self.metrics.inc_policy_rate_limited();
-            warn!(
-                client = %client.anonymized(),
-                "policy denied: per-source-IP rate limit exceeded"
-            );
-            let builder = MessageResponseBuilder::from_message_request(request);
-            self.log_query(
-                &policy,
-                &client,
-                &qname_canon,
-                qtype_label,
-                ResponseCode::Refused,
-                ServedBy::Rejected,
-            );
+        // Gates that must run BEFORE the "query received" debug line (so a
+        // rate-limited or non-Query message is not logged as received). First
+        // gate to return `Some` wins; `response_handle` is consumed by the
+        // single `finish`.
+        if let Some(reply) = self
+            .gate_rate_limit(&ctx)
+            .or_else(|| self.gate_opcode(request, &ctx))
+            .or_else(|| self.gate_class(&ctx))
+        {
             return self
-                .respond(
-                    request,
-                    response_handle,
-                    builder,
-                    ResponseCode::Refused,
-                    false,
-                    Vec::new(),
-                )
-                .await;
-        }
-
-        // hickory 0.26 dropped the `op_code()` accessor; it's now a
-        // public field on the deref'd MessageRequest's metadata.
-        if request.metadata.op_code != OpCode::Query {
-            let builder = MessageResponseBuilder::from_message_request(request);
-            self.log_query(
-                &policy,
-                &client,
-                &qname_canon,
-                qtype_label,
-                ResponseCode::NotImp,
-                ServedBy::Rejected,
-            );
-            return self
-                .respond(
-                    request,
-                    response_handle,
-                    builder,
-                    ResponseCode::NotImp,
-                    false,
-                    Vec::new(),
-                )
-                .await;
-        }
-
-        if qclass != DNSClass::IN {
-            let builder = MessageResponseBuilder::from_message_request(request);
-            self.log_query(
-                &policy,
-                &client,
-                &qname_canon,
-                qtype_label,
-                ResponseCode::NotImp,
-                ServedBy::Rejected,
-            );
-            return self
-                .respond(
-                    request,
-                    response_handle,
-                    builder,
-                    ResponseCode::NotImp,
-                    false,
-                    Vec::new(),
-                )
+                .finish(request, response_handle, builder, &ctx, reply)
                 .await;
         }
 
         // PRIVACY: qname logged at debug only; do not enable debug in production.
-        debug!(client = %client.anonymized(), qname = %qname, qtype = %qtype, "query received");
+        debug!(client = %ctx.client.anonymized(), qname = %ctx.qname, qtype = %ctx.qtype, "query received");
 
-        let builder = MessageResponseBuilder::from_message_request(request);
-
-        // Scheduled block window (TODO 8.5): if this client is inside an active
-        // `[[policy.block_windows]]` window right now, refuse every query
-        // BEFORE consulting the pipeline (e.g. "kids' devices off after 22:00").
-        if policy.schedule_blocked {
-            self.metrics.inc_policy_schedule_blocked();
-            warn!(
-                client = %client.anonymized(),
-                "policy denied: client is within a scheduled block window"
-            );
-            self.log_query(
-                &policy,
-                &client,
-                &qname_canon,
-                qtype_label,
-                ResponseCode::Refused,
-                ServedBy::Rejected,
-            );
-            return self
-                .respond(
-                    request,
-                    response_handle,
-                    builder,
-                    ResponseCode::Refused,
-                    false,
-                    Vec::new(),
-                )
-                .await;
-        }
-
-        // Zone allowlist: if the policy restricts this client to a set
-        // of zones, refuse anything outside that set BEFORE consulting
-        // the pipeline. Mesh-local quarantine clients never even probe
-        // the resolver / blocklist.
-        if !policy.zones_allowed.is_empty()
-            && !name_in_any_zone(&qname_canon, &policy.zones_allowed)
-        {
-            self.metrics.inc_policy_zone_denied();
-            warn!(client = %client.anonymized(), "policy denied: name outside zones_allowed");
-            let builder = MessageResponseBuilder::from_message_request(request);
-            self.log_query(
-                &policy,
-                &client,
-                &qname_canon,
-                qtype_label,
-                ResponseCode::Refused,
-                ServedBy::Rejected,
-            );
-            return self
-                .respond(
-                    request,
-                    response_handle,
-                    builder,
-                    ResponseCode::Refused,
-                    false,
-                    Vec::new(),
-                )
-                .await;
-        }
-
-        if let Some(records) = self.authority.lookup(&qname_canon, qtype_label) {
-            self.metrics.inc_authority_hits();
-            let answers = Self::dns_records_to_rrs(&records);
-            self.log_query(
-                &policy,
-                &client,
-                &qname_canon,
-                qtype_label,
-                ResponseCode::NoError,
-                ServedBy::Authority,
-            );
-            return self
-                .respond(
-                    request,
-                    response_handle,
-                    builder,
-                    ResponseCode::NoError,
-                    true,
-                    answers,
-                )
-                .await;
-        }
-
-        // DNS rewrites / local cloaking map (TODO 8.2): operator-defined
-        // overrides for names OUTSIDE our zones — pin a name to an IP, CNAME
-        // it elsewhere, or blackhole it. Consulted AFTER authority (authority
-        // wins) and BEFORE the blocklist/resolver. Bind the decision to a
-        // local so the ArcSwap guard is not held across the `.await` below.
-        let rewrite = self.rewrites.load().lookup(&qname_canon, qtype);
-        if let Some(decision) = rewrite {
-            self.metrics.inc_rewrite_hits();
-            // PRIVACY: qname at debug only; do not enable debug in production.
-            debug!(client = %client.anonymized(), qname = %qname, "query rewritten");
-            let (code, aa, answers) = match decision {
-                RewriteDecision::Nxdomain => (ResponseCode::NXDomain, false, Vec::new()),
-                RewriteDecision::NoData => (ResponseCode::NoError, false, Vec::new()),
-                RewriteDecision::Answer(records) => (
-                    ResponseCode::NoError,
-                    false,
-                    Self::dns_records_to_rrs(&records),
-                ),
-            };
-            self.log_query(
-                &policy,
-                &client,
-                &qname_canon,
-                qtype_label,
-                code,
-                ServedBy::Rewrite,
-            );
-            return self
-                .respond(request, response_handle, builder, code, aa, answers)
-                .await;
-        }
-
-        // Surface blocklist_bypass only when it ACTUALLY changed the
-        // outcome — i.e. the name would have been blocked but wasn't.
-        // A trivial bypass on a name that wasn't on the blocklist
-        // anyway doesn't deserve a metric bump.
-        // Per-client blocklist group (TODO 8.6): match against the client's
-        // named group set when assigned, else the global blocklist.
-        let group = policy.blocklist_group.as_deref();
-        let bypassed =
-            policy.blocklist_bypass && self.blocklist.is_blocked_for_group(&qname_canon, group);
-        if bypassed {
-            self.metrics.inc_policy_blocklist_bypass();
-        }
-        if !policy.blocklist_bypass && self.blocklist.is_blocked_for_group(&qname_canon, group) {
-            self.metrics.inc_blocklist_hits();
-            // PRIVACY: qname logged at debug only; do not enable debug in production.
-            debug!(client = %client.anonymized(), qname = %qname, "query blocked");
-            let (code, answers) = self.build_block_response(&qname, qtype);
-
-            self.log_query(
-                &policy,
-                &client,
-                &qname_canon,
-                qtype_label,
-                code,
-                ServedBy::Blocklist,
-            );
-            return self
-                .respond(request, response_handle, builder, code, false, answers)
-                .await;
-        }
-
-        self.metrics.inc_resolver_queries();
-        // load_full() yields an owned Arc so we don't hold the ArcSwap
-        // guard across the .await (the guard is not Send).
-        let resolver = self.resolver.load_full();
-        // Raw `qname` (original case) to the upstream — unchanged behaviour.
-        match resolver.resolve(&qname, qtype_label).await {
-            Ok(out) => {
-                self.metrics
-                    .inc_private_rdata_dropped(out.private_rdata_dropped);
-
-                // CNAME-cloaking defence (TODO 8.1): a tracker can pass the
-                // pre-resolution QNAME blocklist check by CNAMEing a clean
-                // first-party name to a blocked tracker domain. Now that we
-                // have the answer, block the whole response if any CNAME
-                // target is on the blocklist — unless this client bypasses
-                // the blocklist (same exemption as QNAME blocking). The
-                // `&&` short-circuits so bypass clients pay nothing.
-                if self.blocklist.block_cname_cloaking()
-                    && !policy.blocklist_bypass
-                    && self.cname_chain_blocked(&out.records, policy.blocklist_group.as_deref())
-                {
-                    self.metrics.inc_blocklist_hits();
-                    self.metrics.inc_blocklist_cname_cloaking_blocked();
-                    // PRIVACY: qname at debug only; do not enable debug in prod.
-                    debug!(
-                        client = %client.anonymized(),
-                        qname = %qname,
-                        "query blocked (CNAME cloaking)"
-                    );
-                    let (code, answers) = self.build_block_response(&qname, qtype);
-                    self.log_query(
-                        &policy,
-                        &client,
-                        &qname_canon,
-                        qtype_label,
-                        code,
-                        ServedBy::Blocklist,
-                    );
-                    return self
-                        .respond(request, response_handle, builder, code, false, answers)
-                        .await;
-                }
-
-                // Response-IP denylist (TODO 8.3): block if any resolved
-                // A/AAAA rdata is on the operator's IP/CIDR denylist (malware
-                // C2 / ad-network ranges). Same bypass exemption; the active
-                // guard short-circuits when no ranges are configured.
-                if self.blocklist.response_ip_denylist_active()
-                    && !policy.blocklist_bypass
-                    && self.response_ip_blocked(&out.records)
-                {
-                    self.metrics.inc_blocklist_hits();
-                    self.metrics.inc_blocklist_response_ip_blocked();
-                    // PRIVACY: qname at debug only; do not enable debug in prod.
-                    debug!(
-                        client = %client.anonymized(),
-                        qname = %qname,
-                        "query blocked (response-IP denylist)"
-                    );
-                    let (code, answers) = self.build_block_response(&qname, qtype);
-                    self.log_query(
-                        &policy,
-                        &client,
-                        &qname_canon,
-                        qtype_label,
-                        code,
-                        ServedBy::Blocklist,
-                    );
-                    return self
-                        .respond(request, response_handle, builder, code, false, answers)
-                        .await;
-                }
-
-                let answers = Self::dns_records_to_rrs(&out.records);
-                // Honour the upstream's NXDOMAIN vs NODATA distinction: a
-                // genuinely non-existent name returns NXDomain, not an empty
-                // NoError. The `answers.is_empty()` guard ensures we never
-                // emit NXDomain alongside records (defensive — the resolver
-                // only sets `nxdomain` on the empty-answer path).
-                let code = if out.nxdomain && answers.is_empty() {
-                    ResponseCode::NXDomain
-                } else {
-                    ResponseCode::NoError
-                };
-                self.log_query(
-                    &policy,
-                    &client,
-                    &qname_canon,
-                    qtype_label,
-                    code,
-                    ServedBy::Resolver,
-                );
-                self.respond(request, response_handle, builder, code, false, answers)
-                    .await
-            }
-            Err(err) => {
-                self.metrics.inc_resolver_failures();
-                match err {
-                    RustyDnsError::AllUpstreamsFailed => {
-                        warn!(client = %client.anonymized(), "all upstreams failed");
-                    }
-                    RustyDnsError::DnssecValidation { .. } => {
-                        warn!(client = %client.anonymized(), "DNSSEC validation failed");
-                    }
-                    RustyDnsError::Upstream { upstream, .. } => {
-                        warn!(client = %client.anonymized(), upstream = %upstream, "upstream error");
-                    }
-                    _ => {
-                        warn!(client = %client.anonymized(), "resolver error");
-                    }
-                }
-                self.log_query(
-                    &policy,
-                    &client,
-                    &qname_canon,
-                    qtype_label,
-                    ResponseCode::ServFail,
-                    ServedBy::ServerFailure,
-                );
-                self.respond(
-                    request,
-                    response_handle,
-                    builder,
-                    ResponseCode::ServFail,
-                    false,
-                    Vec::new(),
-                )
-                .await
-            }
-        }
+        // The pipeline proper: policy gates → authority → rewrite → blocklist,
+        // each short-circuiting, else the resolver (which always replies, and
+        // fails closed to SERVFAIL).
+        let reply = self
+            .gate_schedule(&ctx)
+            .or_else(|| self.gate_zones(&ctx))
+            .or_else(|| self.gate_authority(&ctx))
+            .or_else(|| self.gate_rewrite(&ctx))
+            .or_else(|| self.gate_blocklist(&ctx));
+        let reply = match reply {
+            Some(reply) => reply,
+            None => self.stage_resolve(&ctx).await,
+        };
+        self.finish(request, response_handle, builder, &ctx, reply)
+            .await
     }
 }
 

@@ -124,10 +124,19 @@ posture (opt-in, same certificate, fail-closed when misconfigured).
 
 ## 5. Code quality / tech debt
 
-- **5.1 🟡 `handler.rs` is ~1000+ lines** — the `RequestHandler::handle_request`
-  body is long with many early-return branches. Consider extracting the pipeline
-  stages (rate-limit → opcode/class → authority → blocklist → resolver) into
-  named helpers for readability and unit-testability of each stage.
+- **5.1 ✅ `handle_request` decomposed into named pipeline stages — DONE.** The
+  ~430-line body is now a slim orchestrator: each stage is a method returning
+  `Option<Reply>` (`gate_rate_limit` → `gate_opcode` → `gate_class` →
+  `gate_schedule` → `gate_zones` → `gate_authority` → `gate_rewrite` →
+  `gate_blocklist`), chained with `.or_else` so the first to fire wins, falling
+  through to `stage_resolve` (async; always replies, fails closed to SERVFAIL).
+  A per-query `QueryCtx` (borrows + `Copy` + the once-resolved policy — **no new
+  allocation**, preserving the no-heap-on-cache-hit invariant) is threaded by
+  reference, and a single `finish` does the one `log_query` + `respond`,
+  collapsing ~10 duplicated tail blocks into one. Behaviour-identical: the full
+  99-test `rustydnsd` suite (authority/blocklist/cname-cloak/response-IP/rewrite/
+  safesearch/policy/block-window/group/NXDOMAIN-vs-NODATA/rate-limit/opcode)
+  passes unchanged.
 - **5.2 🟡 `free_port()` race in integration tests** — `tests/sighup_reload.rs`
   binds `:0`, reads the port, drops, then lets the daemon rebind. Tiny TOCTOU;
   acceptable on loopback but could flake under heavy parallelism. The *bigger*
