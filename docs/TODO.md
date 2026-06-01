@@ -322,3 +322,20 @@ blocklist groups shipped — `[[blocklist.groups]]` named sets + a
   listener handover (roadmap 3.2); IPv6 `/64` rate-limit fix; DoH body-size cap;
   `--validate-config` privacy warnings; mesh-bundle `record_count` bound +
   read TOCTOU fix. See `git log`.
+
+## Opportunistic hardening (found by re-scouring; shipped)
+
+- **DNS 0x20 query-name case randomisation on the plain path — DONE.** A
+  re-audit of the hickory 0.26 API surfaced `ResolverOpts.case_randomization`
+  (absent before). `build_resolver_arm` now enables it for **plain UDP**
+  upstreams only — the one transport without channel integrity — so off-path
+  spoofing/cache-poisoning must also guess the case bits; DoH/DoQ skip it (TLS
+  already authenticates). A case-mismatch is rejected → SERVFAIL (fail-closed).
+  Tested: `upstream_e2e::plain_upstream_randomises_query_name_case_0x20` proves
+  the wire QNAME comes back mixed-case for plain; the existing plain e2e tests
+  confirm 0x20 round-trips without regression.
+- **Re-verified the upstream-blocked items (1.1/1.2/2.1) against hickory
+  0.26.1:** query minimisation is still absent, and `DnsRequestOptions` still
+  carries a literal `// TODO: add EDNS options here?` with no padding field and
+  no RFC 8467 block-size logic — so DoH/DoQ padding remains genuinely blocked.
+  The scaffolding + startup warnings stay; adopt when hickory ships the knobs.

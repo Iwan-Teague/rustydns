@@ -22,6 +22,7 @@
 //! | Strip EDNS Client Subnet | RFC 7871 | ✓ | `privacy.no_edns_client_subnet = true` | implemented (we never set ECS) |
 //! | DoH query padding | RFC 8467 | ✓ | `privacy.upstream_padding = true` | **pending** — hickory 0.26 doesn't expose RFC 8467 yet; daemon warns at startup. See `docs/roadmap.md` §1.2. |
 //! | Randomise upstream selection | — | ✓ | `privacy.randomize_upstream_selection = true` | implemented (round-robin server-ordering strategy) |
+//! | DNS 0x20 query-name case randomisation | — | ✓ (plain only) | (automatic) | implemented — anti-spoofing / anti-cache-poisoning entropy for **plain UDP** upstreams (the only transport without channel integrity); skipped for DoH/DoQ (TLS already authenticates). A case-mismatched response is rejected → SERVFAIL (fail-closed). |
 //! | Query Name Minimisation | RFC 7816 | ✓ | `privacy.query_minimization = true` | **pending** — hickory 0.26 doesn't apply qmin yet; daemon warns at startup. See `docs/roadmap.md` §1.1. |
 //!
 //! # Fail-closed guarantee
@@ -574,6 +575,20 @@ async fn build_resolver_arm(
     } else {
         ServerOrderingStrategy::QueryStatistics
     };
+
+    // DNS 0x20 (RFC-style query-name case randomisation): randomise the case of
+    // the QNAME and require the response to echo it back exactly, which forces
+    // an off-path spoofer to also guess the case bits — many extra bits of
+    // anti-spoofing / anti-cache-poisoning entropy. Enabled ONLY for PLAIN UDP
+    // upstreams: that is the only transport with no channel integrity, so it is
+    // both where 0x20 actually helps and where the (already soft-warned)
+    // operator has opted out of TLS. DoH/DoQ are integrity-protected by TLS, so
+    // 0x20 there is pure redundancy with a needless break risk against a
+    // case-insensitive server. A 0x20 mismatch makes hickory reject the
+    // response (→ SERVFAIL under our fail-closed posture), which is exactly
+    // right: a case-mangled answer on an unauthenticated channel is
+    // indistinguishable from a spoof, so refusing it is the secure choice.
+    opts.case_randomization = protocol == UpstreamProtocol::Plain;
 
     let inner: TokioResolver =
         HickoryResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())

@@ -208,6 +208,49 @@ async fn happy_path_a_query_returns_record() {
 }
 
 #[tokio::test]
+async fn plain_upstream_randomises_query_name_case_0x20() {
+    // DNS 0x20: over PLAIN UDP (no channel integrity) the resolver randomises
+    // the QNAME case and requires the response to echo it back, so an off-path
+    // spoofer must also guess the case bits. The mock records the raw, wire
+    // (case-preserving) first label of each query it sees; a sufficiently long
+    // label is overwhelmingly likely to come back mixed-case when 0x20 is on
+    // (P(all-lowercase) ≈ 2^-27 for this label).
+    let seen_labels: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen_labels.clone();
+    let mock = MockUpstream::new(move |name, _| {
+        if let Some(first) = name.iter().next() {
+            recorder.lock().unwrap().push(first.to_vec());
+        }
+        vec![a_record(name, Ipv4Addr::new(1, 2, 3, 4), 300)]
+    })
+    .await;
+
+    let cfg = plain_config(&mock.addr_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    // The echo mock preserves case, so 0x20 round-trips and the query succeeds.
+    let out = resolver
+        .resolve("a-deliberately-long-first-label.example.org.", "A")
+        .await
+        .expect("resolve");
+    assert_eq!(out.records.len(), 1);
+
+    let labels = seen_labels.lock().unwrap();
+    assert!(!labels.is_empty(), "mock received no query");
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.iter().any(u8::is_ascii_uppercase)),
+        "plain upstream must randomise QNAME case (DNS 0x20); first labels seen: {:?}",
+        labels
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same

@@ -167,6 +167,17 @@ is configured, the daemon refuses to start.
 The `protocol` field in `[[resolvers]]` accepts `"doh"` or `"doq"` only. Setting
 `"plain"` logs a startup warning and will become a hard error in a future release.
 
+**DNS 0x20 on the plain path.** When a plain UDP upstream *is* configured anyway
+(e.g. a bare-IP local resolver, or a `[[upstream.routes]]` route to a LAN DNS),
+the resolver enables DNS 0x20 query-name case randomisation: it randomises the
+case of the QNAME and requires the response to echo it back, so an off-path
+spoofer must guess the case bits in addition to the transaction ID and source
+port. This is anti-spoofing / anti-cache-poisoning defence-in-depth for the one
+transport with no channel integrity; DoH and DoQ skip it because TLS already
+authenticates the bytes. A case-mismatched response is rejected, which under the
+fail-closed posture yields SERVFAIL — correct, since on an unauthenticated
+channel a case-mangled answer is indistinguishable from a spoof.
+
 ### TLS Implementation
 
 All TLS is implemented by `rustls` — a pure-Rust TLS library with no dependency on
