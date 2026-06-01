@@ -36,8 +36,9 @@ impl Drop for DaemonGuard {
     }
 }
 
-/// Grab a currently-free TCP port. There's an inherent race between drop and
-/// the daemon re-binding, but on loopback in a test it's reliable enough.
+/// Grab a currently-free TCP port. There's an inherent race between this drop
+/// and the daemon re-binding (a busy machine can steal the port in the gap);
+/// [`spawn_with_retry`] absorbs that by retrying the bring-up with fresh ports.
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
@@ -97,6 +98,41 @@ fn spawn_daemon(config: &Path, log: &Path) -> DaemonGuard {
         .spawn()
         .expect("failed to spawn rustydnsd");
     DaemonGuard(child)
+}
+
+/// Number of fresh-port spawn attempts before giving up (see [`spawn_with_retry`]).
+const SPAWN_ATTEMPTS: usize = 5;
+
+/// Spawn the daemon and wait until it is serving, retrying with freshly
+/// allocated ports if it does not come up.
+///
+/// This defeats the `free_port` TOCTOU under heavy parallelism (TODO §5.2): a
+/// port stolen between `free_port()` and the daemon's bind makes the daemon
+/// **exit at bind** (every bind error propagates out of `main`), so we just kill
+/// it and try again with new ports. A clean spawn is ~1 s, so a few attempts are
+/// cheap. Because any failed bind tears the whole daemon down, confirming a
+/// single listener is serving proves the generation came up fully.
+///
+/// `setup` allocates ports, writes the config, spawns the daemon, and returns
+/// the guard plus whatever the caller needs afterwards (typically the chosen
+/// ports). `ready` reports whether the daemon is actually serving.
+fn spawn_with_retry<T>(
+    setup: impl Fn() -> (DaemonGuard, T),
+    ready: impl Fn(&T) -> bool,
+) -> (DaemonGuard, T) {
+    for attempt in 1..=SPAWN_ATTEMPTS {
+        let (guard, value) = setup();
+        if wait_until(Duration::from_secs(10), || ready(&value)) {
+            return (guard, value);
+        }
+        // Did not come up — almost always a stolen port → bind failure → the
+        // daemon exited. Kill any survivor and retry with fresh ports.
+        drop(guard);
+        eprintln!(
+            "daemon spawn attempt {attempt}/{SPAWN_ATTEMPTS} did not come up; retrying with fresh ports"
+        );
+    }
+    panic!("daemon never became ready after {SPAWN_ATTEMPTS} attempts");
 }
 
 fn send_sighup(guard: &DaemonGuard) {
@@ -404,21 +440,15 @@ fn sighup_rebinds_dns_and_metrics_to_new_unprivileged_ports() {
     let config = dir.path().join("config.toml");
     let log = dir.path().join("daemon.log");
 
-    let (dns_old, metrics_old, doh) = (free_port(), free_port(), free_port());
-    write_config(&config, dns_old, metrics_old, doh);
-
-    let guard = spawn_daemon(&config, &log);
-
-    // Wait for both listeners to come up.
-    assert!(
-        wait_until(Duration::from_secs(10), || metrics_health_ok(metrics_old)),
-        "metrics listener never came up on {metrics_old}\nlog:\n{}",
-        read_log(&log)
-    );
-    assert!(
-        wait_until(Duration::from_secs(5), || dns_responds(dns_old)),
-        "DNS listener never answered on {dns_old}\nlog:\n{}",
-        read_log(&log)
+    // Bring the initial generation up (retrying fresh ports past a free_port
+    // steal, §5.2); both metrics and DNS must serve.
+    let (guard, (_dns_old, metrics_old, doh)) = spawn_with_retry(
+        || {
+            let (dns, metrics, doh) = (free_port(), free_port(), free_port());
+            write_config(&config, dns, metrics, doh);
+            (spawn_daemon(&config, &log), (dns, metrics, doh))
+        },
+        |&(dns, metrics, _doh)| metrics_health_ok(metrics) && dns_responds(dns),
     );
 
     // Rewrite the config with fresh ports and reload.
@@ -460,14 +490,14 @@ fn sighup_refuses_privileged_port_change_and_keeps_serving() {
     let config = dir.path().join("config.toml");
     let log = dir.path().join("daemon.log");
 
-    let (dns, metrics, doh) = (free_port(), free_port(), free_port());
-    write_config(&config, dns, metrics, doh);
-
-    let guard = spawn_daemon(&config, &log);
-    assert!(
-        wait_until(Duration::from_secs(10), || dns_responds(dns)),
-        "DNS listener never came up on {dns}\nlog:\n{}",
-        read_log(&log)
+    // Bring the initial generation up (retrying past a free_port steal, §5.2).
+    let (guard, (dns, metrics, doh)) = spawn_with_retry(
+        || {
+            let (dns, metrics, doh) = (free_port(), free_port(), free_port());
+            write_config(&config, dns, metrics, doh);
+            (spawn_daemon(&config, &log), (dns, metrics, doh))
+        },
+        |&(dns, _metrics, _doh)| dns_responds(dns),
     );
 
     // Change the DNS listener to a privileged port (:53). The daemon dropped
@@ -503,16 +533,15 @@ fn sighup_rebinds_doh_listener_to_new_unprivileged_port() {
     let config = dir.path().join("config.toml");
     let log = dir.path().join("daemon.log");
 
-    let (dns, metrics, doh_old) = (free_port(), free_port(), free_port());
-    write_config(&config, dns, metrics, doh_old);
-
-    let guard = spawn_daemon(&config, &log);
-
-    // DoH must come up on the original port (a `probe.mesh` GET returns 200).
-    assert!(
-        wait_until(Duration::from_secs(10), || doh_responds(doh_old)),
-        "DoH listener never came up on {doh_old}\nlog:\n{}",
-        read_log(&log)
+    // Bring the initial generation up (retrying past a free_port steal, §5.2);
+    // DoH must serve (a `probe.mesh` GET returns 200).
+    let (guard, (dns, metrics, doh_old)) = spawn_with_retry(
+        || {
+            let (dns, metrics, doh) = (free_port(), free_port(), free_port());
+            write_config(&config, dns, metrics, doh);
+            (spawn_daemon(&config, &log), (dns, metrics, doh))
+        },
+        |&(_dns, _metrics, doh)| doh_responds(doh),
     );
 
     // Move ONLY the DoH listener to a fresh port; DNS + metrics unchanged.
@@ -563,23 +592,20 @@ fn sighup_rotates_dot_cert_on_path_change() {
     let der_b = cert_pem_to_der(DOT_CERT_B);
     assert_ne!(der_a, der_b, "the two rotation test certs must differ");
 
-    let (dns, metrics, doh, dot) = (free_port(), free_port(), free_port(), free_port());
-    std::fs::write(
-        &config,
-        dot_config_body(dns, metrics, doh, dot, &cert_a, &key_a),
-    )
-    .unwrap();
-    set_mode_600(&config);
-
-    let guard = spawn_daemon(&config, &log);
-
+    // Bring the initial generation up (retrying past a free_port steal, §5.2);
     // DoT must come up presenting cert A.
-    assert!(
-        wait_until(Duration::from_secs(10), || dot_presented_leaf(dot)
-            .as_deref()
-            == Some(der_a.as_slice())),
-        "DoT listener never presented cert A on {dot}\nlog:\n{}",
-        read_log(&log)
+    let (guard, (dns, metrics, doh, dot)) = spawn_with_retry(
+        || {
+            let (dns, metrics, doh, dot) = (free_port(), free_port(), free_port(), free_port());
+            std::fs::write(
+                &config,
+                dot_config_body(dns, metrics, doh, dot, &cert_a, &key_a),
+            )
+            .unwrap();
+            set_mode_600(&config);
+            (spawn_daemon(&config, &log), (dns, metrics, doh, dot))
+        },
+        |&(_dns, _metrics, _doh, dot)| dot_presented_leaf(dot).as_deref() == Some(der_a.as_slice()),
     );
 
     // Rotate: repoint cert/key paths to B and reload. Only the TLS material
@@ -722,21 +748,20 @@ fn daemon_serves_doq_queries() {
     std::fs::write(&cert, DOT_CERT_A).unwrap();
     std::fs::write(&key, DOT_KEY_A).unwrap();
 
-    let (dns, metrics, doh, doq) = (free_port(), free_port(), free_port(), free_port());
-    std::fs::write(
-        &config,
-        doq_config_body(dns, metrics, doh, doq, &cert, &key),
-    )
-    .unwrap();
-    set_mode_600(&config);
-
-    let guard = spawn_daemon(&config, &log);
-
-    // DoQ must come up and answer a `probe.mesh` query over a real QUIC handshake.
-    assert!(
-        wait_until(Duration::from_secs(10), || doq_responds(doq)),
-        "DoQ listener never answered on {doq}\nlog:\n{}",
-        read_log(&log)
+    // Bring the daemon up (retrying past a free_port steal, §5.2); DoQ must
+    // answer a `probe.mesh` query over a real QUIC handshake.
+    let (guard, _ports) = spawn_with_retry(
+        || {
+            let (dns, metrics, doh, doq) = (free_port(), free_port(), free_port(), free_port());
+            std::fs::write(
+                &config,
+                doq_config_body(dns, metrics, doh, doq, &cert, &key),
+            )
+            .unwrap();
+            set_mode_600(&config);
+            (spawn_daemon(&config, &log), (dns, metrics, doh, doq))
+        },
+        |&(_dns, _metrics, _doh, doq)| doq_responds(doq),
     );
     drop(guard);
 }

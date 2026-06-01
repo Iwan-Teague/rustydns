@@ -137,15 +137,17 @@ posture (opt-in, same certificate, fail-closed when misconfigured).
   99-test `rustydnsd` suite (authority/blocklist/cname-cloak/response-IP/rewrite/
   safesearch/policy/block-window/group/NXDOMAIN-vs-NODATA/rate-limit/opcode)
   passes unchanged.
-- **5.2 🟡 `free_port()` race in integration tests** — `tests/sighup_reload.rs`
-  binds `:0`, reads the port, drops, then lets the daemon rebind. Tiny TOCTOU;
-  acceptable on loopback but could flake under heavy parallelism. The *bigger*
-  flake — the daemon doing real network I/O at startup (default StevenBlack
-  fetch + DoH bootstrap) and `dns_responds` resolving a public name with a 1.5s
-  timeout — is now **fixed**: the test runs the daemon fully offline (empty
-  blocklist, plain bare-IP upstream, a local `probe.mesh` static record), so it
-  is deterministic and ~7× faster. The residual `free_port` TOCTOU itself
-  remains (could pass the bound fd via socket activation, or retry on bind).
+- **5.2 ✅ `free_port()` race in integration tests — DONE.**
+  `tests/sighup_reload.rs` binds `:0`, reads the port, drops, then lets the
+  daemon rebind — a TOCTOU where a busy machine steals the port in the gap.
+  Because every bind error propagates out of `main`, a stolen port makes the
+  daemon **exit at bind**, so the new `spawn_with_retry` helper retries the
+  initial bring-up with fresh ports (up to `SPAWN_ATTEMPTS`); a clean spawn is
+  ~1 s, so retries are cheap. All five sighup tests route their initial spawn
+  through it. Verified: a full-workspace parallel run that previously failed
+  **0/5** sighup tests now passes **5/5** (385 total, 0 failures). (The earlier
+  *bigger* flake — real network I/O at startup — was already fixed by running
+  the daemon fully offline with a local `probe.mesh` static record.)
 
 (5.3 done: systematic `unwrap()/expect()` audit across all network/parser paths
 — no reachable panic on attacker-controlled input; query-log mutex locks now
