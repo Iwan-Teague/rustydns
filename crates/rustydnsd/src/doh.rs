@@ -32,6 +32,7 @@ use hickory_server::net::xfer::Protocol;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 
 use rustydns_core::RustyDnsError;
+use rustydns_core::client::ClientId;
 
 use crate::handler::DnsHandler;
 
@@ -133,7 +134,9 @@ async fn handle_dns_message(handler: Arc<DnsHandler>, src: SocketAddr, bytes: Ve
             // Form errors are a client problem — return HTTP 400 rather
             // than synthesise a DNS-format FormErr response (which
             // would require a parsed Header we don't have).
-            warn!(src = %src, error = %e, "malformed DNS-over-HTTPS request");
+            // PRIVACY: anonymise the client (never log a full client IP at
+            // info+); this path fires before the handler's own anonymisation.
+            warn!(client = %ClientId::from_ip(src.ip()).anonymized(), error = %e, "malformed DNS-over-HTTPS request");
             return bad_request("malformed DNS message");
         }
     };
