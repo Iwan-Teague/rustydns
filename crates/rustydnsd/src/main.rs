@@ -320,6 +320,15 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // systemd socket activation: adopt any sockets passed via LISTEN_FDS so the
+    // privileged :53/:853 binds can happen in systemd and the daemon never needs
+    // CAP_NET_BIND_SERVICE. Empty (→ normal binding below) for every
+    // non-socket-activated start.
+    let mut inherited =
+        listeners::InheritedSockets::from_env().context("failed to adopt LISTEN_FDS sockets")?;
+    if !inherited.is_empty() {
+        info!("systemd socket activation detected (LISTEN_FDS) — adopting passed sockets");
+    }
     let dns_server = listeners::build_dns_server(
         handler.clone(),
         &listen_addrs,
@@ -327,8 +336,17 @@ async fn main() -> Result<()> {
         initial_tls,
         doq_addr,
         initial_doq_tls,
+        &mut inherited,
     )
     .context("failed to bind DNS listeners")?;
+    if inherited.remaining() > 0 {
+        warn!(
+            unmatched = inherited.remaining(),
+            "systemd passed socket(s) whose address matches no configured listener — \
+             check that the .socket unit's Listen directives match server.listen / \
+             dot_listen / doq_listen. Those sockets will receive no queries."
+        );
+    }
     for addr in &listen_addrs {
         info!(listen = %addr, "listening for DNS queries (UDP+TCP)");
     }
@@ -353,6 +371,11 @@ async fn main() -> Result<()> {
     // Under systemd this is belt-and-braces (the unit already pins the
     // capability bounding set). For non-systemd deployments (Docker,
     // runit, OpenRC) this is the only enforcement.
+    //
+    // Under **socket activation** the privileged sockets were bound by
+    // systemd and adopted above (LISTEN_FDS), so the daemon never needed
+    // CAP_NET_BIND_SERVICE in the first place — the `.socket` unit lets the
+    // `.service` run with an empty capability set (roadmap §7.1).
     //
     // Non-fatal: a failure to drop is logged at warn! and the daemon
     // continues. The systemd-level bounding set is the primary defence
@@ -874,6 +897,10 @@ impl ActiveListeners {
             None
         };
 
+        // Reload always binds fresh: inherited (socket-activated) fds are
+        // adopted once, at startup. A live rebind here only ever targets
+        // unprivileged ports (privileged ones are restart-required), so an
+        // empty inherited set is correct.
         match listeners::build_dns_server(
             self.handler.clone(),
             &new_listen,
@@ -881,6 +908,7 @@ impl ActiveListeners {
             tls,
             new_doq,
             doq_tls,
+            &mut listeners::InheritedSockets::empty(),
         ) {
             Ok(new_server) => {
                 let old = self.dns_server.replace(new_server);

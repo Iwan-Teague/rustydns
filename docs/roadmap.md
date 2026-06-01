@@ -95,7 +95,12 @@ A few fields remain restart-only **by design**, not for lack of work:
   capability-discipline invariant working as intended (AGENTS.md). A change
   to such a listener is detected on reload and logged as restart-required.
   Deployments that need live DNS/DoT/DoQ listener changes can bind unprivileged
-  ports and port-map at the orchestrator/firewall layer.
+  ports and port-map at the orchestrator/firewall layer. **Note:** with systemd
+  **socket activation** (`install/rustydns.socket`) the privileged binds happen
+  in systemd and the daemon needs *no* `CAP_NET_BIND_SERVICE` at all — it adopts
+  the passed sockets at startup (`listeners::InheritedSockets`). A privileged
+  listener change is still applied by restarting the unit (systemd re-binds),
+  which is the intended lifecycle for socket-activated sockets.
 - **Blocklist *source list*** — the loader + engine are built once at startup
   (SIGHUP still re-fetches content from the *current* sources).
 - **On-disk query log** path/toggle — the writer task + file handle are bound

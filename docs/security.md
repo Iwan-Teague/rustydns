@@ -366,6 +366,17 @@ The systemd unit (see `install/rustydns.service`) uses `AmbientCapabilities=CAP_
 and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` to ensure no other capability is ever
 available to the process, and runs the daemon as an unprivileged `rustydns` user.
 
+**Zero-capability mode via socket activation.** With the optional
+`install/rustydns.socket` unit, *systemd* binds the privileged sockets and
+passes them to the daemon as already-bound file descriptors (`LISTEN_FDS`). The
+daemon adopts them at startup (`listeners::InheritedSockets`) instead of binding,
+so it never needs `CAP_NET_BIND_SERVICE` at all — a `.service` drop-in can set
+`AmbientCapabilities=` and `CapabilityBoundingSet=` to empty. The fd adoption is
+handled by the `listenfd` crate (the only place the otherwise-forbidden `unsafe`
+`FromRawFd` lives); a passed socket whose bound address does not match any
+configured listener is logged at startup. This is opt-in: with no `LISTEN_FDS`
+the daemon self-binds exactly as before.
+
 For deployments without systemd, the binary drops capabilities in-process after
 binding its sockets via the `caps` crate (Linux-only; no-op on other targets).
 The runtime call clears **every** capability set — Effective, Permitted,

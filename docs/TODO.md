@@ -156,17 +156,30 @@ matrix added to `docs/operator-endpoints.md`.)
 
 ## 7. Future / larger design items
 
-- **7.1 ⚪ Privileged-port live reload via socket activation** — the one gap in
-  SIGHUP Phase 2 is that `:53`/`:853` can't be rebound after the capability
-  drop. systemd **socket activation** (`LISTEN_FDS`) would let systemd own the
-  privileged sockets and pass the fds in, so the daemon never needs
-  `CAP_NET_BIND_SERVICE` *and* could receive fresh fds on reload — closing the
-  gap without weakening the capability posture. Needs a design pass + a
-  non-systemd story. See `docs/design-sighup-reload.md`. **Left flagged (no
-  clean drop-in):** this is a from-scratch implementation (parse
-  `LISTEN_FDS`/`LISTEN_PID`, adopt pre-bound fds into the listener setup, ship a
-  `.socket` unit, and design a non-systemd fallback) — not a library feature
-  that can be wired in safely without that design pass. Deferred deliberately.
+- **7.1 ✅ systemd socket activation (`LISTEN_FDS`) — DONE.** The daemon now
+  adopts sockets passed by systemd socket activation, so systemd can own the
+  privileged `:53`/`:853` binds and the daemon needs **no
+  `CAP_NET_BIND_SERVICE` at all** — closing the one residual gap in the
+  capability posture.
+  - **Where:** `listeners::InheritedSockets` (`from_env` adopts every
+    `LISTEN_FDS` socket, probing TCP-then-UDP and tagging each by its bound
+    address); `build_dns_server` adopts a passed socket whose address + type
+    matches a configured listener, else binds fresh. The single `unsafe`
+    `FromRawFd` lives in the `listenfd` crate, so rustydnsd stays
+    `#![forbid(unsafe_code)]`.
+  - **Strictly additive:** when `LISTEN_FDS` is unset (Docker, bare binary,
+    `cargo run`, tests) the inherited set is empty and binding is unchanged. A
+    SIGHUP reload always binds fresh (passed fds are adopted once, at startup;
+    privileged-port reload remains restart-only).
+  - **Non-systemd story:** there is nothing to do — socket activation is opt-in
+    via the `.socket` unit; every other init system / container runtime keeps
+    the existing self-bind + ambient-capability path.
+  - **Packaging:** `install/rustydns.socket` (privileged binds in systemd; a
+    `.service` drop-in then sets `AmbientCapabilities=` /
+    `CapabilityBoundingSet=` empty). Unmatched passed sockets are warned about
+    at startup. Unit-tested: address/type matching, consumption, and the
+    no-`LISTEN_FDS` empty path (`listeners::tests`); full fd-passing is verified
+    manually with `systemd-socket-activate` (documented).
 - **7.2 ✅ Per-qtype / per-rcode metrics — DONE.** Added
   `rustydns_dns_queries_by_qtype_total{qtype}` (incremented at the query-receipt
   choke point) and `rustydns_dns_responses_by_rcode_total{rcode}` (incremented in

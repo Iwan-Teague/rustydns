@@ -37,6 +37,7 @@ base64             = { workspace = true }
 ahash              = { workspace = true }
 arc-swap           = { workspace = true }
 socket2            = { workspace = true }
+listenfd           = { workspace = true }
 rustls-pki-types = { workspace = true }
 
 # Capability dropping is Linux-only. On other targets `drop_capabilities`

@@ -86,10 +86,21 @@ A change to a listener on a privileged port, or to blocklist *sources* / the
 on-disk query log, is detected and logged as restart-required
 (`restart_required_changes` covers the latter two). See roadmap.md §3.
 
+Under **systemd socket activation** (`install/rustydns.socket`) the privileged
+binds happen in systemd and the daemon adopts the passed fds at startup
+(`listeners::InheritedSockets`), so it needs no `CAP_NET_BIND_SERVICE`. Reload
+still binds fresh — inherited fds are adopted once, at startup — so a
+privileged-port change remains a restart (systemd re-binds and re-passes), which
+is the intended lifecycle for socket-activated sockets.
+
 ### Tests
 
-- `listeners.rs`: `is_privileged` / `all_unprivileged` classification, and
-  `SO_REUSEPORT` proving two binds on the same live port succeed (TCP + UDP).
+- `listeners.rs`: `is_privileged` / `all_unprivileged` classification;
+  `SO_REUSEPORT` proving two binds on the same live port succeed (TCP + UDP);
+  and socket activation — an inherited UDP/TCP socket is adopted by matching
+  bound address (and consumed), a non-matching address falls through to a fresh
+  bind, and `from_env` with no `LISTEN_FDS` yields an empty set. Full fd-passing
+  is verified manually with `systemd-socket-activate`.
 - `main.rs`: `restart_required_changes` now only flags blocklist/query-log
   fields (listener/metrics handled by the reconciler).
 - Verified end-to-end: a SIGHUP that moves the DNS + metrics ports rebinds the

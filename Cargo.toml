@@ -66,6 +66,13 @@ arc-swap = "1"
 # Low-level socket options (SO_REUSEPORT) for zero-drop listener handover
 socket2 = { version = "0.6", features = ["all"] }
 
+# systemd socket activation: adopt LISTEN_FDS-passed sockets so systemd can own
+# the privileged :53/:853 binds and the daemon needs NO CAP_NET_BIND_SERVICE.
+# `listenfd` encapsulates the single `FromRawFd` so our crates stay
+# `#![forbid(unsafe_code)]`. When LISTEN_FDS is unset (every non-systemd
+# deployment) it yields an empty set and we bind normally.
+listenfd = "1"
+
 # Fast, DoS-resistant hashing (randomised seed per process)
 ahash = "0.8"
 

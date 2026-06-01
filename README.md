@@ -251,6 +251,7 @@ For a detailed description of each component, see [`docs/architecture.md`](docs/
 - **RPZ passthru injection protection** — untrusted blocklist sources cannot inject allowlist entries
 - **`panic = "abort"`** in release builds — no unwinding machinery
 - **Systemd hardening** — `MemoryDenyWriteExecute`, `ProtectSystem=strict`, `NoNewPrivileges`, minimal capabilities
+- **Optional socket activation** (`install/rustydns.socket`) — systemd binds `:53`/`:853` and passes the fds in, so the daemon runs with **zero** capabilities
 - **Config file permission check** at startup — world-readable config is a hard error
 - **`deny_unknown_fields`** on config structs — typos that would silently disable security options are caught at startup
 
@@ -303,7 +304,8 @@ rustydns/
 │   ├── workflows/ci.yml          # fmt + clippy + test + release-build + cargo-deny + docker smoke
 │   └── dependabot.yml            # Weekly cargo + actions updates
 ├── install/
-│   └── rustydns.service          # Systemd unit with kernel hardening
+│   ├── rustydns.service          # Systemd unit with kernel hardening
+│   └── rustydns.socket           # Optional socket activation (zero-capability binds)
 └── scripts/
     └── install.sh                # Installation script
 ```

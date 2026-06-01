@@ -40,6 +40,11 @@ StartLimitBurst=5
 # ---------------------------------------------------------------------------
 # Privilege hardening
 # Bind port 53/853 via ambient capability; all other capabilities are removed.
+#
+# For the tightest posture, use socket activation (install/rustydns.socket):
+# systemd binds the privileged ports and passes the fds in, so the daemon needs
+# NO capability at all — set both lines below to empty in a drop-in. See the
+# header of rustydns.socket and docs/operator-endpoints.md.
 # ---------------------------------------------------------------------------
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE

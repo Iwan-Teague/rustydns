@@ -1,0 +1,57 @@
+# rustydns systemd socket unit (OPTIONAL — socket activation)
+# ─────────────────────────────────────────────────────────────────────────────
+# With this unit, *systemd* binds the listening sockets (including the
+# privileged :53 / :853) and passes them to rustydnsd as already-bound file
+# descriptors (LISTEN_FDS). The daemon adopts them instead of binding, so it
+# needs NO CAP_NET_BIND_SERVICE at all — closing the one residual gap in the
+# capability posture (roadmap §7.1). This is OPTIONAL hardening; the default
+# rustydns.service binds directly using an ambient capability and does not need
+# this unit.
+#
+# Enable (socket-activated mode):
+#   1. Install both units:
+#        cp install/rustydns.service /etc/systemd/system/
+#        cp install/rustydns.socket  /etc/systemd/system/
+#   2. Tell the service to consume the passed sockets and run capability-free,
+#      via a drop-in (so the shipped .service stays the non-activated default):
+#        systemctl edit rustydns.service
+#      and add:
+#        [Unit]
+#        Requires=rustydns.socket
+#        After=rustydns.socket
+#        [Service]
+#        # Privileged binds now happen in systemd — drop the capability entirely.
+#        AmbientCapabilities=
+#        CapabilityBoundingSet=
+#   3. systemctl daemon-reload && systemctl enable --now rustydns.socket rustydns.service
+#
+# The Listen directives below MUST match the daemon's configured listen
+# addresses (server.listen / server.dot_listen / server.doq_listen) exactly —
+# rustydnsd matches passed sockets to listeners by bound address + type, and
+# warns about any passed socket that matches no configured listener.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[Unit]
+Description=rustydns DNS listening sockets (socket activation)
+Documentation=https://github.com/Iwan-Teague/rustydns
+
+[Socket]
+Service=rustydns.service
+
+# Plain DNS on :53 — UDP (ListenDatagram) and TCP (ListenStream).
+ListenDatagram=0.0.0.0:53
+ListenStream=0.0.0.0:53
+
+# DNS-over-TLS on :853 (TCP) — uncomment if server.dot_listen is set.
+# ListenStream=0.0.0.0:853
+
+# DNS-over-QUIC on :853 (UDP) — uncomment if server.doq_listen is set.
+# ListenDatagram=0.0.0.0:853
+
+# Set SO_REUSEPORT on the systemd-bound sockets. Harmless for the privileged
+# ports (which are restart-only anyway) and required if you want SIGHUP live
+# rebinds to work for any socket-activated UNPRIVILEGED listener.
+ReusePort=true
+
+# Do NOT set Accept=yes: rustydnsd wants the listening socket itself, not one
+# spawned process per connection (the default, Accept=no, is correct).
