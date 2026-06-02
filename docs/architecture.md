@@ -22,6 +22,18 @@ Security, privacy, and anonymity are first-class design constraints — not feat
          │ admit
          ▼
   ┌─────────────┐
+  │   Opcode /  │  — non-Query opcode or non-IN class → NOTIMP
+  │   Class     │    (early rejection before pipeline work)
+  └──────┬──────┘
+         │ Query/IN
+         ▼
+  ┌─────────────┐
+  │  Schedule / │  — active block window? → REFUSED (policy)
+  │  Zones      │    name outside zones_allowed? → REFUSED (policy)
+  └──────┬──────┘
+         │ pass
+         ▼
+  ┌─────────────┐
   │  Authority  │  — mesh zone or static zone hit?
   │   (cache)   │    yes → answer immediately (NOERROR or NXDOMAIN)
   └──────┬──────┘    mesh records are NEVER blocked — authority wins
@@ -40,12 +52,12 @@ Security, privacy, and anonymity are first-class design constraints — not feat
          │ pass
          ▼
   ┌─────────────┐
-  │  Resolver   │  — DoH/DoQ upstream only (plaintext is explicit opt-in)
+  │  Resolver   │  — DoH/DoQ/ODoH upstream (plaintext is opt-in)
   │  + cache    │    fail_closed=true → SERVFAIL if all upstreams fail
   └─────────────┘    (there is no stale-answer fallback mode)
 ```
 
-**Pipeline order is an invariant.** Rate-limit before authority; authority before rewrite; rewrite before blocklist; blocklist before resolver. This order must never change. The rate limiter runs first so that a flood of malformed queries from one source IP costs only an `AHashMap` lookup + token-bucket update. Rewrites sit after the authority (so the daemon's own zones always win) and before the blocklist/resolver (so an operator pin/blackhole takes precedence over a list and never leaks upstream).
+**Pipeline order is an invariant.** The full gate sequence is: rate-limit → opcode/class → schedule/zones → authority → rewrite → blocklist → resolver. This order must never change. The rate limiter runs first so a flood from one source IP costs only a hash lookup + token-bucket update. The opcode/class gates reject malformed requests immediately. The policy gates (schedule block windows, zones_allowed) run before the authority so quarantined clients never even probe the resolver. Rewrites sit after the authority (so the daemon's own zones always win) and before the blocklist/resolver (so an operator pin/blackhole takes precedence). Each gate is a named method on `DnsHandler` returning `Option<Reply>`; the first to fire wins.
 
 ## Crate responsibilities
 
@@ -86,8 +98,9 @@ Recursive resolver forwarding to upstream servers using DoH (default) or DoQ. Pr
 | Fail-closed (SERVFAIL, no stale fallback) | — | ✓ implemented (`upstream.fail_closed`) |
 | Conditional forwarding (per-zone routes) | — | ✓ implemented (`[[upstream.routes]]`) |
 | DNS-rebinding defence (drop private rdata) | — | ✓ implemented (`upstream.block_private_rdata`, default off) |
-| Query Name Minimisation | RFC 7816 | ⏳ pending (hickory 0.26 still doesn't expose qmin) |
-| DoH query/response padding | RFC 8467 | ⏳ pending (hickory 0.26 still doesn't expose RFC 8467) |
+| DNS 0x20 query-name case randomisation | — | ✓ implemented — auto-enabled for **plain UDP** upstreams only; off for DoH/DoQ (TLS already authenticates). Forces off-path spoofers to also guess case bits. A case-mismatch → SERVFAIL (fail-closed). |
+| Query Name Minimisation | RFC 7816 | ⏳ pending — hickory 0.26 doesn't expose qmin yet; startup warns; will be adopted automatically when hickory exposes the knob |
+| DoH/DoQ query padding | RFC 8467 | ⏳ pending — hickory 0.26 `DnsRequestOptions` has no padding field yet; startup warns. **Already applied on the ODoH arm** (odoh-rs pads the oblivious plaintext to 128-byte blocks). |
 | Oblivious DoH (target never learns client IP) | RFC 9230 | ✓ implemented — `upstream.protocol = "odoh"` + `upstream.odoh_proxies` (one relay chosen at random per query); HPKE via `odoh-rs`. Fail-closed (never falls back to plain DoH); recovers from target key rotation; **optional client-side DNSSEC** (`dnssec_validation = true` wraps the oblivious handle in hickory's validator, chain lookups also oblivious, BOGUS → SERVFAIL). See `docs/roadmap.md` §ODoH and `crates/rustydns-resolver/src/odoh.rs` |
 
 **There is no stale-answer mode.** When `fail_closed = true` (the default), a failure of all upstreams returns `SERVFAIL`. Returning a stale answer without indicating staleness is a silent privacy degradation — a client might rely on that answer for a domain that has since changed, or the cached answer may have been for a different client's query.

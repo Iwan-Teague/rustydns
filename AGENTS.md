@@ -12,19 +12,23 @@ This file is the entry point for any AI agent or automated tool working in this 
 
 **Milestones 1–4 feature-complete.** All five crates ship; `rustydnsd` runs
 end-to-end on UDP, TCP, DoT, DoQ, and DoH with the full privacy posture (TLS 1.3 floor,
-DNSSEC, ECS strip, randomised upstream selection, fail-closed). The mesh-zone
-bundle is hot-reloaded via `ArcSwap`, the authority chases intra-zone CNAME
-chains (RFC 1034 §3.6.2), the daemon drops Linux capabilities in-process and
-sets `umask(0o077)`, and three independent deployment paths are documented
-(systemd, bare binary, Docker).
+DNSSEC, ECS strip, randomised upstream selection, fail-closed, ODoH, DNS 0x20
+anti-spoofing). The mesh-zone bundle is hot-reloaded via `ArcSwap`, the authority
+chases intra-zone CNAME chains (RFC 1034 §3.6.2), the daemon drops Linux
+capabilities in-process and sets `umask(0o077)`, and three independent deployment
+paths are documented (systemd / systemd socket activation / bare binary / Docker).
+SIGHUP live-reloads upstream config and hot-rebinds unprivileged listeners
+zero-drop via `SO_REUSEPORT`. Filter features: deep CNAME-chain blocking,
+DNS rewrites/local cloaking, response-IP denylist, Safe Search enforcement,
+scheduled block windows, per-client blocklist groups, regex block rules.
 
 | Surface | Status |
 |---------|--------|
 | `crates/rustydns-core`      | ✅ config (`validate_config` with ~30 rejection branches), error, record, client types |
-| `crates/rustydns-blocklist` | ✅ engine, parser (hosts/plain/RPZ/AdGuard auto-detect), allowlist with TLD-guard |
+| `crates/rustydns-blocklist` | ✅ engine, parser (hosts/plain/RPZ/AdGuard auto-detect), allowlist with TLD-guard, CNAME-chain blocking, response-IP denylist, safe search, scheduled windows, per-client groups, regex rules |
 | `crates/rustydns-authority` | ✅ static zones + signed Rustynet mesh bundle + intra-zone CNAME chasing |
-| `crates/rustydns-resolver`  | ✅ DoH/DoQ/plain upstream, TLS 1.3 floor, DNSSEC, fail-closed, randomised selection |
-| `crates/rustydnsd`          | ✅ UDP/TCP/DoT/DoQ/DoH listeners, `/metrics` `/health` `/queries`, query-log ring buffer, per-client policy, bounded graceful shutdown, capability drop, umask |
+| `crates/rustydns-resolver`  | ✅ DoH/DoQ/ODoH/plain upstream, TLS 1.3 floor, DNSSEC, fail-closed, randomised selection, DNS 0x20, optional client-side DNSSEC over ODoH |
+| `crates/rustydnsd`          | ✅ UDP/TCP/DoT/DoQ/DoH listeners, systemd socket activation, SIGHUP zero-drop reload, `/metrics` `/health` `/queries`, disk+ring query log, per-client policy (IP-keyed), rate limiting, per-qtype/rcode metrics, bounded graceful shutdown, capability drop, umask |
 
 Doc surfaces:
 

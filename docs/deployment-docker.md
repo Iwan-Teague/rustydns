@@ -18,8 +18,10 @@ $EDITOR rustydns.toml
 docker compose up -d
 ```
 
-Then point a client at the host on port 53 (UDP/TCP), 853 (DoT over TCP and/or
-DoQ over UDP), or 8053 (DoH).
+Then point a client at the host on port 53 (UDP/TCP), 853 TCP (DoT),
+853 UDP (DoQ — opt-in, see compose port comment), or 8053 TCP (DoH).
+DoT and DoQ share a port number but use different transport protocols (TCP vs UDP)
+and therefore different sockets — they can both be enabled simultaneously.
 
 ## Image layout
 

@@ -145,7 +145,7 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Tests
 
-- 130+ tests across 5 crates: blocklist parser, allowlist, engine,
+- 386 tests across 5 crates: blocklist parser, allowlist, engine,
   authority static + mesh, mesh signature paths, resolver record
   conversion, config validation (every rejection branch), handler
   e2e via UDP/TCP, DoH GET/POST, query log, policy enforcement,
@@ -207,26 +207,88 @@ See `docs/operator-endpoints.md` for the full reference.
   backend and runs `rustydnsd --version` inside it, catching
   Dockerfile regressions on PR.
 
-### Added
+### Added (listeners)
 
-- **DNS-over-TLS listener** (`server.dot_listen`). Now wired
-  end-to-end with hickory-server 0.26's
-  `register_tls_listener_with_tls_config`. Requires
-  `server.tls_cert_path` and `server.tls_key_path`; validation in
+- **DNS-over-TLS listener** (`server.dot_listen`). Wired end-to-end
+  with hickory-server 0.26's `register_tls_listener_with_tls_config`.
+  Requires `server.tls_cert_path` and `server.tls_key_path`;
   `validate_config` rejects `dot_listen` without both.
+- **DNS-over-QUIC listener** (`server.doq_listen`, RFC 9250). QUIC over
+  UDP; shares the same cert as DoT. The TLS config carries the `doq` ALPN
+  (separate from the no-ALPN DoT config). A real `quinn`-based e2e test
+  proves the handshake end-to-end.
+- **Inbound DoH listener** (`server.doh_listen`). HTTP/2 axum server on
+  loopback; TLS termination is the reverse-proxy's job.
+
+### Added (upstream protocols)
+
+- **Oblivious DoH** (`upstream.protocol = "odoh"`, RFC 9230). The flagship
+  anonymity feature: queries are HPKE-encrypted to the target and relayed
+  through an oblivious proxy, so the proxy sees the client IP but not the
+  query, and the target sees the query but not the client IP. Fail-closed
+  (never falls back to plain DoH). Key-rotation recovery. Multi-relay with
+  per-query random selection. Optional client-side DNSSEC (chain lookups
+  also travel obliviously; BOGUS → SERVFAIL). RFC 8467 padding applied
+  on the oblivious plaintext (128-byte blocks via odoh-rs).
+- **DNS 0x20 case randomisation** (plain UDP only). Auto-enabled for
+  `upstream.protocol = "plain"` to defend against off-path spoofing and
+  cache poisoning. Off for DoH/DoQ (TLS already authenticates). A
+  case-mismatch → SERVFAIL (fail-closed).
+
+### Added (daemon hardening)
+
+- **SIGHUP live reload Phase 1+2**. Phase 1: hot-swaps upstream resolver,
+  policy table, rate limiter, rewrite map, blocklist content atomically
+  via `ArcSwap`. Phase 2: zero-drop live rebind of changed listeners on
+  unprivileged ports (DNS UDP/TCP, DoT, DoQ, DoH, metrics) via
+  `SO_REUSEPORT`. Privileged-port changes detected and logged as
+  restart-required.
+- **Systemd socket activation** (`install/rustydns.socket`). systemd binds
+  the privileged `:53`/`:853` sockets and passes them in via `LISTEN_FDS`;
+  the daemon adopts them with `InheritedSockets` and needs no
+  `CAP_NET_BIND_SERVICE` at all. A `.service` drop-in can set
+  `AmbientCapabilities=` to empty. Strictly additive — non-socket-activated
+  starts (Docker, bare binary) bind normally.
+- **Disk query log** (`privacy.query_log_to_disk`). Opt-in NDJSON writer
+  with file rotation (`max_file_bytes`, `max_files`), mode-0600 creation,
+  and world-readable rejection at startup. Stores only hashed qname +
+  anonymised client — same privacy posture as the ring buffer.
+- **DNS rebinding defence** (`upstream.block_private_rdata`). Strips
+  private/loopback/link-local A/AAAA rdata from default-arm upstream
+  responses. Route and authority responses are never filtered.
+- **Per-source-IP rate limiting** (`[rate_limit]`). Token bucket,
+  loopback exempt, bounded LRU table, REFUSED on excess.
+- **Per-client blocklist groups** (`[[blocklist.groups]]`). Named sets of
+  sources; clients assigned via `[[policy]].blocklist_group`.
+- **Deep CNAME-chain blocking** (`blocklist.block_cname_cloaking`). Blocks
+  the whole response if any CNAME target is on the blocklist.
+- **Response-IP denylist** (`blocklist.response_ip_denylist`). CIDR-based.
+- **Safe Search enforcement** (`[safesearch]`). Rewrites A/AAAA for Google,
+  Bing, DuckDuckGo, YouTube to their safe-search endpoints.
+- **Scheduled block windows** (`[[policy]].block_windows`). Time-of-day
+  restrictions per client; active windows refuse all queries before the
+  pipeline.
+- **Regex custom block rules** (`[[blocklist.regex_rules]]`). ReDoS-guarded
+  via the `regex` crate (linear-time finite automata, no catastrophic
+  backtracking).
+- **Per-qtype / per-rcode Prometheus metrics**.
+  `rustydns_dns_queries_by_qtype_total` and
+  `rustydns_dns_responses_by_rcode_total` with bounded label cardinality.
 
 ### Known deferrals
 
-The full, structured list of unfinished work lives in
-[`docs/roadmap.md`](docs/roadmap.md) — single source of truth for
-upstream-blocked items (hickory 0.26: RFC 7816 qmin, RFC 8467 padding),
-sibling-blocked items (Rustynet peer-table → NodeId-keyed policy
-matching), unstarted features (`query_log_to_disk`, SIGHUP full-config
-reload, DNS rebinding defence, per-client rate limiting), test
-coverage gaps, and maintenance items.
+The full, structured list is in [`docs/roadmap.md`](docs/roadmap.md). Only
+three items remain genuinely blocked — all on external code:
 
-For each pending item rustydnsd today either emits an explicit
-startup `tracing::warn!` (qmin/padding, NodeId-only policy,
-`query_log_to_disk`) or surfaces the limitation in the relevant
-crate-level doc, so an operator running with that flag set never
-silently believes the feature is active.
+- **RFC 7816 query name minimisation** — hickory 0.26 doesn't expose a
+  qmin knob yet. Scaffolded + startup warning. Adopts automatically when
+  hickory ships it.
+- **RFC 8467 DoH/DoQ body padding** — hickory 0.26's `DnsRequestOptions`
+  has no padding field. Scaffolded + startup warning. (Already applied on
+  the ODoH arm via odoh-rs.) Adopts automatically when hickory ships it.
+- **NodeId-keyed policy matching** — `node_id` in `[[policy]]` is parsed
+  and validated but inert; wiring requires `rustynetd` to expose a
+  `SocketAddr → NodeId` peer-table lookup at query time.
+
+All other features previously listed here as "unstarted" are now fully
+shipped and tested.

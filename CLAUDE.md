@@ -8,7 +8,7 @@ historical footguns worth remembering even though they no longer fire.
 
 **Production-ready. Milestones 1–4 feature-complete.** All five crates ship,
 the daemon runs end-to-end on UDP/TCP/DoT/DoQ/DoH with the full privacy posture,
-~380 tests pass in CI, and three deployment paths (systemd / bare binary /
+~386 tests pass in CI, and three deployment paths (systemd / systemd socket activation / bare binary /
 Docker) are documented and verified. Your tasks now are typically:
 
 - Operator-visible improvements (validation tightening, startup warnings,

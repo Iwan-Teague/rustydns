@@ -220,23 +220,35 @@ For a detailed description of each component, see [`docs/architecture.md`](docs/
 
 | Feature                                  | Status                                  | RFC       |
 |------------------------------------------|-----------------------------------------|-----------|
-| DNS-over-HTTPS upstream                  | Implemented                             | RFC 8484  |
-| DNS-over-QUIC upstream                   | Implemented (via hickory `quic-ring`)   | RFC 9250  |
+| DNS-over-HTTPS upstream                  | Implemented (`upstream.protocol = "doh"`) | RFC 8484 |
+| DNS-over-QUIC upstream                   | Implemented (`upstream.protocol = "doq"`, hickory `quic-ring`) | RFC 9250 |
+| Oblivious DoH upstream                   | Implemented (`upstream.protocol = "odoh"` + `upstream.odoh_proxies`); HPKE via `odoh-rs`; fail-closed; optional client-side DNSSEC | RFC 9230 |
 | DNS-over-TLS listener                    | Implemented (`server.dot_listen`)       | RFC 7858  |
 | DNS-over-QUIC listener                   | Implemented (`server.doq_listen`)       | RFC 9250  |
 | DNS-over-HTTPS listener                  | Implemented (`server.doh_listen`)       | RFC 8484  |
 | TLS 1.3 floor for upstreams              | Implemented (`upstream.min_tls_version`)| RFC 8446  |
 | EDNS0 Client Subnet stripping            | Implemented (never set on upstreams)    | RFC 7871  |
 | DNSSEC validation                        | Implemented (`upstream.dnssec_validation`) | RFC 4033 |
+| DNS 0x20 anti-spoofing                   | Implemented (auto-enabled for plain UDP upstreams; off for DoH/DoQ) | — |
 | Randomised upstream selection            | Implemented (`upstream.randomize_upstream_selection`) | — |
 | Fail-closed on upstream failure          | Implemented (`upstream.fail_closed`)    | —         |
 | Conditional forwarding (per-zone routes) | Implemented (`[[upstream.routes]]`)     | —         |
 | DNS-rebinding defence (drop private rdata) | Implemented (`upstream.block_private_rdata`, default off) | — |
+| Deep CNAME-chain blocking                | Implemented (`blocklist.block_cname_cloaking`) | — |
+| Response-IP denylist                     | Implemented (`blocklist.response_ip_denylist`) | — |
+| Safe Search enforcement                  | Implemented (`[safesearch]`)            | —         |
+| Scheduled block windows                  | Implemented (`[[policy]].block_windows`) | —        |
+| Per-client blocklist groups              | Implemented (`[[blocklist.groups]]`)    | —         |
+| Regex block rules (ReDoS-guarded)        | Implemented (`[[blocklist.regex_rules]]`) | —       |
 | Per-source-IP rate limiting              | Implemented (`[rate_limit]`, default on; loopback exempt) | — |
+| Systemd socket activation                | Implemented (`install/rustydns.socket`); zero-capability mode | — |
+| SIGHUP live reload (zero-drop)           | Implemented (unprivileged listeners rebind via `SO_REUSEPORT`) | — |
 | Client IP anonymisation (/16 IPv4, /64 IPv6) | Implemented                         | —         |
-| In-memory query log (hashed qname, anonymised client) | Implemented                | —         |
-| Query Name Minimisation                  | Pending (hickory 0.26 doesn't expose)   | RFC 7816  |
-| Query/response padding                   | Pending (hickory 0.26 doesn't expose)   | RFC 8467  |
+| In-memory query log (hashed qname, anonymised client) | Implemented            | —         |
+| Disk query log (hashed, anonymised, rotating) | Implemented (`privacy.query_log_to_disk`) | — |
+| Per-qtype / per-rcode Prometheus metrics | Implemented (bounded label cardinality) | —        |
+| Query Name Minimisation                  | Pending — hickory 0.26 doesn't expose qmin yet; startup warns | RFC 7816 |
+| DoH/DoQ body padding                     | Pending — hickory 0.26 doesn't expose RFC 8467 yet; startup warns. ODoH arm already pads. | RFC 8467 |
 
 ---
 

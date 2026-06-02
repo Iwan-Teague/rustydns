@@ -106,3 +106,10 @@ is the intended lifecycle for socket-activated sockets.
 - Verified end-to-end: a SIGHUP that moves the DNS + metrics ports rebinds the
   new ports, drains the old generation cleanly, and refuses (with a clear warn)
   a change to a privileged port while keeping the old listeners serving.
+- **Integration test reliability.** `tests/sighup_reload.rs` uses a
+  `spawn_with_retry` helper that retries daemon bring-up with freshly allocated
+  ports if the daemon doesn't come up within the poll window. This defeats the
+  `free_port()` TOCTOU race (§5.2): a stolen port causes the whole daemon to
+  exit at bind, so retrying with new ports recovers cleanly. All five sighup
+  tests route their initial spawn through it, making the full parallel
+  `cargo test --workspace` run reliably green.

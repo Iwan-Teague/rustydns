@@ -688,7 +688,7 @@ Complete this checklist before putting RustyDNS on a network.
 
 ### Binary and Installation
 
-- [ ] Binary installed at `/usr/local/bin/rustydns` with mode `750` (not 755)
+- [ ] Binary installed at `/usr/local/bin/rustydnsd` with mode `750` (not 755)
 - [ ] Binary owned by `root:rustydns`
 - [ ] Binary checksum verified against a release signature (when releases are tagged)
 
@@ -719,7 +719,7 @@ Complete this checklist before putting RustyDNS on a network.
 
 ### Systemd Unit
 
-- [ ] Systemd unit installed: `systemctl enable --now rustydns`
+- [ ] Systemd unit installed: `systemctl enable --now rustydnsd`
 - [ ] Unit runs as `User=rustydns` (not root)
 - [ ] `MemoryDenyWriteExecute=yes` is present in the unit
 - [ ] `ProtectSystem=strict` is present in the unit
