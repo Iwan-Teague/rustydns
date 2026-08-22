@@ -2016,6 +2016,169 @@ mod tests {
         );
     }
 
+    /// Minimal [`ResponseHandler`] that records every encoded reply so a test
+    /// can drive `handle_request` directly without a live socket.
+    #[derive(Clone)]
+    struct CapturingHandler {
+        responses: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl hickory_server::server::ResponseHandler for CapturingHandler {
+        async fn send_response<'a>(
+            &mut self,
+            response: hickory_server::zone_handler::MessageResponse<
+                '_,
+                'a,
+                impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+                impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+                impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+                impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+            >,
+        ) -> Result<hickory_server::server::ResponseInfo, hickory_server::net::NetError> {
+            let mut buffer = Vec::with_capacity(512);
+            let mut encoder = hickory_proto::serialize::binary::BinEncoder::new(&mut buffer);
+            encoder.set_max_size(u16::MAX);
+            let info = response
+                .destructive_emit(&mut encoder)
+                .map_err(|e| hickory_server::net::NetError::Msg(format!("encode error: {e}")))?;
+            self.responses.lock().unwrap().push(buffer);
+            Ok(info)
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_refuses_query_beyond_configured_burst() {
+        // Pipeline proof for the per-client limiter: once one client exhausts
+        // its burst, gate_rate_limit must answer REFUSED before any other
+        // stage runs — while a different client keeps its own budget.
+        //
+        // Driven through handle_request directly with a NON-loopback source:
+        // the limiter deliberately exempts loopback (local proxies), so no
+        // real socket test from 127.0.0.1 could ever exercise the refusal.
+        // `Request::from_bytes` lets the test present an off-host src addr.
+        use hickory_proto::op::Message as ProtoMessage;
+        use hickory_server::net::xfer::Protocol;
+        use hickory_server::server::Request as HickoryRequest;
+        // handle_request is the (private) RequestHandler trait method; tests
+        // reach it through the trait, pinning hickory's TokioTime impl
+        // (hickory-server re-exports hickory_net as `net`).
+        use hickory_server::net::runtime::TokioTime;
+        use hickory_server::server::RequestHandler;
+
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: vec![static_a("rl.example.", "203.0.113.90")],
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            ..BlocklistConfig::default()
+        }));
+        let mut dns_config = DnsConfig {
+            upstream: rustydns_core::config::UpstreamConfig {
+                resolvers: vec!["127.0.0.1:1".to_string()],
+                protocol: rustydns_core::config::UpstreamProtocol::Plain,
+                timeout_ms: 100,
+                ..rustydns_core::config::UpstreamConfig::default()
+            },
+            ..Default::default()
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: true,
+                qps: 1,
+                burst: 2,
+                max_tracked_clients: 16,
+            },
+        ));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            Arc::new(crate::query_log::QueryLog::new(64)),
+            rate_limiter,
+            &[],
+            &[],
+        )
+        .expect("handler");
+
+        let responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capturer = CapturingHandler {
+            responses: responses.clone(),
+        };
+
+        let mut query_msg = ProtoMessage::new(0x1234, MessageType::Query, OpCode::Query);
+        query_msg.metadata.recursion_desired = true;
+        query_msg.add_query({
+            let mut q = Query::new();
+            q.set_name(ProtoName::from_ascii("rl.example.").unwrap())
+                .set_query_type(ProtoRecordType::A);
+            q
+        });
+        let raw = query_msg.to_bytes().expect("encode query");
+        let src = |ip: &str, port: u16| {
+            format!("{ip}:{port}")
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+        };
+
+        let ask = |bytes: Vec<u8>, peer: std::net::SocketAddr| -> HickoryRequest {
+            HickoryRequest::from_bytes(bytes, peer, Protocol::Udp).expect("build request")
+        };
+
+        // burst = 2: the first two queries from client A are served from the
+        // authority record...
+        for _ in 0..2 {
+            let req = ask(raw.clone(), src("203.0.113.44", 53001));
+            let info = handler
+                .handle_request::<_, TokioTime>(&req, capturer.clone())
+                .await;
+            assert_eq!(info.response_code, ResponseCode::NoError);
+        }
+        // ...the third immediate query from the SAME client is REFUSED by
+        // the limiter gate — before authority, blocklist or resolution run.
+        let req = ask(raw.clone(), src("203.0.113.44", 53001));
+        let info = handler
+            .handle_request::<_, TokioTime>(&req, capturer.clone())
+            .await;
+        assert_eq!(
+            info.response_code,
+            ResponseCode::Refused,
+            "query beyond the configured burst must be refused"
+        );
+        // Client B has an independent bucket and is untouched by A's flood.
+        let req = ask(raw, src("203.0.113.45", 53002));
+        let info = handler
+            .handle_request::<_, TokioTime>(&req, capturer.clone())
+            .await;
+        assert_eq!(info.response_code, ResponseCode::NoError);
+
+        // Four replies were emitted (2×NoError, Refused, NoError); decode
+        // the last two to confirm what actually went back on the "wire".
+        let sent = responses.lock().unwrap().clone();
+        assert_eq!(sent.len(), 4);
+        for (idx, expected) in [(2, ResponseCode::Refused), (3, ResponseCode::NoError)] {
+            let msg = ProtoMessage::from_bytes(&sent[idx]).expect("decode reply");
+            assert_eq!(
+                msg.metadata.response_code, expected,
+                "reply {idx} rcode mismatch"
+            );
+        }
+    }
+
     /// Send a question over TCP using the standard 2-byte length prefix
     /// from RFC 1035 §4.2.2. Returns the parsed response.
     async fn query_tcp(port: u16, name: &str, rtype: ProtoRecordType) -> Message {
