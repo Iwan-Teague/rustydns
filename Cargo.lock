@@ -2152,6 +2152,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "futures-util",
  "hickory-proto",
  "hickory-resolver",
  "odoh-rs",

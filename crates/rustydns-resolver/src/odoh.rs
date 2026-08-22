@@ -209,6 +209,46 @@ enum OdohHttp {
 }
 
 impl OdohHttp {
+    /// Largest acceptable `ObliviousDoHConfigs` document. A single HPKE config
+    /// is ~60 bytes; even a long key-rotation history stays far below this.
+    const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+    /// Largest acceptable oblivious response body. An encrypted DNS message is
+    /// bounded by the DNS message size (well under 64 KiB) plus padding.
+    const MAX_RESPONSE_BYTES: u64 = 128 * 1024;
+
+    /// Drain a response body under a hard byte cap: content-length precheck,
+    /// then a chunked streaming read that aborts as soon as the running total
+    /// would exceed `cap`. A hostile relay (the less-trusted half of the ODoH
+    /// pair) cannot stream unbounded bytes into memory before parsing — same
+    /// defence the blocklist fetcher applies to its sources ("no unbounded
+    /// memory" invariant).
+    async fn read_capped(
+        resp: reqwest::Response,
+        cap: u64,
+        what: &'static str,
+    ) -> Result<Vec<u8>, OdohError> {
+        if let Some(len) = resp.content_length()
+            && len > cap
+        {
+            return Err(OdohError::Http(format!(
+                "{what} content-length {len} exceeds {cap}-byte cap"
+            )));
+        }
+        use futures_util::StreamExt;
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| OdohError::Http(e.to_string()))?;
+            if (body.len() as u64).saturating_add(chunk.len() as u64) > cap {
+                return Err(OdohError::Http(format!(
+                    "{what} response exceeds {cap}-byte cap"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
     /// `GET {configs_url}` → raw `ObliviousDoHConfigs` bytes.
     async fn fetch_configs(&self, configs_url: &str) -> Result<Vec<u8>, OdohError> {
         match self {
@@ -221,11 +261,7 @@ impl OdohHttp {
                 if !resp.status().is_success() {
                     return Err(OdohError::ConfigStatus(resp.status().as_u16()));
                 }
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| OdohError::Http(e.to_string()))?;
-                Ok(bytes.to_vec())
+                Self::read_capped(resp, Self::MAX_CONFIG_BYTES, "ODoH config").await
             }
             #[cfg(test)]
             OdohHttp::Mock(m) => m.fetch_configs(),
@@ -257,11 +293,7 @@ impl OdohHttp {
                 if !resp.status().is_success() {
                     return Err(OdohError::RelayStatus(resp.status().as_u16()));
                 }
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| OdohError::Http(e.to_string()))?;
-                Ok(bytes.to_vec())
+                Self::read_capped(resp, Self::MAX_RESPONSE_BYTES, "oblivious").await
             }
             #[cfg(test)]
             OdohHttp::Mock(m) => m.relay(target_host, target_path, &body),
@@ -489,12 +521,13 @@ impl OdohTransport {
     /// decrypt.
     ///
     /// Targets rotate their HPKE key periodically. If the **first** attempt hits
-    /// a *stale-key* signal — the target rejecting our query with a 4xx (RFC
+    /// a *stale-key* signal — the target rejecting our query with HTTP 400 (RFC
     /// 9230's rotation signal) or a response that won't decrypt — the cached
     /// config is dropped and the exchange is retried **once** with a freshly
-    /// fetched config. Any other failure (5xx, network, malformed response)
-    /// fails closed immediately: a config refetch wouldn't help. After two
-    /// attempts we give up — still fail-closed, never a less-private fallback.
+    /// fetched config. Any other failure (other statuses, network, malformed
+    /// response) fails closed immediately: a config refetch wouldn't help.
+    /// After two attempts we give up — still fail-closed, never a less-private
+    /// fallback.
     async fn exchange(&self, target: &OdohTarget, query_wire: &[u8]) -> Result<Bytes, OdohError> {
         // One relay for the whole exchange (both attempts) — a different relay
         // wouldn't change a key-rotation outcome, and keeping it stable avoids
@@ -509,13 +542,16 @@ impl OdohTransport {
                 query_padding(query_wire.len(), self.pad_queries),
             );
             // hpke 0.13 expects a rand_core-0.9 CSPRNG; hand it OsRng wrapped
-            // in UnwrapErr (OS entropy, no second rand major in the tree).
-            // OsRng is fallible-only (TryRngCore) in rand_core 0.9 — the
-            // wrapper panics on the practically-impossible OS entropy error,
-            // which matches fail-closed semantics. Send + Copy, so scoping it
-            // before the `.await` below is not required any more.
+            // in UnwrapErr (OsRng is fallible-only (TryRngCore) in rand_core
+            // 0.9). Entropy health is probed first so an OS RNG failure maps
+            // to a query-level error (fail closed) instead of a panic tearing
+            // down the client's connection task; the wrapper's panic is then a
+            // practically-unreachable backstop.
             let (omsg, secret) = {
-                use rand_core::{OsRng, UnwrapErr};
+                use rand_core::{OsRng, TryRngCore, UnwrapErr};
+                OsRng
+                    .try_fill_bytes(&mut [0u8; 1])
+                    .map_err(|e| OdohError::Encrypt(format!("os rng unavailable: {e}")))?;
                 let mut rng = UnwrapErr(OsRng);
                 encrypt_query(&query, &config, &mut rng)
                     .map_err(|e| OdohError::Encrypt(e.to_string()))?
@@ -550,8 +586,12 @@ impl OdohTransport {
                     }
                 }
                 // RFC 9230 key rotation: the target rejected our (stale-key)
-                // query with a 4xx. Refetch the config and retry once.
-                Err(OdohError::RelayStatus(code)) if may_retry && (400..500).contains(&code) => {
+                // query with HTTP 400. Only 400 is the stale-key signal —
+                // other relay-side 4xx (403/429 auth or throttling) must not
+                // trigger a config refetch per query, or a throttling relay
+                // turns us into a `/.well-known` fetch loop against the
+                // target. Other statuses fail closed.
+                Err(OdohError::RelayStatus(code)) if may_retry && code == 400 => {
                     last_err = Some(OdohError::RelayStatus(code));
                     target.config.store(None);
                     continue;

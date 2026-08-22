@@ -37,6 +37,8 @@ arc-swap         = { workspace = true }
 # second rand major into the tree.
 rand             = { workspace = true }
 rand_core        = { version = "0.9", default-features = false, features = ["os_rng"] }
+# Streaming the ODoH HTTP bodies through a hard size cap (no unbounded reads).
+futures-util     = { workspace = true }
 
 [dev-dependencies]
 tokio        = { workspace = true }
