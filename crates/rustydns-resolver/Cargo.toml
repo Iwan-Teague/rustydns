@@ -31,9 +31,12 @@ odoh-rs          = { workspace = true }
 bytes            = { workspace = true }
 reqwest          = { workspace = true }
 arc-swap         = { workspace = true }
-# hpke 0.13 (via odoh-rs) needs a rand_core-0.9 CSPRNG; the workspace pins
-# rand 0.8 (a different, incompatible major) for other crates, so pin 0.9 here.
-rand             = "0.9"
+# Unified on the workspace rand 0.10 pin for our own randomness (target/proxy
+# rotation, query IDs). hpke 0.13 (via odoh-rs) still expects a rand_core-0.9
+# CSPRNG, so we hand it rand_core's OsRng directly rather than pulling a
+# second rand major into the tree.
+rand             = { workspace = true }
+rand_core        = { version = "0.9", default-features = false, features = ["os_rng"] }
 
 [dev-dependencies]
 tokio        = { workspace = true }

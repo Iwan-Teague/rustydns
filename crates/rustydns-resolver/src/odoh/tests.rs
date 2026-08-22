@@ -74,7 +74,10 @@ pub(crate) struct MockRelay {
 
 /// Fresh HPKE keypair plus its serialised `ObliviousDoHConfigs` bytes.
 fn fresh_keypair() -> (ObliviousDoHKeyPair, Vec<u8>) {
-    let mut rng = rand::rng();
+    // odoh-rs wants a rand_core-0.9 CSPRNG — OsRng via the UnwrapErr adapter
+    // (same as the production path in `OdohTransport::exchange`).
+    use rand_core::{OsRng, UnwrapErr};
+    let mut rng = UnwrapErr(OsRng);
     let keypair = ObliviousDoHKeyPair::new(&mut rng);
     let config: ObliviousDoHConfig = keypair.public().clone().into();
     let configs = compose(&ObliviousDoHConfigs::from(vec![config]))
