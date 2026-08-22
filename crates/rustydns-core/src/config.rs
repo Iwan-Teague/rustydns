@@ -2136,6 +2136,38 @@ mod tests {
         validate_config(&cfg).expect("bare host:port with plain protocol must validate");
     }
 
+    #[test]
+    fn no_scheme_exists_for_system_stub_resolution() {
+        // rustydns has no /etc/resolv.conf fallback and no NetworkManager-style
+        // "system" resolver source by design (fail-closed DNS): the ONLY
+        // resolution sources are the explicitly configured upstream URLs.
+        // Pin that no pseudo-scheme can smuggle system-stub resolution in —
+        // `system://` and `file://` URLs are rejected as scheme mismatches
+        // under EVERY protocol variant, so an implicit fallback is not merely
+        // disabled but inexpressible in config.
+        for url in ["system:///etc/resolv.conf", "file:///etc/resolv.conf"] {
+            let mut doh = baseline();
+            doh.upstream.resolvers = vec![url.to_string()];
+            assert_config_err(validate_config(&doh), "is not an https:// URL");
+
+            let mut doq = baseline();
+            doq.upstream.protocol = UpstreamProtocol::Doq;
+            doq.upstream.resolvers = vec![url.to_string()];
+            assert_config_err(validate_config(&doq), "is not a quic:// URL");
+
+            let mut plain = baseline();
+            plain.upstream.protocol = UpstreamProtocol::Plain;
+            plain.upstream.resolvers = vec![url.to_string()];
+            assert_config_err(validate_config(&plain), "contains a URL scheme");
+
+            let mut odoh = baseline();
+            odoh.upstream.protocol = UpstreamProtocol::Odoh;
+            odoh.upstream.resolvers = vec![url.to_string()];
+            odoh.upstream.odoh_proxies = vec!["https://proxy.example".to_string()];
+            assert_config_err(validate_config(&odoh), "is not an https:// URL");
+        }
+    }
+
     // --- ODoH (RFC 9230) — implemented oblivious upstream arm (TODO 7.3) ----
 
     #[test]
