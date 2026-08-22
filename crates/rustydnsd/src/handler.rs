@@ -1557,6 +1557,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rewrite_address_pins_name_to_ipv6() {
+        // IPv6 local cloaking: the same pinning guarantee as
+        // rewrite_address_pins_name_to_ip, on the AAAA family — the answer is
+        // the configured local address and the upstream (unreachable in this
+        // harness) is never consulted; anything else would SERVFAIL.
+        let harness = build_rewrite_harness(
+            vec![],
+            vec![rewrite_rule(
+                "nas6.corp.example.com",
+                Some("fd00:dead:beef::7"),
+                None,
+                false,
+            )],
+        )
+        .await;
+        let resp = query(
+            harness.port,
+            "nas6.corp.example.com.",
+            ProtoRecordType::AAAA,
+        )
+        .await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::AAAA(aaaa) => {
+                assert_eq!(aaaa.0.to_string(), "fd00:dead:beef::7")
+            }
+            other => panic!("expected AAAA, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn rewrite_cname_returns_cname() {
         let harness = build_rewrite_harness(
             vec![],
