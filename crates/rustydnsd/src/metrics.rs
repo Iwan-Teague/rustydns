@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -428,17 +429,22 @@ pub async fn serve(
     listener: TcpListener,
     path: String,
     shutdown: CancellationToken,
+    health_ready: Arc<AtomicBool>,
 ) -> Result<(), RustyDnsError> {
     let metrics_clone = metrics.clone();
     let query_log_clone = query_log.clone();
+    let health_clone = health_ready.clone();
     let app = Router::new()
         .route(&path, get(move || metrics_handler(metrics_clone.clone())))
         // Liveness endpoint for orchestrators (k8s, runit, systemd's
-        // ExecStartPost healthcheck wrappers). 200 OK means the daemon
-        // process is up and its loopback listener is serving — it
-        // doesn't claim anything about upstream resolver reachability
-        // or blocklist freshness (those are visible on /metrics).
-        .route("/health", get(health_handler))
+        // ExecStartPost healthcheck wrappers). 503 until the DNS
+        // listeners are actually bound (the flag is flipped once
+        // startup finishes), then 200 OK means the daemon process is up,
+        // its loopback listener is serving AND the DNS listeners are
+        // live — it doesn't claim anything about upstream resolver
+        // reachability or blocklist freshness (those are visible on
+        // /metrics).
+        .route("/health", get(move || health_handler(health_clone.clone())))
         // Operator inspection of the in-memory query ring buffer.
         // Exposes ONLY hashed qnames + anonymised client identifiers.
         .route(
@@ -488,12 +494,24 @@ async fn metrics_handler(metrics: Arc<Metrics>) -> Response {
         .unwrap()
 }
 
-async fn health_handler() -> Response {
-    Response::builder()
-        .status(200)
-        .header("Content-Type", "application/json")
-        .body(Body::from("{\"status\":\"ok\"}"))
-        .unwrap()
+/// `/health` truth table: 503 "starting" until the caller flips the flag
+/// (all DNS listeners bound at the end of startup), 200 "ok" afterwards.
+/// Never a static 200 — an orchestrator polling during startup sees a
+/// failure, not a lie.
+async fn health_handler(ready: Arc<AtomicBool>) -> Response {
+    if ready.load(Ordering::Relaxed) {
+        Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .body(Body::from("{\"status\":\"ok\"}"))
+            .unwrap()
+    } else {
+        Response::builder()
+            .status(503)
+            .header("Content-Type", "application/json")
+            .body(Body::from("{\"status\":\"starting\"}"))
+            .unwrap()
+    }
 }
 
 /// Render the query ring buffer as JSON. Newest entry first. Hand-rolls
@@ -743,8 +761,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn health_handler_returns_200_ok_json() {
-        let resp = health_handler().await;
+    async fn health_handler_reports_starting_until_listeners_are_bound() {
+        // 503 before the flag is flipped: an orchestrator polling during
+        // startup must see a failure, not a static 200 lie.
+        let resp = health_handler(Arc::new(AtomicBool::new(false))).await;
+        assert_eq!(resp.status(), 503);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"{\"status\":\"starting\"}");
+
+        // Once startup flips the flag (DNS listeners bound), healthy.
+        let ready = Arc::new(AtomicBool::new(true));
+        let resp = health_handler(ready).await;
         assert_eq!(resp.status(), 200);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await

@@ -73,6 +73,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -403,6 +404,13 @@ async fn main() -> Result<()> {
     active.start_doh(&config)?;
     active.start_metrics(&config)?;
 
+    // Startup complete: every configured listener is bound. From here /health
+    // reports 200 ok instead of 503 starting.
+    active
+        .health_ready
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    info!("DNS listeners bound; /health reports ok");
+
     // Periodic (non-signal) reload loops.
     spawn_blocklist_reload_loop(
         blocklist_loader.clone(),
@@ -702,6 +710,9 @@ struct ActiveListeners {
     live_doh: Option<SocketAddr>,
     live_metrics: Option<SocketAddr>,
     live_metrics_path: String,
+    /// Flipped once startup has finished binding the DNS listeners. `/health`
+    /// reports 503 "starting" until then — never a static 200.
+    health_ready: Arc<AtomicBool>,
 }
 
 impl ActiveListeners {
@@ -732,6 +743,7 @@ impl ActiveListeners {
             live_doh: None,
             live_metrics: None,
             live_metrics_path: String::new(),
+            health_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -788,9 +800,17 @@ impl ActiveListeners {
         let query_log = self.query_log.clone();
         let path_for_task = path.clone();
         let task_token = token.clone();
+        let health_ready = self.health_ready.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                metrics::serve(metrics, query_log, listener, path_for_task, task_token).await
+            if let Err(e) = metrics::serve(
+                metrics,
+                query_log,
+                listener,
+                path_for_task,
+                task_token,
+                health_ready,
+            )
+            .await
             {
                 warn!(error = %e, "metrics server failed");
             }
@@ -1938,6 +1958,7 @@ mod tests {
             live_doh: Some("127.0.0.1:8053".parse().unwrap()),
             live_metrics: Some("127.0.0.1:8089".parse().unwrap()),
             live_metrics_path: "/metrics".to_string(),
+            health_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
