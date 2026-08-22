@@ -437,6 +437,77 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn doh_rejects_unsupported_methods() {
+        // Input hardening: the router registers ONLY GET and POST on
+        // /dns-query. PUT/DELETE are rejected by the framework with 405
+        // Method Not Allowed — never routed to a handler, so the request
+        // body is never parsed as DNS. HEAD is special-cased: axum's
+        // MethodRouter serves HEAD through the GET handler (with an empty
+        // body), and with no `?dns=` parameter the Query extractor rejects
+        // it with 400 — still a rejection before any DNS processing.
+        let handler = build_handler(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let body = build_query("router.mesh.", ProtoRecordType::A);
+        for method in ["PUT", "DELETE"] {
+            let resp = client
+                .request(
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                    format!("{base}/dns-query"),
+                )
+                .header("content-type", "application/dns-message")
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::METHOD_NOT_ALLOWED,
+                "{method} must not reach the DNS pipeline"
+            );
+            // No handler ran, so no DNS response bytes can come back.
+            let headers = resp.headers().clone();
+            assert_ne!(
+                headers.get("content-type").and_then(|v| v.to_str().ok()),
+                Some("application/dns-message"),
+                "{method} must not produce a DNS response"
+            );
+        }
+
+        // HEAD rides the GET route; it is refused with 400 on the missing
+        // `dns` parameter — rejected before the body could ever be parsed,
+        // and no application/dns-message response is produced.
+        let resp = client
+            .request(reqwest::Method::HEAD, format!("{base}/dns-query"))
+            .header("content-type", "application/dns-message")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "HEAD must not reach the DNS pipeline"
+        );
+        assert_ne!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/dns-message"),
+            "HEAD must not produce a DNS response"
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn doh_rejects_malformed_dns_message() {
         let handler = build_handler(
             vec![],
