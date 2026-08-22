@@ -430,6 +430,44 @@ async fn fail_closed_when_no_upstream_responds() {
 }
 
 #[tokio::test]
+async fn fail_closed_with_dead_secure_upstreams_never_falls_back_to_plaintext() {
+    // The full fail-closed contract with the DEFAULT secure posture: every
+    // configured upstream is an https:// DoH URL (the production default),
+    // ALL of them are unreachable, and `fail_closed = true`. The resolver
+    // must return an error — never silently degrade to plain UDP, a stale
+    // cached answer, or any other insecure path (there is no such branch;
+    // this pins that behaviourally). A second resolve on a fresh name must
+    // fail identically, proving no degraded mode latches in after the first
+    // failure.
+    let dead_a = {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.local_addr().unwrap().port()
+    };
+    let dead_b = {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.local_addr().unwrap().port()
+    };
+    assert_ne!(dead_a, dead_b);
+
+    let mut cfg = plain_config(&format!("https://127.0.0.1:{dead_a}/dns-query"));
+    cfg.upstream
+        .resolvers
+        .push(format!("https://127.0.0.1:{dead_b}/dns-query"));
+    cfg.upstream.protocol = UpstreamProtocol::Doh;
+    cfg.upstream.timeout_ms = 250;
+
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    for name in ["dead-a.example.com.", "dead-b.example.com."] {
+        let err = resolver.resolve(name, "A").await.unwrap_err();
+        assert!(
+            matches!(err, RustyDnsError::AllUpstreamsFailed),
+            "expected AllUpstreamsFailed for {name}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn cache_serves_repeat_query_without_upstream_hit() {
     let mock =
         MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(8, 8, 8, 8), 300)]).await;
