@@ -251,6 +251,71 @@ async fn plain_upstream_randomises_query_name_case_0x20() {
 }
 
 #[tokio::test]
+async fn plain_upstream_rejects_case_mismatched_response_0x20() {
+    use hickory_proto::op::Query;
+
+    // The other half of the DNS 0x20 defence: a response whose QUESTION
+    // section does not echo the query's exact randomised case must be
+    // rejected (fail-closed) — a mismatched-case answer is precisely what an
+    // off-path spoofer can forge. A plain echo mock cannot exercise this (it
+    // reflects the original question), so this test runs a dedicated
+    // "spoofer" upstream that answers the LOWERCASED form of whatever arrives:
+    // impossible from a legitimate server for our randomised query, trivial
+    // for an attacker watching the wire.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind spoofer");
+    let addr = socket.local_addr().expect("local_addr");
+    let shutdown = CancellationToken::new();
+    let sh = shutdown.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            tokio::select! {
+                _ = sh.cancelled() => break,
+                res = socket.recv_from(&mut buf) => {
+                    let (n, src) = match res {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                        continue;
+                    };
+                    let Some(question) = query.queries.first() else {
+                        continue;
+                    };
+                    let lowered = question.name().to_lowercase();
+                    let mut resp =
+                        Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.recursion_available = true;
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    // Both halves of the response carry the wrong case —
+                    // exactly what a forged reply looks like.
+                    resp.add_query(Query::query(lowered.clone(), question.query_type()));
+                    resp.add_answer(a_record(&lowered, Ipv4Addr::new(6, 6, 6, 6), 300));
+                    if let Ok(bytes) = resp.to_bytes() {
+                        let _ = socket.send_to(&bytes, src).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let cfg = plain_config(&addr.to_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    // A long first label makes mixed-case outgoing queries a certainty
+    // (see plain_upstream_randomises_query_name_case_0x20), so this response
+    // can never legitimately match.
+    let err = resolver
+        .resolve("a-deliberately-long-first-label.example.org.", "A")
+        .await
+        .expect_err("case-mismatched upstream answer must be rejected");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "expected fail-closed AllUpstreamsFailed on 0x20 mismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same
