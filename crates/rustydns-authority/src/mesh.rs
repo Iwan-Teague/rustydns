@@ -362,6 +362,7 @@ fn build_record(
     mesh_zone: &str,
 ) -> Result<Vec<DnsRecord>, MeshBundleError> {
     let label = required_indexed(fields, index, "label")?;
+    validate_single_label(&label, &format!("record.{index}.label"))?;
     let rr_type = required_indexed(fields, index, "rr_type")?;
     let target_addr_kind = required_indexed(fields, index, "target_addr_kind")?;
     let expected_ip = required_indexed(fields, index, "expected_ip")?;
@@ -401,6 +402,7 @@ fn build_record(
 
     let mut names = vec![label.clone()];
     for alias in aliases.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        validate_single_label(alias, &format!("record.{index}.aliases"))?;
         names.push(alias.to_string());
     }
 
@@ -478,6 +480,34 @@ fn parse_u64(
             field: name.to_string(),
             reason: "not a u64".to_string(),
         })
+}
+
+/// A mesh record's FQDN is always `<label><zone>`, so every component (the
+/// label and each alias) must be a **single** well-formed DNS label. The
+/// bundle is signature-gated, but the signer is not free to inject names the
+/// format never intended: a dotted label (`evil.com`) would mint
+/// `evil.com.mesh.`-shaped multi-level names, an empty label would target the
+/// zone apex, and oversized/non-ASCII labels would violate the same domain
+/// invariants the blocklist parser enforces. Fail closed at parse time —
+/// defence-in-depth against a compromised or buggy signer.
+fn validate_single_label(value: &str, field: &str) -> Result<(), MeshBundleError> {
+    let reject = |reason: String| MeshBundleError::InvalidField {
+        field: field.to_string(),
+        reason,
+    };
+    if value.is_empty() {
+        return Err(reject("label is empty".to_string()));
+    }
+    if value.len() > 63 {
+        return Err(reject(format!("label is {} bytes (max 63)", value.len())));
+    }
+    if !value.is_ascii() {
+        return Err(reject("label is not ASCII".to_string()));
+    }
+    if value.contains('.') {
+        return Err(reject(format!("label `{value}` contains a dot")));
+    }
+    Ok(())
 }
 
 fn parse_usize(
@@ -1011,5 +1041,157 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, MeshBundleError::SignatureMismatch), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_dotted_label() {
+        let now = now();
+        let (wire, key_hex) =
+            build_signed_bundle("mesh", &[("evil.com", "100.64.0.1", &[])], now, now + 300);
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "dotted-label-bundle"),
+            &write_temp(key_hex.as_bytes(), "dotted-label-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(err, "record.0.label", "contains a dot");
+    }
+
+    #[test]
+    fn rejects_empty_label() {
+        let now = now();
+        let (wire, key_hex) =
+            build_signed_bundle("mesh", &[("", "100.64.0.1", &[])], now, now + 300);
+        // An empty label would build the zone apex itself ("mesh." + ".").
+        // The bundle builder writes `record.0.fqdn=.mesh.` for it — still a
+        // well-formed signed payload, so only label validation catches it.
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "empty-label-bundle"),
+            &write_temp(key_hex.as_bytes(), "empty-label-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(err, "record.0.label", "label is empty");
+    }
+
+    #[test]
+    fn rejects_oversized_label() {
+        let now = now();
+        let long_label = "a".repeat(64);
+        let (wire, key_hex) =
+            build_signed_bundle("mesh", &[(&long_label, "100.64.0.1", &[])], now, now + 300);
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "long-label-bundle"),
+            &write_temp(key_hex.as_bytes(), "long-label-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(err, "record.0.label", "max 63");
+    }
+
+    #[test]
+    fn rejects_non_ascii_label() {
+        let now = now();
+        let (wire, key_hex) =
+            build_signed_bundle("mesh", &[("routör", "100.64.0.1", &[])], now, now + 300);
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "unicode-label-bundle"),
+            &write_temp(key_hex.as_bytes(), "unicode-label-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(err, "record.0.label", "not ASCII");
+    }
+
+    #[test]
+    fn rejects_dotted_alias() {
+        let now = now();
+        let (wire, key_hex) = build_signed_bundle(
+            "mesh",
+            &[("nas", "100.64.0.2", &["storage.box"])],
+            now,
+            now + 300,
+        );
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "dotted-alias-bundle"),
+            &write_temp(key_hex.as_bytes(), "dotted-alias-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(err, "record.0.aliases", "contains a dot");
+    }
+
+    #[test]
+    fn fuzz_mutated_bundles_never_panic_and_valid_labels_hold() {
+        // Dependency-free LCG fuzz over the full signed-bundle path (the same
+        // shape the blocklist parser's property test uses): mutate a valid
+        // payload byte-wise, re-sign (so mutations reach the PARSER, not just
+        // signature verification), and require no panic. Any bundle that DOES
+        // load must contain only single-label names under the mesh zone.
+        let mut seed: u64 = 0x5EED_BABE_F00D;
+        let mut lcg = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let now = now();
+        let (base_wire, key_hex) = build_signed_bundle(
+            "mesh",
+            &[("router", "100.64.0.1", &["storage"])],
+            now,
+            now + 300,
+        );
+        let key_path = write_temp(key_hex.as_bytes(), "fuzz-label-key");
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+
+        for i in 0..2000u32 {
+            let mut wire = base_wire.clone();
+            // 1-4 point mutations per iteration.
+            for _ in 0..(lcg() % 4 + 1) {
+                let idx = (lcg() as usize) % wire.len();
+                match lcg() % 3 {
+                    0 => wire[idx] = (lcg() % 256) as u8,
+                    1 => {
+                        wire.remove(idx);
+                    }
+                    _ => wire.insert(idx, b"=.\n abc0"[(lcg() % 8) as usize]),
+                }
+            }
+            // Re-sign whatever mangled payload precedes the LAST signature
+            // marker; malformed payloads must be rejected by extraction or
+            // parsing, never panic.
+            let sig = signing.sign(&wire);
+            let hex = sig
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let text = String::from_utf8_lossy(&wire).to_string();
+            let signed = match text.rfind("\nsignature=") {
+                Some(p) => format!("{}signature={hex}\n", &text[..p]),
+                None => format!("{}signature={hex}\n", text.trim_end()),
+            };
+            let path = write_temp(signed.as_bytes(), &format!("fuzz-label-{i}"));
+            if let Ok(loaded) = load_mesh_bundle(&path, &key_path, "mesh.", 600) {
+                for r in &loaded.records {
+                    let stem = r.name.strip_suffix(".mesh.").expect("zone suffix");
+                    assert!(
+                        !stem.is_empty()
+                            && !stem.contains('.')
+                            && stem.len() <= 63
+                            && stem.is_ascii(),
+                        "invalid record name from mutated bundle: {}",
+                        r.name
+                    );
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
