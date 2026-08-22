@@ -96,6 +96,20 @@ consequences for `rustynetd`:
 A rejected rollback keeps the previous snapshot and bumps
 `rustydns_mesh_zone_reload_failure_total`.
 
+### Record-name constraints
+
+Every record name is built as `<label><zone>`, so the `label` field and
+every comma-separated entry in `aliases` must be a **single** DNS label:
+non-empty, at most 63 bytes, ASCII only, and containing no dots. A signed
+bundle that violates any of these is rejected at load time with an
+`InvalidField` error naming the offending field; the previously-loaded
+snapshot keeps serving and `rustydns_mesh_zone_reload_failure_total`
+increments. A dotted label (`evil.com`) would mint names outside the
+intended `<label>.<zone>` shape, an empty label would target the zone apex,
+and oversized/non-ASCII labels violate the same domain invariants the
+blocklist parser enforces — so validation fails closed even though the
+bundle's signature verifies.
+
 ## Rustynet policy integration
 
 ### rustydns as a Rustynet service
