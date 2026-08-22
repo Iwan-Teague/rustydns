@@ -645,6 +645,104 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn metrics_handler_renders_every_registered_family() {
+        let m = Arc::new(Metrics::new().unwrap());
+
+        // Touch every family so spot-checked values are provably wired to the
+        // right mutator, not just present-by-registration at zero.
+        m.inc_queries();
+        m.inc_query_qtype("AAAA");
+        m.inc_response_rcode("SERVFAIL");
+        m.inc_authority_hits();
+        m.inc_rewrite_hits();
+        m.inc_blocklist_hits();
+        m.inc_blocklist_cname_cloaking_blocked();
+        m.inc_blocklist_response_ip_blocked();
+        m.inc_resolver_queries();
+        m.inc_resolver_failures();
+        m.mark_blocklist_reload_success();
+        m.mark_blocklist_reload_failure();
+        m.set_blocklist_state(1234, 5678);
+        m.mark_mesh_zone_reload_success(42);
+        m.mark_mesh_zone_reload_failure();
+        m.inc_policy_blocklist_bypass();
+        m.inc_policy_zone_denied();
+        m.inc_policy_schedule_blocked();
+        m.inc_policy_rate_limited();
+        m.inc_private_rdata_dropped(3);
+        m.inc_query_log_disk_written();
+        m.inc_query_log_disk_io_errors();
+        m.inc_query_log_disk_rotations();
+
+        let resp = metrics_handler(m.clone()).await;
+        assert_eq!(resp.status(), 200);
+        assert!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .starts_with("text/plain"),
+            "Prometheus text exposition content-type"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body collect");
+        let body = std::str::from_utf8(&body).expect("utf-8 exposition");
+
+        // Every registered family must survive gather() + TextEncoder intact.
+        const FAMILIES: &[&str] = &[
+            "rustydns_dns_queries_total",
+            "rustydns_dns_queries_by_qtype_total",
+            "rustydns_dns_responses_by_rcode_total",
+            "rustydns_authority_hits_total",
+            "rustydns_rewrite_hits_total",
+            "rustydns_blocklist_hits_total",
+            "rustydns_blocklist_cname_cloaking_blocked_total",
+            "rustydns_blocklist_response_ip_blocked_total",
+            "rustydns_resolver_queries_total",
+            "rustydns_resolver_failures_total",
+            "rustydns_blocklist_reload_success_total",
+            "rustydns_blocklist_reload_failure_total",
+            "rustydns_blocklist_entries",
+            "rustydns_blocklist_heap_bytes",
+            "rustydns_blocklist_last_reload_seconds",
+            "rustydns_mesh_records",
+            "rustydns_mesh_zone_reload_success_total",
+            "rustydns_mesh_zone_reload_failure_total",
+            "rustydns_mesh_zone_last_reload_seconds",
+            "rustydns_policy_blocklist_bypass_total",
+            "rustydns_policy_zone_denied_total",
+            "rustydns_policy_schedule_blocked_total",
+            "rustydns_policy_rate_limited_total",
+            "rustydns_resolver_private_rdata_dropped_total",
+            "rustydns_query_log_disk_written_total",
+            "rustydns_query_log_disk_dropped_total",
+            "rustydns_query_log_disk_io_errors_total",
+            "rustydns_query_log_disk_rotations_total",
+        ];
+        for name in FAMILIES {
+            assert!(body.contains(name), "family {name} missing from exposition");
+        }
+
+        // Value spot-checks: the mutators above landed on their families.
+        assert!(body.contains("rustydns_dns_queries_total 1"));
+        assert!(body.contains("rustydns_blocklist_entries 1234"));
+        assert!(body.contains("rustydns_blocklist_heap_bytes 5678"));
+        assert!(body.contains("rustydns_mesh_records 42"));
+        assert!(body.contains("rustydns_resolver_private_rdata_dropped_total 3"));
+        assert!(body.contains("rustydns_policy_rate_limited_total 1"));
+        assert!(
+            body.contains(r#"qtype="AAAA""#),
+            "labelled qtype series must carry its label"
+        );
+        assert!(
+            body.contains(r#"rcode="SERVFAIL""#),
+            "labelled rcode series must carry its label"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn health_handler_returns_200_ok_json() {
         let resp = health_handler().await;
         assert_eq!(resp.status(), 200);
