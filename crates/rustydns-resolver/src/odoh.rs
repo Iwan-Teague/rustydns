@@ -508,11 +508,15 @@ impl OdohTransport {
                 query_wire,
                 query_padding(query_wire.len(), self.pad_queries),
             );
-            // Scope the (non-Send) ThreadRng so it is dropped before the
-            // `.await` below — otherwise the resolve future would be !Send and
-            // hickory's RequestHandler could not drive it.
+            // hpke 0.13 expects a rand_core-0.9 CSPRNG; hand it OsRng wrapped
+            // in UnwrapErr (OS entropy, no second rand major in the tree).
+            // OsRng is fallible-only (TryRngCore) in rand_core 0.9 — the
+            // wrapper panics on the practically-impossible OS entropy error,
+            // which matches fail-closed semantics. Send + Copy, so scoping it
+            // before the `.await` below is not required any more.
             let (omsg, secret) = {
-                let mut rng = rand::rng();
+                use rand_core::{OsRng, UnwrapErr};
+                let mut rng = UnwrapErr(OsRng);
                 encrypt_query(&query, &config, &mut rng)
                     .map_err(|e| OdohError::Encrypt(e.to_string()))?
             };
