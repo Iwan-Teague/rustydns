@@ -211,31 +211,44 @@ impl BlocklistLoader {
             )));
         }
 
-        if let Some(len) = response.content_length()
-            && len > self.config.max_fetch_bytes
-        {
+        read_body_capped(url, response, self.config.max_fetch_bytes).await
+    }
+}
+
+/// Drain a successful blocklist-fetch response under the configured byte cap:
+/// content-length precheck first, then a chunked streaming read that aborts
+/// as soon as the running total would exceed `cap`. A hostile or compromised
+/// CDN cannot stream unbounded bytes into memory before parsing ("no
+/// unbounded memory" invariant). Split out of [`BlocklistLoader::fetch_remote`]
+/// so it can be driven directly against a plain-HTTP loopback server in tests
+/// (the production client is `https_only` and refuses such URLs).
+async fn read_body_capped(
+    url: &str,
+    response: reqwest::Response,
+    cap: u64,
+) -> Result<String, RustyDnsError> {
+    if let Some(len) = response.content_length()
+        && len > cap
+    {
+        return Err(RustyDnsError::Blocklist(format!(
+            "fetch failed for {url}: content-length {len} exceeds max_fetch_bytes {cap}"
+        )));
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| RustyDnsError::Blocklist(format!("fetch failed for {url}: {e}")))?;
+        if (body.len() + chunk.len()) as u64 > cap {
             return Err(RustyDnsError::Blocklist(format!(
-                "fetch failed for {url}: content-length {len} exceeds max_fetch_bytes {}",
-                self.config.max_fetch_bytes
+                "fetch failed for {url}: response exceeds max_fetch_bytes {cap}"
             )));
         }
-
-        let mut body: Vec<u8> = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| RustyDnsError::Blocklist(format!("fetch failed for {url}: {e}")))?;
-            if (body.len() + chunk.len()) as u64 > self.config.max_fetch_bytes {
-                return Err(RustyDnsError::Blocklist(format!(
-                    "fetch failed for {url}: response exceeds max_fetch_bytes {}",
-                    self.config.max_fetch_bytes
-                )));
-            }
-            body.extend_from_slice(&chunk);
-        }
-
-        Ok(String::from_utf8_lossy(&body).into_owned())
+        body.extend_from_slice(&chunk);
     }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 #[cfg(test)]
@@ -282,5 +295,94 @@ mod tests {
         assert!(err.to_string().contains("max_fetch_bytes"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -- read_body_capped: real-HTTP coverage of the remote streaming cap --
+    //
+    // The production client is https_only, so these drive a plain loopback
+    // HTTP server and hand `read_body_capped` the genuine reqwest::Response.
+    // Same shape as the ODoH read_capped tests.
+
+    /// Serve ONE handcrafted response on a fresh loopback listener; returns
+    /// the URL to GET. Drains the request head first so hyper sees a complete
+    /// request before we answer, then holds the socket open (5 s) so streamed
+    /// bodies are not RST mid-read.
+    async fn serve_once(response: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let owned = response.to_vec();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(n) if n > 0 => {
+                            if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                let _ = sock.write_all(&owned).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+        format!("http://{addr}/list.txt")
+    }
+
+    #[tokio::test]
+    async fn remote_body_content_length_over_cap_rejected_before_read() {
+        // Lying-but-large content-length header must abort before any body
+        // bytes are pulled.
+        let url = serve_once(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 99999999\r\ncontent-type: text/plain\r\n\r\nsmall",
+        )
+        .await;
+        let resp = reqwest::get(&url).await.expect("request");
+        let err = read_body_capped(&url, resp, 1024)
+            .await
+            .expect_err("over-cap content-length must be rejected");
+        assert!(err.to_string().contains("content-length"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn remote_body_streaming_over_cap_aborts_mid_stream() {
+        // Chunked encoding (no content-length): one oversized chunk must trip
+        // the running-total check even though the terminating chunk never
+        // arrives — the cap aborts proactively, it does not wait for EOF.
+        let chunk_data = vec![b'a'; 4096];
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n");
+        raw.extend_from_slice(format!("{:x}\r\n", chunk_data.len()).as_bytes());
+        raw.extend_from_slice(&chunk_data);
+        raw.extend_from_slice(b"\r\n"); // no terminating 0-chunk on purpose
+
+        let url = serve_once(&raw).await;
+        let resp = reqwest::get(&url).await.expect("request");
+        let err = read_body_capped(&url, resp, 1024)
+            .await
+            .expect_err("over-cap stream must be rejected");
+        assert!(
+            err.to_string().contains("response exceeds max_fetch_bytes"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_body_under_cap_is_returned_intact() {
+        let url = serve_once(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 15\r\ncontent-type: text/plain\r\n\r\nads.example.com",
+        )
+        .await;
+        let resp = reqwest::get(&url).await.expect("request");
+        let body = read_body_capped(&url, resp, 1024)
+            .await
+            .expect("under-cap ok");
+        assert_eq!(body, "ads.example.com");
     }
 }
