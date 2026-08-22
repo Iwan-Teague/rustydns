@@ -1127,6 +1127,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_single_label_rejects_multi_label_and_empty_directly() {
+        // Direct unit on the validator itself (the bundle-level tests above
+        // exercise it end-to-end through load_mesh_bundle).
+        let err = validate_single_label("a.b", "record.0.label").unwrap_err();
+        assert_invalid_field(err, "record.0.label", "contains a dot");
+
+        let err = validate_single_label("", "record.0.aliases").unwrap_err();
+        assert_invalid_field(err, "record.0.aliases", "label is empty");
+
+        // Sanity: a well-formed single label is accepted.
+        assert!(validate_single_label("router", "record.0.label").is_ok());
+    }
+
+    #[test]
     fn fuzz_mutated_bundles_never_panic_and_valid_labels_hold() {
         // Dependency-free LCG fuzz over the full signed-bundle path (the same
         // shape the blocklist parser's property test uses): mutate a valid
