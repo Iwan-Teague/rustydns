@@ -1672,6 +1672,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn restrictive_umask_makes_new_files_owner_only() {
+        use nix::sys::stat::{Mode, umask};
+        use std::os::unix::fs::PermissionsExt;
+        // Save and restore the process-wide mask so parallel tests that
+        // create files are unaffected outside this window.
+        let saved = umask(Mode::empty());
+        {
+            set_restrictive_umask();
+            let p = tmp_path("umask-probe.txt");
+            std::fs::File::create(&p).expect("create probe");
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "files created under the daemon umask must be owner-only, got {mode:o}"
+            );
+            let _ = std::fs::remove_file(&p);
+        }
+        umask(saved);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn check_config_permissions_accepts_owner_and_group() {
         let p = tmp_path("config-640.toml");
         write_file(&p, b"");
