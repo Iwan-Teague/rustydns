@@ -825,4 +825,191 @@ mod tests {
             "got {err:?}"
         );
     }
+
+    /// Sign an arbitrary payload (byte-exact — the payload may be non-UTF8) in
+    /// the Rustynet wire format and return (wire_bytes, verifier_key_hex).
+    fn sign_arbitrary_payload(payload: &[u8]) -> (Vec<u8>, String) {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let verifier_hex = signing
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let sig_hex = signing
+            .sign(payload)
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let mut wire = payload.to_vec();
+        wire.extend_from_slice(b"signature=");
+        wire.extend_from_slice(sig_hex.as_bytes());
+        wire.push(b'\n');
+        (wire, verifier_hex)
+    }
+
+    fn assert_invalid_field(err: MeshBundleError, field: &str, reason_contains: &str) {
+        match err {
+            MeshBundleError::InvalidField { field: f, reason } => {
+                assert_eq!(f, field, "field");
+                assert!(reason.contains(reason_contains), "reason: {reason}");
+            }
+            other => panic!("expected InvalidField for {field}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_field_in_bundle() {
+        let now = now();
+        let payload = format!(
+            "version=1\nzone_name=mesh\nsubject_node_id=test-subject\n\
+             generated_at_unix={now}\nexpires_at_unix={}\nnonce=1\nnonce=2\nrecord_count=0\n",
+            now + 300
+        );
+        let (wire, key_hex) = sign_arbitrary_payload(payload.as_bytes());
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "dup-field-bundle"),
+            &write_temp(key_hex.as_bytes(), "dup-field-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(err, "nonce", "duplicate field");
+    }
+
+    #[test]
+    fn rejects_non_key_value_line() {
+        let now = now();
+        let payload = format!(
+            "version=1\nzone_name=mesh\nthis line has no equals sign\n\
+             subject_node_id=test-subject\ngenerated_at_unix={now}\n\
+             expires_at_unix={}\nnonce=1\nrecord_count=0\n",
+            now + 300
+        );
+        let (wire, key_hex) = sign_arbitrary_payload(payload.as_bytes());
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "nonkv-bundle"),
+            &write_temp(key_hex.as_bytes(), "nonkv-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(err, "this line has no equals sign", "not `key=value`");
+    }
+
+    #[test]
+    fn rejects_unsupported_bundle_version() {
+        let now = now();
+        // A future version must never parse with this reader: version is
+        // pinned to the literal "1" so a v2 format cannot silently downgrade.
+        let payload = format!(
+            "version=2\nzone_name=mesh\nsubject_node_id=test-subject\n\
+             generated_at_unix={now}\nexpires_at_unix={}\nnonce=1\nrecord_count=0\n",
+            now + 300
+        );
+        let (wire, key_hex) = sign_arbitrary_payload(payload.as_bytes());
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "v2-bundle"),
+            &write_temp(key_hex.as_bytes(), "v2-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(err, "version", "unsupported bundle version");
+    }
+
+    #[test]
+    fn rejects_expiry_not_after_generation() {
+        let now = now();
+        let payload = format!(
+            "version=1\nzone_name=mesh\nsubject_node_id=test-subject\n\
+             generated_at_unix={}\nexpires_at_unix={}\nnonce=1\nrecord_count=0\n",
+            now + 300,
+            now + 300
+        );
+        let (wire, key_hex) = sign_arbitrary_payload(payload.as_bytes());
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "zero-window-bundle"),
+            &write_temp(key_hex.as_bytes(), "zero-window-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(
+            err,
+            "expires_at_unix",
+            "must be greater than generated_at_unix",
+        );
+    }
+
+    #[test]
+    fn rejects_signature_that_is_not_64_hex_bytes() {
+        let now = now();
+        let (mut wire, key_hex) =
+            build_signed_bundle("mesh", &[("router", "100.64.0.1", &[])], now, now + 300);
+        // Truncate the signature to an odd number of hex nibbles: decode must
+        // fail before any ed25519 work happens.
+        let sig_pos =
+            String::from_utf8_lossy(&wire).rfind("signature=").unwrap() + "signature=".len();
+        wire.truncate(wire.len() - 1); // drop trailing \n
+        while wire.len() - sig_pos > 63 {
+            wire.pop();
+        }
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "short-sig-bundle"),
+            &write_temp(key_hex.as_bytes(), "short-sig-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MeshBundleError::MissingSignature), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_non_utf8_payload() {
+        let now = now();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"version=1\nzone_name=me");
+        payload.push(0xFF); // invalid UTF-8 inside a field value
+        payload.extend_from_slice(
+            format!(
+                "sh\nsubject_node_id=test-subject\ngenerated_at_unix={now}\n\
+                     expires_at_unix={}\nnonce=1\nrecord_count=0\n",
+                now + 300
+            )
+            .as_bytes(),
+        );
+        let (wire, key_hex) = sign_arbitrary_payload(&payload);
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "nonutf8-bundle"),
+            &write_temp(key_hex.as_bytes(), "nonutf8-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert_invalid_field(err, "<payload>", "not valid UTF-8");
+    }
+
+    #[test]
+    fn appended_second_signature_invalidates_verification() {
+        let now = now();
+        let (mut wire, key_hex) =
+            build_signed_bundle("mesh", &[("router", "100.64.0.1", &[])], now, now + 300);
+        // Append a second `signature=` line carrying a well-formed but wrong
+        // 64-byte signature value. Extraction takes the LAST marker, so the
+        // verified payload now includes the first signature line and no longer
+        // matches — append/extension games cannot smuggle content past
+        // verification.
+        let extra = format!("\nsignature={}", "ab".repeat(64));
+        wire.extend_from_slice(extra.as_bytes());
+        let err = load_mesh_bundle(
+            &write_temp(&wire, "double-sig-bundle"),
+            &write_temp(key_hex.as_bytes(), "double-sig-key"),
+            "mesh.",
+            600,
+        )
+        .unwrap_err();
+        assert!(matches!(err, MeshBundleError::SignatureMismatch), "{err:?}");
+    }
 }
