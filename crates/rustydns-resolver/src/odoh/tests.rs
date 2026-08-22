@@ -17,6 +17,7 @@ use hickory_proto::dnssec::rdata::{DNSKEY, DNSSECRData, RRSIG};
 use hickory_proto::dnssec::{Algorithm, DnssecSigner, PublicKeyBuf, SigningKey, TrustAnchors};
 use hickory_proto::op::{DnsRequestOptions, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::rdata::opt::EdnsCode;
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordSet, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use hickory_resolver::net::xfer::{DnsHandle, FirstAnswer};
@@ -64,6 +65,11 @@ struct MockState {
     rotated: bool,
     /// Number of `/.well-known/odohconfigs` fetches served (test assertions).
     config_fetches: usize,
+    /// Decrypted plaintext queries, most recent last (bounded so a long-lived
+    /// arm under fuzz-like loops cannot grow unbounded). Lets tests inspect
+    /// exactly what the target received — e.g. that the oblivious wire never
+    /// carries an EDNS Client Subnet option.
+    captured: Vec<Message>,
 }
 
 /// In-process ODoH target + relay. Holds a real HPKE keypair and answers with
@@ -111,6 +117,7 @@ impl MockRelay {
                 configs,
                 rotated: false,
                 config_fetches: 0,
+                captured: Vec::new(),
             }),
             mode,
             responses,
@@ -154,7 +161,7 @@ impl MockRelay {
             _ => {}
         }
 
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
         let mut b = Bytes::copy_from_slice(body);
         let qmsg: ObliviousDoHMessage =
             parse(&mut b).map_err(|e| OdohError::Mock(e.to_string()))?;
@@ -163,6 +170,13 @@ impl MockRelay {
 
         let query_msg = Message::from_bytes(&q_plain.clone().into_msg())
             .map_err(|e| OdohError::Mock(e.to_string()))?;
+        {
+            const CAPTURE_CAP: usize = 32;
+            if st.captured.len() >= CAPTURE_CAP {
+                st.captured.remove(0);
+            }
+            st.captured.push(query_msg.clone());
+        }
         let resp_wire = if matches!(self.mode, MockMode::SignedZone) {
             build_signed_response(&self.responses, &query_msg)?
         } else {
@@ -234,6 +248,12 @@ fn mock_state_of(arm: &OdohArm) -> std::sync::MutexGuard<'_, MockState> {
         OdohHttp::Mock(m) => m.state.lock().unwrap(),
         _ => unreachable!("test arms always use the mock transport"),
     }
+}
+
+/// Clone out the decrypted queries the mock target received (guard dropped so
+/// the arm stays usable).
+fn captured_queries_of(arm: &OdohArm) -> Vec<Message> {
+    mock_state_of(arm).captured.clone()
 }
 
 fn arm_with_mock_opts(mode: MockMode, pad_queries: bool) -> OdohArm {
@@ -579,6 +599,32 @@ fn arm_with_signed_zone(
         }),
         trust_anchor: Some(Arc::new(anchor)),
     }
+}
+
+#[tokio::test]
+async fn odoh_oblivious_query_carries_no_edns_client_subnet() {
+    // The ECS-strip invariant re-applied to the oblivious arm: the plaintext
+    // DNS message the TARGET decrypts must never carry an EDNS Client Subnet
+    // option (RFC 7871) — on ODoH the target must not learn even a coarse
+    // client network, that is the entire point of the transport. The mock
+    // runs the real odoh-rs server side, so this inspects the exact bytes
+    // the target would see after HPKE decryption.
+    let arm = arm_with_mock_opts(MockMode::AnswerA(Ipv4Addr::new(203, 0, 113, 20)), false);
+    arm.resolve("ecs.example.", RecordType::A, false)
+        .await
+        .expect("resolve over the oblivious arm");
+
+    let captured = captured_queries_of(&arm);
+    assert_eq!(captured.len(), 1, "the target saw exactly one query");
+    if let Some(edns) = &captured[0].edns {
+        // EDNS0 itself may be present; what must NEVER be present is the
+        // Client Subnet option (code 8).
+        assert!(
+            edns.option(EdnsCode::Subnet).is_none(),
+            "oblivious wire carried an EDNS Client Subnet option: {edns:?}"
+        );
+    }
+    // No EDNS at all is equally fine — both shapes satisfy "no ECS".
 }
 
 #[tokio::test]
