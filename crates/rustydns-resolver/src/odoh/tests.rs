@@ -679,3 +679,88 @@ async fn odoh_round_trips_across_multiple_proxies() {
         assert_eq!(outcome.records.len(), 1);
     }
 }
+
+/// Real-HTTP coverage for [`super::OdohHttp::read_capped`]. The mock transport
+/// above bypasses the reqwest arm entirely, so the body-cap defence (the
+/// "no unbounded memory" invariant on the relay-facing path) would otherwise
+/// ship untested. Each test serves one handcrafted HTTP/1.1 response from a
+/// loopback listener so `reqwest` produces a genuine `Response`.
+mod http_cap {
+    use tokio::io::AsyncWriteExt;
+
+    /// Serve ONE response (raw HTTP/1.1 bytes) on a fresh loopback listener;
+    /// returns the GET URL for a plain-HTTP reqwest client. The connection is
+    /// held open after writing so the reader decides when to stop.
+    async fn serve_once(response: &[u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = response.to_vec();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request head (GET + headers) before answering.
+            let mut buf = [0u8; 2048];
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                    .await
+                    .unwrap();
+                if n == 0 || buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(&response).await.unwrap();
+            sock.flush().await.unwrap();
+            // Hold the socket open; the test drops it when done.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        format!("http://{addr}/cap")
+    }
+
+    async fn get(url: &str) -> reqwest::Response {
+        reqwest::get(url).await.expect("plain-HTTP GET succeeds")
+    }
+
+    #[tokio::test]
+    async fn content_length_over_cap_rejected_before_body() {
+        let url =
+            serve_once(b"HTTP/1.1 200 OK\r\ncontent-length: 1048576\r\n\r\nshort-but-lying").await;
+        let err = super::OdohHttp::read_capped(get(&url).await, 64 * 1024, "ODoH config")
+            .await
+            .expect_err("a lying content-length over the cap must be rejected");
+        assert!(
+            err.to_string().contains("content-length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_body_over_cap_aborts_mid_stream() {
+        // No content-length: reqwest must fall back to streaming chunks, and
+        // read_capped must abort once the running total crosses the cap — not
+        // buffer until the server finishes. The server never sends a
+        // terminating chunk, so success here proves the abort is proactive.
+        let mut raw = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nffff\r\n".to_vec();
+        raw.extend_from_slice(&[0xffu8; 0xffff]);
+        raw.extend_from_slice(b"\r\n"); // no terminating `0` chunk
+        let url = serve_once(&raw).await;
+        let err = super::OdohHttp::read_capped(get(&url).await, 32 * 1024, "oblivious")
+            .await
+            .expect_err("an over-cap chunked body must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_under_cap_is_returned_intact() {
+        const BODY: &[u8] = b"definitely-a-config-document";
+        let mut raw =
+            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", BODY.len()).into_bytes();
+        raw.extend_from_slice(BODY);
+        let url = serve_once(&raw).await;
+        let body = super::OdohHttp::read_capped(get(&url).await, 64 * 1024, "ODoH config")
+            .await
+            .expect("an under-cap body passes through untouched");
+        assert_eq!(body, BODY);
+    }
+}
