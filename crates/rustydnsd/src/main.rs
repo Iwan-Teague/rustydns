@@ -1867,4 +1867,107 @@ mod tests {
         assert!(changed.contains(&"blocklist.response_ip_denylist"));
         assert!(changed.contains(&"blocklist.regex_rules"));
     }
+
+    /// Minimal live-generation stand-in for the reload guards: a real
+    /// handler (empty authority/blocklist, unreachable upstream) plus
+    /// baseline unprivileged listener state, no hickory server attached
+    /// (the reload paths under test never touch it).
+    async fn reload_test_listeners() -> ActiveListeners {
+        let mut cfg = base_config();
+        cfg.upstream.resolvers = vec!["https://127.0.0.1:1/dns-query".to_string()];
+        cfg.upstream.timeout_ms = 500;
+        cfg.privacy.randomize_upstream_selection = false;
+        cfg.upstream.dnssec_validation = false;
+
+        let authority = Arc::new(
+            Authority::new(rustydns_core::config::AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: Vec::new(),
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(
+            rustydns_core::config::BlocklistConfig {
+                sources: Vec::new(),
+                reload_interval_secs: 0,
+                ..rustydns_core::config::BlocklistConfig::default()
+            },
+        ));
+        let resolver = Arc::new(Resolver::new(cfg).await.expect("resolver"));
+        ActiveListeners {
+            handler: DnsHandler::new(
+                authority,
+                blocklist,
+                resolver,
+                Arc::new(Metrics::new().expect("metrics")),
+                Arc::new(crate::query_log::QueryLog::new(64)),
+                Arc::new(crate::rate_limiter::RateLimiter::new(
+                    &rustydns_core::config::RateLimitConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                )),
+                &[],
+                &[],
+            )
+            .expect("handler"),
+            metrics: Arc::new(Metrics::new().expect("metrics")),
+            query_log: Arc::new(crate::query_log::QueryLog::new(64)),
+            parent_shutdown: CancellationToken::new(),
+            dns_server: None,
+            doh_token: Some(CancellationToken::new()),
+            metrics_token: Some(CancellationToken::new()),
+            live_listen: Vec::new(),
+            live_dot: None,
+            live_doq: None,
+            live_tls_paths: (None, None),
+            live_doh: Some("127.0.0.1:8053".parse().unwrap()),
+            live_metrics: Some("127.0.0.1:8089".parse().unwrap()),
+            live_metrics_path: "/metrics".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sighup_refuses_privileged_listener_move_after_capability_drop() {
+        // drop_capabilities() clears every capability set after the
+        // privileged binds, so a LIVE rebind onto <1024 is impossible by
+        // design — SIGHUP must refuse the move and keep serving on the old
+        // binding instead of failing to bind (or worse, silently dropping
+        // the listener). This pins both refusal guards cross-platform; the
+        // kernel cap-clear itself is Linux prctl/caps, enforced additionally
+        // by the systemd CapabilityBoundingSet.
+        let mut al = reload_test_listeners().await;
+
+        // DoH leg: move onto :853 must be refused, state untouched.
+        let mut cfg = base_config();
+        cfg.server.doh_listen = Some("127.0.0.1:853".to_string());
+        al.reload_doh_group(&cfg);
+        assert_eq!(
+            al.live_doh,
+            Some("127.0.0.1:8053".parse().unwrap()),
+            "privileged DoH move must NOT be applied live"
+        );
+        assert!(
+            al.doh_token.is_some(),
+            "current DoH listener must stay alive"
+        );
+
+        // Metrics leg: same guard before install_metrics.
+        let mut cfg = base_config();
+        cfg.metrics.listen = "127.0.0.1:853".to_string();
+        al.reload_metrics_group(&cfg);
+        assert_eq!(
+            al.live_metrics,
+            Some("127.0.0.1:8089".parse().unwrap()),
+            "privileged metrics move must NOT be applied live"
+        );
+        assert!(
+            al.metrics_token.is_some(),
+            "current metrics listener must stay alive"
+        );
+    }
 }
