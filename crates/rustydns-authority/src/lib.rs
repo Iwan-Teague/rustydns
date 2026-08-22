@@ -1249,6 +1249,43 @@ mod tests {
     }
 
     #[test]
+    fn reload_mesh_rejects_corrupt_bundle_without_dropping_current_zone() {
+        // Hot-reload contract beyond rollback: a bundle file that no longer
+        // verifies (tampered payload / bad signature) must fail the reload
+        // AND leave the currently-served zone untouched — readers on the
+        // ArcSwap snapshot never observe a half-applied or empty state.
+        let now = now_secs();
+        let (bundle_path, key_path) =
+            make_bundle_at(&[("router", "100.64.0.7")], "mesh", now - 300, now + 600, 1);
+        let auth = auth_from(bundle_path.clone(), key_path);
+        assert_eq!(router_ip(&auth), "100.64.0.7");
+
+        // Overwrite with a tampered variant of a structurally valid bundle:
+        // flip one hex character of the trailing signature so extraction and
+        // parsing succeed but verification against the pinned key fails.
+        let (fresh, _) =
+            make_bundle_at(&[("router", "100.64.0.9")], "mesh", now - 60, now + 600, 2);
+        let mut bytes = std::fs::read(&fresh).unwrap();
+        let len = bytes.len();
+        bytes[len - 2] = if bytes[len - 2] == b'0' { b'1' } else { b'0' };
+        std::fs::write(&bundle_path, &bytes).unwrap();
+
+        let err = auth
+            .reload_mesh()
+            .expect_err("a forged bundle must never apply");
+        assert!(
+            matches!(
+                err,
+                MeshBundleError::SignatureMismatch | MeshBundleError::MissingField(_)
+            ),
+            "expected signature failure, got {err:?}"
+        );
+
+        // The live snapshot still answers from the last good bundle.
+        assert_eq!(router_ip(&auth), "100.64.0.7");
+    }
+
+    #[test]
     fn mesh_record_count_excludes_static_records() {
         let (bundle_path, key_path) =
             make_bundle(&[("router", "100.64.0.1"), ("nas", "100.64.0.2")], "mesh");
