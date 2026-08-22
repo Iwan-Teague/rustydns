@@ -2970,6 +2970,145 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn blocklist_group_blocks_strict_client_while_default_client_resolves() {
+        // One daemon, two clients, one name. Through a dual-stack ([::])
+        // listener a 127.0.0.1 peer arrives as ::ffff:127.0.0.1 and ::1 as
+        // itself — two distinct policy keys on loopback. The strict-group
+        // policy matches the mapped-v4 key; ::1 stays default (global list,
+        // which is EMPTY here). The group list alone names ads.example.com,
+        // so the identical query must be blocked for A and RESOLVED for B.
+        use rustydns_blocklist::BlocklistSource;
+        use rustydns_core::config::{BlocklistGroup, UpstreamProtocol};
+
+        let upstream_port = spawn_a_mock("203.0.113.80").await;
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: Vec::new(),
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            groups: vec![BlocklistGroup {
+                name: "strict".to_string(),
+                sources: Vec::new(),
+                local_files: Vec::new(),
+                trusted_rpz_sources: Vec::new(),
+                allowlist: Vec::new(),
+            }],
+            ..BlocklistConfig::default()
+        }));
+        // Global list empty; only the group blocks.
+        blocklist.load_trusted("");
+        blocklist.load_group(
+            "strict",
+            &[("0.0.0.0 ads.example.com\n", BlocklistSource::Trusted)],
+            &[],
+        );
+        let mut dns_config = DnsConfig {
+            upstream: UpstreamConfig {
+                resolvers: vec![format!("127.0.0.1:{upstream_port}")],
+                protocol: UpstreamProtocol::Plain,
+                timeout_ms: 1000,
+                ..UpstreamConfig::default()
+            },
+            ..Default::default()
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let policies = vec![
+            NodePolicy {
+                node_id: None,
+                client_ip: Some("::ffff:127.0.0.1".to_string()),
+                blocklist_bypass: false,
+                zones_allowed: Vec::new(),
+                log_all_queries: false,
+                block_windows: Vec::new(),
+                blocklist_group: Some("strict".to_string()),
+            },
+            NodePolicy {
+                node_id: None,
+                client_ip: Some("::1".to_string()),
+                blocklist_bypass: false,
+                zones_allowed: Vec::new(),
+                log_all_queries: false,
+                block_windows: Vec::new(),
+                blocklist_group: None,
+            },
+        ];
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log.clone(),
+            rate_limiter,
+            &policies,
+            &[],
+        )
+        .expect("handler");
+        // Dual-stack bind: accepts both v4-mapped and native-v6 peers.
+        let udp = UdpSocket::bind("[::]:0").await.expect("bind udp");
+        let port = udp.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server.register_socket(udp);
+
+        // Client A — 127.0.0.1 (mapped on the wire) → strict group → blocked.
+        let resp = query(port, "ads.example.com.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NXDomain,
+            "the grouped (stricter) client must be blocked by its group list"
+        );
+
+        // Client B — ::1 → no group, global list empty → served by upstream.
+        let b = UdpSocket::bind("[::1]:0").await.expect("client v6 bind");
+        let mut msg = Message::new(0x4321, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(ProtoName::from_ascii("ads.example.com.").expect("name"))
+                .set_query_type(ProtoRecordType::A);
+            q
+        });
+        b.send_to(&msg.to_bytes().expect("encode"), format!("[::1]:{port}"))
+            .await
+            .expect("send");
+        let mut buf = vec![0u8; 1500];
+        let n = tokio::time::timeout(Duration::from_secs(5), b.recv(&mut buf))
+            .await
+            .expect("reply within 5s")
+            .expect("recv");
+        let resp = Message::from_bytes(&buf[..n]).expect("decode");
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "the default client must NOT inherit the group's blocks"
+        );
+        match resp.answers.first().map(|a| &a.data) {
+            Some(hickory_proto::rr::RData::A(a)) => {
+                assert_eq!(a.0.to_string(), "203.0.113.80", "served from upstream");
+            }
+            other => panic!("expected an A answer for the default client, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn policy_block_window_refuses_during_active_window() {
         // An all-day, every-day block window is active at any wall-clock time,
         // so the client (loopback 127.0.0.1) must be REFUSED — even for a name
