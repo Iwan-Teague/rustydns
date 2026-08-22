@@ -1527,6 +1527,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn safesearch_rewrites_other_engines_and_spares_non_search_domains() {
+        // google is covered by the test above; this pins the OTHER default
+        // engines (bing → strict, duckduckgo → safe) through the same
+        // pipeline, and — the no-collateral half — that a non-search domain
+        // is NOT rewritten: its answer must never be a CNAME to any safe
+        // variant. The harness upstream is unreachable, so a pass-through
+        // query fails closed as SERVFAIL with no answers — which still proves
+        // gate_rewrite did not fire for it.
+        let ss = rustydns_core::config::SafeSearchConfig {
+            enabled: true,
+            ..rustydns_core::config::SafeSearchConfig::default()
+        };
+        let harness = build_rewrite_harness(vec![], ss.rewrite_rules()).await;
+
+        let resp = query(harness.port, "bing.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::CNAME(t) => {
+                assert_eq!(t.to_string(), "strict.bing.com.")
+            }
+            other => panic!("expected CNAME to strict.bing.com, got {other:?}"),
+        }
+
+        let resp = query(harness.port, "duckduckgo.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::CNAME(t) => {
+                assert_eq!(t.to_string(), "safe.duckduckgo.com.")
+            }
+            other => panic!("expected CNAME to safe.duckduckgo.com, got {other:?}"),
+        }
+
+        // Non-search collateral check: not a CNAME to any safe variant.
+        let resp = query(harness.port, "example.org.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+        assert!(
+            resp.answers.is_empty(),
+            "non-search domain must produce no answers, got {:?}",
+            resp.answers
+        );
+    }
+
+    #[tokio::test]
     async fn authority_wins_over_rewrite() {
         // A static record AND a rewrite for the same name: authority is first
         // in the pipeline, so it answers and the rewrite never runs.
