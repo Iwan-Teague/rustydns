@@ -1628,7 +1628,7 @@ mod tests {
     /// Spawn a mock UDP upstream that answers any A query for `NAME` with a
     /// single `NAME A <ip>` record. Used by the response-IP denylist tests.
     async fn spawn_a_mock(ip: &'static str) -> u16 {
-        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::rdata::{A, AAAA};
         use hickory_proto::rr::{RData, Record};
 
         let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
@@ -1652,11 +1652,23 @@ mod tests {
                 resp.metadata.recursion_available = true;
                 resp.metadata.response_code = ResponseCode::NoError;
                 resp.add_query(q.clone());
-                resp.add_answer(Record::from_rdata(
-                    owner,
-                    300,
-                    RData::A(A(ip.parse().unwrap())),
-                ));
+                // Answer in the family of the mock IP (v4 → A, v6 → AAAA),
+                // and only for the qtype that matches it — so the same
+                // helper serves A, AAAA, and negative-qtype cases.
+                let rdata = if ip.parse::<std::net::Ipv6Addr>().is_ok() {
+                    if q.query_type() == ProtoRecordType::AAAA {
+                        Some(RData::AAAA(AAAA(ip.parse().unwrap())))
+                    } else {
+                        None
+                    }
+                } else if q.query_type() == ProtoRecordType::A {
+                    Some(RData::A(A(ip.parse().unwrap())))
+                } else {
+                    None
+                };
+                if let Some(rdata) = rdata {
+                    resp.add_answer(Record::from_rdata(owner, 300, rdata));
+                }
                 if let Ok(bytes) = resp.to_bytes() {
                     let _ = sock.send_to(&bytes, src).await;
                 }
@@ -1741,6 +1753,21 @@ mod tests {
             resp.metadata.response_code,
             ResponseCode::NXDomain,
             "an answer IP inside the denylist must be blocked"
+        );
+        assert!(resp.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_ip_denylist_blocks_matching_ipv6_answer() {
+        // The AAAA leg of the same defence: upstream resolves the (unblocked)
+        // name to an IPv6 address inside a /48 denylist entry → NXDOMAIN.
+        let upstream = spawn_a_mock("2001:db8:bad::7").await;
+        let harness = build_response_ip_harness(&["2001:db8:bad::/48"], upstream).await;
+        let resp = query(harness.port, "c6.malware.example.", ProtoRecordType::AAAA).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NXDomain,
+            "an AAAA answer IP inside the denylist must be blocked"
         );
         assert!(resp.answers.is_empty());
     }
