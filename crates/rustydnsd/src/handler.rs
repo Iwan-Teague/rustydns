@@ -2864,6 +2864,148 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn policy_block_window_timed_blocks_inside_and_serves_outside() {
+        // A TIMED window is time-scoped: while the client's local minute-of-
+        // day is inside the span the schedule gate REFUSES (it runs first),
+        // and outside the span the identical query flows through to a live
+        // upstream. No blocklist entries are loaded, so ONLY the window can
+        // refuse — the differential isolates the schedule gate itself.
+        //
+        // Both windows are derived from the current UTC minute (`m`), so the
+        // test is deterministic at any wall-clock time:
+        // - INSIDE: a WRAPPING window `[m+20:00, m+19:59)` — wrapping windows
+        //   are active everywhere except their sub-window gap, which here
+        //   lies entirely behind `now`; `now` sits ≥4 h away from either
+        //   gap edge (the one boundary minute where the span degenerates to
+        //   a non-wrapping `[0, ...)` range still contains `now`).
+        // - OUTSIDE: a normal window `[m+12:00, m+22:00)` whose nearest edge
+        //   is ≥10 h of wall-clock away from `now`.
+        use rustydns_core::config::{BlockWindow, UpstreamProtocol};
+
+        fn hhmm(min_of_day: i64) -> String {
+            let m = min_of_day.rem_euclid(1440);
+            format!("{:02}:{:02}", m / 60, m % 60)
+        }
+        fn window(start_min: i64, end_min: i64) -> BlockWindow {
+            BlockWindow {
+                days: Vec::new(), // every day
+                start: Some(hhmm(start_min)),
+                end: Some(hhmm(end_min)),
+                utc_offset_minutes: 0,
+            }
+        }
+
+        async fn build_windowed_harness(windows: Vec<BlockWindow>, upstream_port: u16) -> u16 {
+            let metrics = Arc::new(Metrics::new().expect("metrics"));
+            let authority = Arc::new(
+                Authority::new(AuthorityConfig {
+                    mesh_zone_bundle_path: None,
+                    mesh_zone_verifier_key_path: None,
+                    mesh_zone_max_age_secs: 600,
+                    mesh_zone: "mesh.".to_string(),
+                    static_records: Vec::new(),
+                    poll_interval_secs: 30,
+                })
+                .expect("authority"),
+            );
+            let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig::default()));
+            let mut dns_config = DnsConfig {
+                upstream: UpstreamConfig {
+                    resolvers: vec![format!("127.0.0.1:{upstream_port}")],
+                    protocol: UpstreamProtocol::Plain,
+                    timeout_ms: 1000,
+                    ..UpstreamConfig::default()
+                },
+                ..Default::default()
+            };
+            dns_config.privacy.randomize_upstream_selection = false;
+            dns_config.upstream.dnssec_validation = false;
+            let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+            let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+            let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+                &rustydns_core::config::RateLimitConfig {
+                    enabled: false,
+                    ..rustydns_core::config::RateLimitConfig::default()
+                },
+            ));
+            let policy = NodePolicy {
+                node_id: None,
+                client_ip: Some("127.0.0.1".to_string()),
+                blocklist_bypass: false,
+                zones_allowed: Vec::new(),
+                log_all_queries: false,
+                block_windows: windows,
+                blocklist_group: None,
+            };
+            let handler = DnsHandler::new(
+                authority,
+                blocklist,
+                resolver,
+                metrics,
+                query_log,
+                rate_limiter,
+                &[policy],
+                &[],
+            )
+            .expect("handler");
+            let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+            let port = udp.local_addr().unwrap().port();
+            let mut server = Server::new(handler);
+            server.register_socket(udp);
+            // The helper returns only the port; deliberately leak the server
+            // so its serve task outlives this call (the other tests keep the
+            // Server alive in the test fn's own scope).
+            std::mem::forget(server);
+            port
+        }
+
+        let now_min = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs() as i64)
+            / 60;
+
+        // Leg 1 — INSIDE the timed window → Refused.
+        let inside_port = spawn_a_mock("203.0.113.60").await;
+        let inside_windows = vec![window(now_min + 1200, now_min + 1199)];
+        let inside_port_listener = build_windowed_harness(inside_windows, inside_port).await;
+        let resp = query(
+            inside_port_listener,
+            "timed.example.com.",
+            ProtoRecordType::A,
+        )
+        .await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::Refused,
+            "a query inside the scheduled window must be REFUSED by the schedule gate"
+        );
+        assert!(resp.answers.is_empty());
+
+        // Leg 2 — OUTSIDE the timed window → served by the live upstream.
+        let outside_port = spawn_a_mock("203.0.113.61").await;
+        let outside_windows = vec![window(now_min + 720, now_min + 1320)];
+        let outside_port_listener = build_windowed_harness(outside_windows, outside_port).await;
+        let pass = query(
+            outside_port_listener,
+            "timed.example.com.",
+            ProtoRecordType::A,
+        )
+        .await;
+        assert_eq!(
+            pass.metadata.response_code,
+            ResponseCode::NoError,
+            "outside the window the query must not be refused"
+        );
+        match &pass.answers[0].data {
+            hickory_proto::rr::RData::A(a) => {
+                assert_eq!(a.0.to_string(), "203.0.113.61", "served outside the window");
+            }
+            other => panic!("expected A rdata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn policy_does_not_match_other_clients() {
         // Policy keyed to 10.0.0.5 — must NOT affect 127.0.0.1.
         let policy = NodePolicy {
