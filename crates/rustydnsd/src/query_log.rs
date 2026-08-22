@@ -365,6 +365,50 @@ mod tests {
     }
 
     #[test]
+    fn sustained_overfill_never_exceeds_capacity() {
+        // The privacy invariant behind the ring buffer ("no query history
+        // growth without bounds") holds CONTINUOUSLY, not just after one
+        // small overflow: stream 8x capacity through and check after every
+        // record that len never exceeded the cap. Afterwards the survivors
+        // are exactly the newest `cap` entries and nothing else.
+        let cap = 64;
+        let total = cap * 8;
+        let log = QueryLog::new(cap);
+        for i in 0..total {
+            log.record(
+                &client(),
+                &format!("host-{i}.example.com"),
+                "A",
+                0,
+                ServedBy::Resolver,
+            );
+            assert!(
+                log.len() <= cap,
+                "ring grew to {} past capacity {cap} at record {i}",
+                log.len()
+            );
+        }
+        assert_eq!(log.len(), cap);
+        let survivors: std::collections::HashSet<u64> =
+            log.snapshot().into_iter().map(|e| e.qname_hash).collect();
+        assert_eq!(survivors.len(), cap, "no duplicate survivors");
+        // Newest kept...
+        for i in (total - cap)..total {
+            assert!(
+                survivors.contains(&log.hash_qname(&format!("host-{i}.example.com"))),
+                "host-{i} should have survived"
+            );
+        }
+        // ...oldest evicted.
+        for i in 0..(total - cap) {
+            assert!(
+                !survivors.contains(&log.hash_qname(&format!("host-{i}.example.com"))),
+                "host-{i} should have been evicted"
+            );
+        }
+    }
+
+    #[test]
     fn hash_is_stable_across_calls_within_one_log() {
         let log = QueryLog::new(4);
         let a = log.hash_qname("example.com.");
