@@ -1312,9 +1312,19 @@ fn spawn_mesh_reload_loop(
 /// `TimeoutStopSec=90s` and k8s's default `terminationGracePeriodSeconds=30s`,
 /// so we always finish before the orchestrator SIGKILLs us.
 fn shutdown_timeout_from_env() -> Duration {
+    shutdown_timeout_from(
+        std::env::var("RUSTYDNS_SHUTDOWN_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure core of [`shutdown_timeout_from_env`], unit-testable without
+/// process-global env mutation (which is `unsafe` under the workspace-wide
+/// `forbid(unsafe_code)`).
+fn shutdown_timeout_from(raw: Option<&str>) -> Duration {
     const DEFAULT_SECS: u64 = 10;
-    let secs = std::env::var("RUSTYDNS_SHUTDOWN_TIMEOUT_SECS")
-        .ok()
+    let secs = raw
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| (1..=60).contains(&v))
         .unwrap_or(DEFAULT_SECS);
@@ -1969,5 +1979,79 @@ mod tests {
             al.metrics_token.is_some(),
             "current metrics listener must stay alive"
         );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_honours_deadline_and_cancels_children() {
+        use std::time::Instant;
+        // Bounded shutdown contract, three legs:
+        // 1) the configured deadline comes from
+        //    RUSTYDNS_SHUTDOWN_TIMEOUT_SECS, clamped to 1..=60 with a 10s
+        //    default for unset/invalid values — operators must be able to
+        //    reason about how long systemd's TimeoutStopSec needs to be;
+        // 2) drain() must return promptly and take BOTH child tokens, so no
+        //    DoH/metrics task outlives the deadline;
+        // 3) a real (idle) hickory Server generation drains cleanly within
+        //    its window — the select! timeout + second-signal escape are the
+        //    forcing-exit backstop for generations that hang on in-flight
+        //    queries.
+
+        // Leg 1: deadline parsing/clamping (pure core — env::set_var is
+        // unsafe under forbid(unsafe_code), so the env wrapper delegates to
+        // shutdown_timeout_from and we test that directly).
+        assert_eq!(shutdown_timeout_from(None), Duration::from_secs(10));
+        assert_eq!(
+            shutdown_timeout_from(Some("1")),
+            Duration::from_secs(1),
+            "in-range values must be honoured"
+        );
+        assert_eq!(shutdown_timeout_from(Some("60")), Duration::from_secs(60));
+        for bad in ["0", "99", "abc", ""] {
+            assert_eq!(
+                shutdown_timeout_from(Some(bad)),
+                Duration::from_secs(10),
+                "{bad:?} must fall back to the default deadline"
+            );
+        }
+
+        // Leg 2: token-only drain returns promptly and cancels children.
+        let mut al = reload_test_listeners().await;
+        let start = Instant::now();
+        al.drain(Duration::from_millis(250)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "token-only drain must not block: {:?}",
+            start.elapsed()
+        );
+        assert!(al.doh_token.is_none(), "DoH child task must be cancelled");
+        assert!(
+            al.metrics_token.is_none(),
+            "metrics child task must be cancelled"
+        );
+
+        // Leg 3: a REAL idle server generation drains cleanly in-window.
+        let mut al2 = reload_test_listeners().await;
+        let handler = al2.handler.clone();
+        let mut inherited = crate::listeners::InheritedSockets::empty();
+        let server = crate::listeners::build_dns_server(
+            handler,
+            &["127.0.0.1:0".parse().unwrap()],
+            None,
+            None,
+            None,
+            None,
+            &mut inherited,
+        )
+        .expect("idle test server");
+        al2.dns_server = Some(server);
+        let start = Instant::now();
+        al2.drain(Duration::from_millis(500)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "idle server drain hung past its window: {:?}",
+            start.elapsed()
+        );
+        assert!(al2.doh_token.is_none());
+        assert!(al2.metrics_token.is_none());
     }
 }
