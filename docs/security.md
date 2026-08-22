@@ -147,6 +147,19 @@ The `odoh-rs` (Cloudflare, BSD-2) + `hpke` 0.13 crates are pinned in workspace d
 pass `cargo deny`. The real HPKE round-trip is verified offline against an in-process mock
 target. Tracked in [`roadmap.md`](roadmap.md) §"ODoH" and `docs/TODO.md` §7.3.
 
+**Bounded relay responses (no unbounded memory).** The relay is the less-trusted half of
+the ODoH pair, so its HTTP responses are drained under hard caps with a streaming reader:
+64 KiB for `ObliviousDoHConfigs` documents and 128 KiB for oblivious DNS responses, both
+with a `Content-Length` precheck *and* a cumulative chunk check that aborts mid-stream —
+a hostile relay cannot stream gigabytes into memory before parsing (the same defence the
+blocklist fetcher applies to its sources; matters on 512 MB Pi-class hardware).
+
+**Key-rotation retry is narrow.** Only the target's HTTP **400** — RFC 9230's stale-key
+signal — triggers a config refetch + single bounded retry. A relay's own 403/429 fails
+closed immediately without hammering the target's `/.well-known` per query. OS entropy is
+health-probed before each encryption, so an `OsRng` failure surfaces as a query error
+(SERVFAIL), never a panic in a connection task.
+
 ### DNSSEC Validation
 
 Responses from upstream are DNSSEC-validated. A resolver that returns a forged answer
@@ -260,6 +273,10 @@ source:
   window, or the source is skipped for this reload cycle.
 - `max_fetch_bytes` (default 52,428,800 bytes = 50 MiB): if a response body exceeds
   this limit, the download is aborted and the source is skipped.
+- The cap applies to **local files too**: `blocklist.local_files` are read with a
+  capped streaming reader (`File::open` + `take(cap + 1)`), not a whole-file
+  buffer followed by a size check — an oversized file is rejected without ever
+  being fully resident in memory (same TOCTOU-safe shape as remote responses).
 
 ### Domain Validation
 
@@ -638,7 +655,9 @@ signature check fails and the daemon keeps serving the previous trusted
 snapshot. Mitigations:
 
 - ed25519 signature verification with a public verifier key configured
-  at startup. Bundles that fail verification are rejected and logged.
+  at startup, using `verify_strict` — non-canonical or small-order signature
+  components are rejected outright, not merely accepted as valid. Bundles that
+  fail verification are rejected and logged.
 - Freshness check: a bundle whose `expires_at_unix` is in the past, or
   whose `generated_at_unix` is older than `mesh_zone_max_age_secs`
   (default 600s), is rejected at load time. This limits the replay
