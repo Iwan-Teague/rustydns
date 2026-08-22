@@ -44,12 +44,14 @@ enum MockMode {
     /// Return undecryptable garbage (→ fail closed, never surfaced).
     Garbage,
     /// Rotate the HPKE key on the FIRST request and reject the (now stale-key)
-    /// query with a 4xx, like a real target at key rotation; answer with this A
-    /// on the retry after the client refetches the config.
+    /// query with HTTP 400 (RFC 9230's rotation signal), like a real target at
+    /// key rotation; answer with this A on the retry after the client refetches
+    /// the config.
     RotateThenAnswer(Ipv4Addr),
-    /// Always reject with a 4xx — the arm must refetch + retry once, then fail
-    /// closed (the retry is bounded, not an infinite loop).
-    AlwaysReject,
+    /// Always reject with the given status — `400` exercises the stale-key
+    /// refetch + single retry then fail-closed (bounded, not an infinite loop);
+    /// other relay-side 4xx must fail closed WITHOUT a config refetch.
+    AlwaysReject(u16),
     /// Serve a pre-built (DNSSEC-signed) zone: answer each query with the
     /// records in `MockRelay::responses` for its qtype. Used by the DNSSEC tests.
     SignedZone,
@@ -60,6 +62,8 @@ struct MockState {
     keypair: ObliviousDoHKeyPair,
     configs: Vec<u8>,
     rotated: bool,
+    /// Number of `/.well-known/odohconfigs` fetches served (test assertions).
+    config_fetches: usize,
 }
 
 /// In-process ODoH target + relay. Holds a real HPKE keypair and answers with
@@ -106,6 +110,7 @@ impl MockRelay {
                 keypair,
                 configs,
                 rotated: false,
+                config_fetches: 0,
             }),
             mode,
             responses,
@@ -114,7 +119,9 @@ impl MockRelay {
 
     /// Serve the target's currently-published `ObliviousDoHConfigs`.
     pub(super) fn fetch_configs(&self) -> Result<Vec<u8>, OdohError> {
-        Ok(self.state.lock().unwrap().configs.clone())
+        let mut st = self.state.lock().unwrap();
+        st.config_fetches += 1;
+        Ok(st.configs.clone())
     }
 
     /// Relay + target: decrypt the oblivious query, answer per [`MockMode`], and
@@ -130,17 +137,18 @@ impl MockRelay {
                 return Err(OdohError::Http("simulated proxy/network failure".into()));
             }
             MockMode::Garbage => return Ok(vec![0xde, 0xad, 0xbe, 0xef]),
-            MockMode::AlwaysReject => return Err(OdohError::RelayStatus(401)),
+            MockMode::AlwaysReject(code) => return Err(OdohError::RelayStatus(code)),
             MockMode::RotateThenAnswer(_) => {
                 let mut st = self.state.lock().unwrap();
                 if !st.rotated {
                     // First request: rotate the key, publish the new config, and
-                    // reject the stale-key query the way a real target would.
+                    // reject the stale-key query the way a real target would
+                    // (HTTP 400 — RFC 9230's rotation signal).
                     let (keypair, configs) = fresh_keypair();
                     st.keypair = keypair;
                     st.configs = configs;
                     st.rotated = true;
-                    return Err(OdohError::RelayStatus(401));
+                    return Err(OdohError::RelayStatus(400));
                 }
             }
             _ => {}
@@ -188,7 +196,7 @@ fn build_mock_response(mode: MockMode, query: &Message) -> Result<Vec<u8>, OdohE
         }
         MockMode::Nxdomain => resp.metadata.response_code = ResponseCode::NXDomain,
         MockMode::ServFail => resp.metadata.response_code = ResponseCode::ServFail,
-        MockMode::RelayError | MockMode::Garbage | MockMode::AlwaysReject => {
+        MockMode::RelayError | MockMode::Garbage | MockMode::AlwaysReject(_) => {
             unreachable!("handled before crypto")
         }
         MockMode::SignedZone => unreachable!("handled by build_signed_response"),
@@ -218,6 +226,14 @@ fn build_signed_response(
 /// Build an `OdohArm` wired to a mock target (no reqwest, no TLS).
 fn arm_with_mock(mode: MockMode) -> OdohArm {
     arm_with_mock_opts(mode, false)
+}
+
+/// Lock the mock relay's mutable state for assertions.
+fn mock_state_of(arm: &OdohArm) -> std::sync::MutexGuard<'_, MockState> {
+    match &arm.transport.http {
+        OdohHttp::Mock(m) => m.state.lock().unwrap(),
+        _ => unreachable!("test arms always use the mock transport"),
+    }
 }
 
 fn arm_with_mock_opts(mode: MockMode, pad_queries: bool) -> OdohArm {
@@ -438,14 +454,33 @@ async fn odoh_recovers_from_target_key_rotation() {
 
 #[tokio::test]
 async fn odoh_bounded_retry_then_fails_closed() {
-    // A target that ALWAYS rejects with a 4xx must not loop forever: the arm
-    // refetches + retries exactly once, then fails closed.
-    let arm = arm_with_mock(MockMode::AlwaysReject);
+    // A target that ALWAYS rejects the stale-key way (HTTP 400) must not loop
+    // forever: the arm refetches + retries exactly once, then fails closed.
+    let arm = arm_with_mock(MockMode::AlwaysReject(400));
     let err = arm
         .resolve("rejected.example.", RecordType::A, false)
         .await
         .expect_err("a persistently-rejecting target must fail closed");
     assert_eq!(err.kind_label(), "relay_status");
+}
+
+#[tokio::test]
+async fn odoh_relay_throttle_does_not_refetch_config() {
+    // A relay-side 4xx that is NOT RFC 9230's stale-key signal (403/429 — auth
+    // or throttling) must fail closed immediately WITHOUT a config refetch;
+    // otherwise a throttling relay turns every query into a `/.well-known`
+    // fetch against the target (self-amplifying fetch loop).
+    let arm = arm_with_mock(MockMode::AlwaysReject(429));
+    let err = arm
+        .resolve("throttled.example.", RecordType::A, false)
+        .await
+        .expect_err("a 429-throttling relay must fail closed");
+    assert_eq!(err.kind_label(), "relay_status");
+    assert_eq!(
+        mock_state_of(&arm).config_fetches,
+        1,
+        "exactly the initial config fetch — no retry refetch"
+    );
 }
 
 #[tokio::test]
