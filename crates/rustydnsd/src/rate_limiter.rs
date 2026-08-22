@@ -80,6 +80,22 @@ fn bucket_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Unwrap an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its native IPv4
+/// form. On a dual-stack listener (`[::]:53`, Linux `bindv6only=0`) every IPv4
+/// client arrives in this form; leaving it wrapped would zero segments 4-8 in
+/// [`bucket_key`] and collapse **all** v4 clients into one shared `::` bucket
+/// (one chatty device exhausts burst for the whole v4 population), while also
+/// hiding mapped loopback from the exemption below.
+fn normalise_mapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
 /// One client's bucket. ~48-64 bytes depending on `Instant` size.
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -146,6 +162,10 @@ impl RateLimiter {
     /// Otherwise consults / updates the IP's bucket and returns
     /// `LimitDecision::Refuse` if the bucket is empty.
     pub fn check(&self, ip: IpAddr) -> LimitDecision {
+        // IPv4-mapped IPv6 (`::ffff:a.b.c.d`, what a dual-stack socket reports
+        // for v4 peers) is unwrapped first so loopback classification and
+        // bucket keying both see the native address.
+        let ip = normalise_mapped(ip);
         // Loopback exemption — applied even when enabled. Checked on the
         // real address before prefix-collapsing, so `::1` stays exempt.
         if ip.is_loopback() {
@@ -372,14 +392,39 @@ mod tests {
 
     #[test]
     fn ipv4_mapped_ipv6_loopback_admitted() {
-        // ::ffff:127.0.0.1 — IPv4-mapped IPv6 form of loopback. The
-        // stdlib's Ipv6Addr::is_loopback is strict (`::1` only), so
-        // the limiter sees this as a normal IPv6 address subject to
-        // rate-limiting. That's intentional: a peer connecting over
-        // IPv6 with this address is not the host itself. We just
-        // assert the limiter doesn't crash on it.
+        // ::ffff:127.0.0.1 — the IPv4-mapped form of loopback, which is what a
+        // dual-stack socket reports for a v4 loopback peer. It is unwrapped to
+        // 127.0.0.1 first, so the loopback exemption applies exactly as it
+        // would for a plain-v4 connection.
         let mapped = IpAddr::V6("::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap());
         let limiter = RateLimiter::new(&cfg(1, 1, 8));
-        let _ = limiter.check(mapped); // must not panic
+        assert_eq!(limiter.check(mapped), LimitDecision::Allow);
+        assert_eq!(
+            limiter.check(IpAddr::V4("127.9.9.9".parse().unwrap())),
+            LimitDecision::Allow
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_clients_get_distinct_v4_buckets() {
+        // On a dual-stack bind every IPv4 client arrives as ::ffff:a.b.c.d.
+        // Each must key on its own /32 — not collapse into one shared `::`
+        // bucket where a single device could exhaust burst for everyone.
+        let limiter = RateLimiter::new(&cfg(1, 2, 64));
+        let unwrap = |s: &str| IpAddr::V6(s.parse::<Ipv6Addr>().unwrap());
+        let a = unwrap("::ffff:192.0.2.10");
+        let b = unwrap("::ffff:192.0.2.11");
+        // burst=2: a drains both tokens; b must still have its own budget.
+        assert_eq!(limiter.check(a), LimitDecision::Allow);
+        assert_eq!(limiter.check(a), LimitDecision::Allow);
+        assert_eq!(limiter.check(a), LimitDecision::Refuse);
+        assert_eq!(limiter.check(b), LimitDecision::Allow);
+        // Two distinct /32 buckets — and identical behaviour through the
+        // native-v4 spelling of the same addresses (same buckets).
+        assert_eq!(limiter.tracked_clients(), 2);
+        assert_eq!(
+            limiter.check(IpAddr::V4("192.0.2.10".parse().unwrap())),
+            LimitDecision::Refuse
+        );
     }
 }
