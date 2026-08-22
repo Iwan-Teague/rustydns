@@ -2003,6 +2003,93 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn allowlisted_domain_matching_a_blocklist_entry_serves_the_upstream_answer() {
+        // Allowlist precedence through the whole pipeline: a name that
+        // matches BOTH a blocklist entry and a config allowlist entry must be
+        // served from the live upstream — never NXDOMAIN'd, sinkholed, or
+        // refused. The blocklist engine already proves precedence at its own
+        // layer (config_allowlist_overrides_blocklist); this pins the same
+        // guarantee where it matters, at the daemon's gate stage.
+        use rustydns_core::config::UpstreamProtocol;
+
+        let upstream_port = spawn_a_mock("203.0.113.50").await;
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: Vec::new(),
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            // The SAME name is on the blocklist and the allowlist; the
+            // allowlist must win.
+            allowlist: vec!["allowed.example.com".to_string()],
+            ..BlocklistConfig::default()
+        }));
+        blocklist.load_trusted("0.0.0.0 allowed.example.com\n");
+        let mut dns_config = DnsConfig {
+            upstream: UpstreamConfig {
+                resolvers: vec![format!("127.0.0.1:{upstream_port}")],
+                protocol: UpstreamProtocol::Plain,
+                timeout_ms: 1000,
+                ..UpstreamConfig::default()
+            },
+            ..Default::default()
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log.clone(),
+            rate_limiter,
+            &[],
+            &[],
+        )
+        .expect("handler");
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let port = udp.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server.register_socket(udp);
+
+        let resp = query(port, "allowed.example.com.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "allowlisted name must not be blocked"
+        );
+        assert_eq!(resp.answers.len(), 1, "the real upstream answer");
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::A(a) => {
+                assert_eq!(
+                    a.0.to_string(),
+                    "203.0.113.50",
+                    "upstream rdata served for the allowlisted name"
+                );
+            }
+            other => panic!("expected A rdata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn blocked_domain_returns_sinkhole_ip_not_upstream_answer() {
         // block_response = "sinkhole": a blocked name must be answered from
         // the CONFIGURED SINKHOLE IP even though a live plain-UDP upstream
