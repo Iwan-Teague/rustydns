@@ -516,6 +516,53 @@ impl Resolver {
 ///
 /// `label` is used only in log/error messages so operators can tell
 /// which arm failed to bootstrap (e.g. `"default"`, `"lan."`).
+/// Build the hickory `ResolverOpts` for one arm from the shared config.
+/// Extracted from [`build_resolver_arm`] so the security-relevant knobs are
+/// unit-testable without bootstrapping a network resolver.
+fn build_resolver_opts(config: &DnsConfig, protocol: UpstreamProtocol) -> ResolverOpts {
+    let mut opts = ResolverOpts::default();
+    // PRIVACY: never advertise EDNS0 Client Subnet. hickory does not
+    // attach ECS automatically, but we also do not enable edns0
+    // unless DNSSEC requires it (which we set below).
+    opts.edns0 = config.upstream.dnssec_validation;
+    opts.validate = config.upstream.dnssec_validation;
+    opts.timeout = Duration::from_millis(config.upstream.timeout_ms);
+    opts.cache_size = config.upstream.max_cache_entries as u64;
+    // Hickory 0.26 took an enum for use_hosts_file. We never want
+    // /etc/hosts consulted for upstream queries (it would leak
+    // mesh names to the OS resolver path on misconfigurations).
+    opts.use_hosts_file = hickory_resolver::config::ResolveHosts::Never;
+    opts.preserve_intermediates = true;
+    // hickory 0.26 dropped `shuffle_dns_servers`; the equivalent is
+    // `ServerOrderingStrategy::RoundRobin` which distributes load
+    // uniformly over time. When randomisation is off we fall back
+    // to QueryStatistics so the healthiest provider gets preference.
+    opts.server_ordering_strategy = if config.privacy.randomize_upstream_selection {
+        ServerOrderingStrategy::RoundRobin
+    } else {
+        ServerOrderingStrategy::QueryStatistics
+    };
+
+    // DNS 0x20 (RFC-style query-name case randomisation): randomise the case of
+    // the QNAME and require the response to echo it back exactly, which forces
+    // an off-path spoofer to also guess the case bits — many extra bits of
+    // anti-spoofing / anti-cache-poisoning entropy. Enabled ONLY for PLAIN UDP
+    // upstreams: that is the only transport with no channel integrity, so it is
+    // both where 0x20 actually helps and where the (already soft-warned)
+    // operator has opted out of TLS. DoH/DoQ are integrity-protected by TLS, so
+    // 0x20 there is pure redundancy with a needless break risk against a
+    // case-insensitive server. A 0x20 mismatch makes hickory reject the
+    // response (→ SERVFAIL under our fail-closed posture), which is exactly
+    // right: a case-mangled answer on an unauthenticated channel is
+    // indistinguishable from a spoof, so refusing it is the secure choice.
+    // The end-to-end rejection behaviour is proven against a live spoofer in
+    // tests/upstream_e2e.rs::plain_upstream_rejects_case_mismatched_response_0x20;
+    // this knob wiring is pinned by unit test below.
+    opts.case_randomization = protocol == UpstreamProtocol::Plain;
+
+    opts
+}
+
 async fn build_resolver_arm(
     label: &str,
     resolvers: &[String],
@@ -553,42 +600,7 @@ async fn build_resolver_arm(
 
     let resolver_config = ResolverConfig::from_parts(None, Vec::new(), name_servers);
 
-    let mut opts = ResolverOpts::default();
-    // PRIVACY: never advertise EDNS0 Client Subnet. hickory does not
-    // attach ECS automatically, but we also do not enable edns0
-    // unless DNSSEC requires it (which we set below).
-    opts.edns0 = config.upstream.dnssec_validation;
-    opts.validate = config.upstream.dnssec_validation;
-    opts.timeout = Duration::from_millis(config.upstream.timeout_ms);
-    opts.cache_size = config.upstream.max_cache_entries as u64;
-    // Hickory 0.26 took an enum for use_hosts_file. We never want
-    // /etc/hosts consulted for upstream queries (it would leak
-    // mesh names to the OS resolver path on misconfigurations).
-    opts.use_hosts_file = hickory_resolver::config::ResolveHosts::Never;
-    opts.preserve_intermediates = true;
-    // hickory 0.26 dropped `shuffle_dns_servers`; the equivalent is
-    // `ServerOrderingStrategy::RoundRobin` which distributes load
-    // uniformly over time. When randomisation is off we fall back
-    // to QueryStatistics so the healthiest provider gets preference.
-    opts.server_ordering_strategy = if config.privacy.randomize_upstream_selection {
-        ServerOrderingStrategy::RoundRobin
-    } else {
-        ServerOrderingStrategy::QueryStatistics
-    };
-
-    // DNS 0x20 (RFC-style query-name case randomisation): randomise the case of
-    // the QNAME and require the response to echo it back exactly, which forces
-    // an off-path spoofer to also guess the case bits — many extra bits of
-    // anti-spoofing / anti-cache-poisoning entropy. Enabled ONLY for PLAIN UDP
-    // upstreams: that is the only transport with no channel integrity, so it is
-    // both where 0x20 actually helps and where the (already soft-warned)
-    // operator has opted out of TLS. DoH/DoQ are integrity-protected by TLS, so
-    // 0x20 there is pure redundancy with a needless break risk against a
-    // case-insensitive server. A 0x20 mismatch makes hickory reject the
-    // response (→ SERVFAIL under our fail-closed posture), which is exactly
-    // right: a case-mangled answer on an unauthenticated channel is
-    // indistinguishable from a spoof, so refusing it is the secure choice.
-    opts.case_randomization = protocol == UpstreamProtocol::Plain;
+    let opts = build_resolver_opts(config, protocol);
 
     let inner: TokioResolver =
         HickoryResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default())
@@ -1054,6 +1066,22 @@ mod tests {
         assert!(zone_matches("foo.lan.", "lan."));
         assert!(zone_matches("foo.bar.lan.", "lan."));
         assert!(zone_matches("FOO.LAN", "lan."));
+    }
+
+    #[test]
+    fn case_randomization_enabled_only_for_plain_udp() {
+        // DNS 0x20 knob wiring: the anti-spoofing case randomisation is
+        // enabled ONLY on the plain-UDP arm — the one transport with no
+        // channel integrity — and stays off wherever TLS already
+        // authenticates the channel (DoH/DoT/DoQ/ODoH). The end-to-end
+        // rejection of a case-mismatched response is proven against a live
+        // spoofer in tests/upstream_e2e.rs
+        // (`plain_upstream_rejects_case_mismatched_response_0x20`); this pins
+        // the wiring that makes that defence exist.
+        let cfg = DnsConfig::default();
+        assert!(build_resolver_opts(&cfg, UpstreamProtocol::Plain).case_randomization);
+        assert!(!build_resolver_opts(&cfg, UpstreamProtocol::Doh).case_randomization);
+        assert!(!build_resolver_opts(&cfg, UpstreamProtocol::Doq).case_randomization);
     }
 
     #[test]
