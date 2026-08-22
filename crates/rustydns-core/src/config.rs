@@ -2858,4 +2858,30 @@ mod tests {
         };
         validate_config(&cfg).expect("safe search config must validate");
     }
+
+    #[test]
+    fn min_tls_version_one_two_is_accepted_with_disclosure_not_rejected() {
+        // The TLS-1.3 floor is enforced at the rustls layer (see the
+        // rustydns-resolver handshake differentials); at the CONFIG layer
+        // "1.2" is a deliberate, disclosed downgrade — accepted so operators
+        // with legacy-only upstreams can still run, but always soft-warned.
+        // This pins that contract: parse → accept, never a hard rejection.
+        let mut cfg = baseline();
+        cfg.upstream.min_tls_version = TlsVersion::Tls12;
+        validate_config(&cfg).expect("min_tls_version \"1.2\" is accepted (soft-warned)");
+
+        // The default floor is 1.3 without any operator opt-in.
+        assert_eq!(TlsVersion::default(), TlsVersion::Tls13);
+        assert_eq!(UpstreamConfig::default().min_tls_version, TlsVersion::Tls13);
+
+        // Both serde spellings round-trip exactly as written in rustydns.toml.
+        #[derive(Deserialize)]
+        struct Floor {
+            min_tls_version: TlsVersion,
+        }
+        let f12: Floor = toml::from_str("min_tls_version = \"1.2\"").unwrap();
+        let f13: Floor = toml::from_str("min_tls_version = \"1.3\"").unwrap();
+        assert_eq!(f12.min_tls_version, TlsVersion::Tls12);
+        assert_eq!(f13.min_tls_version, TlsVersion::Tls13);
+    }
 }
