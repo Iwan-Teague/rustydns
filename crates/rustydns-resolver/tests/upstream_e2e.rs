@@ -316,6 +316,96 @@ async fn plain_upstream_rejects_case_mismatched_response_0x20() {
 }
 
 #[tokio::test]
+async fn plain_upstream_0x20_rejection_is_caused_by_case_mismatch_alone() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Differential proof that the 0x20 check — not any other property of the
+    // reply — is what rejects a forged answer. ONE upstream serves BOTH legs
+    // with identical plumbing (same socket, same record shape, same rcode):
+    // the first query is answered with its question echoed back EXACTLY as
+    // received (legitimate case-preserving server), every later query with
+    // the LOWERCASED name in both question and answer section (the spoofer).
+    // Only the case bits differ between the accepted and rejected replies.
+    //
+    // Two distinct long-first-label names keep each leg out of the cache, so
+    // both actually reach the wire; a long label makes mixed-case outgoing
+    // queries a certainty (see plain_upstream_randomises_query_name_case_0x20),
+    // so "echo exactly" and "lowercase" are never the same response.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().expect("local_addr");
+    let shutdown = CancellationToken::new();
+    let sh = shutdown.clone();
+    let served = Arc::new(AtomicUsize::new(0));
+    let served_inner = served.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            tokio::select! {
+                _ = sh.cancelled() => break,
+                res = socket.recv_from(&mut buf) => {
+                    let (n, src) = match res {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                        continue;
+                    };
+                    let Some(question) = query.queries.first() else {
+                        continue;
+                    };
+                    // First leg: echo verbatim. Later legs: spoof.
+                    let answered = if served_inner.fetch_add(1, Ordering::SeqCst) == 0 {
+                        question.name().clone()
+                    } else {
+                        question.name().to_lowercase()
+                    };
+                    let mut resp =
+                        Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.recursion_available = true;
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    resp.add_query(hickory_proto::op::Query::query(
+                        answered.clone(),
+                        question.query_type(),
+                    ));
+                    resp.add_answer(a_record(&answered, Ipv4Addr::new(6, 6, 6, 6), 300));
+                    if let Ok(bytes) = resp.to_bytes() {
+                        let _ = socket.send_to(&bytes, src).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let cfg = plain_config(&addr.to_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    // Leg 1 — exact-case echo: ACCEPTED.
+    let ok = resolver
+        .resolve("a-leg-one-long-first-label.example.org.", "A")
+        .await
+        .expect("exact-echo answer must be accepted under 0x20");
+    match &ok.records[0].data {
+        RecordData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(6, 6, 6, 6)),
+        other => panic!("expected A record, got {other:?}"),
+    }
+
+    // Leg 2 — lowercased question/answer: REJECTED, same everything else.
+    let err = resolver
+        .resolve("a-leg-two-long-first-label.example.org.", "A")
+        .await
+        .expect_err("lowercased-answer spoofer must be rejected");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "expected fail-closed AllUpstreamsFailed on 0x20 mismatch, got {err:?}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2,
+        "both legs reached the wire"
+    );
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same
