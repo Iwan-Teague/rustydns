@@ -406,6 +406,32 @@ mod tests {
     }
 
     #[test]
+    fn mapped_v6_and_native_v4_hash_to_the_same_bucket_key() {
+        // The unwrap itself, asserted directly. A dual-stack socket reports
+        // IPv4 peers as ::ffff:a.b.c.d; `check()` unwraps via
+        // `normalise_mapped` BEFORE keying, so the composed key must equal the
+        // bare-v4 spelling's key for the same address.
+        let mapped = |s: &str| IpAddr::V6(s.parse::<Ipv6Addr>().unwrap());
+        let native = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());
+        let key = |ip: IpAddr| bucket_key(normalise_mapped(ip));
+
+        assert_eq!(key(mapped("::ffff:192.0.2.10")), native("192.0.2.10"));
+        assert_eq!(key(mapped("::ffff:192.0.2.10")), key(native("192.0.2.10")));
+        // A real (non-mapped) IPv6 address is untouched by the unwrap and
+        // keys on its /64 prefix.
+        assert_eq!(
+            normalise_mapped(mapped("2001:db8::1")),
+            mapped("2001:db8::1")
+        );
+        assert_eq!(key(mapped("2001:db8::1")), mapped("2001:db8::"));
+        // And the mapped loopback unwraps to the exempted 127.0.0.1.
+        assert_eq!(
+            normalise_mapped(mapped("::ffff:127.0.0.1")),
+            native("127.0.0.1")
+        );
+    }
+
+    #[test]
     fn ipv4_mapped_ipv6_clients_get_distinct_v4_buckets() {
         // On a dual-stack bind every IPv4 client arrives as ::ffff:a.b.c.d.
         // Each must key on its own /32 — not collapse into one shared `::`
