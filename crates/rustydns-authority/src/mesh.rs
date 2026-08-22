@@ -44,7 +44,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use thiserror::Error;
 
 use rustydns_core::record::{DnsRecord, RecordData};
@@ -178,7 +178,10 @@ pub fn load_mesh_bundle(
 
     let (payload, signature_hex) = split_payload_and_signature(&raw)?;
     let signature = parse_signature(signature_hex)?;
-    key.verify(payload, &signature)
+    // verify_strict rejects non-canonical signatures (small-order R, malleable
+    // s >= L forms) that plain `verify` accepts — free defence-in-depth on the
+    // signature that gates the entire mesh zone.
+    key.verify_strict(payload, &signature)
         .map_err(|_| MeshBundleError::SignatureMismatch)?;
 
     let fields = parse_fields(payload)?;
