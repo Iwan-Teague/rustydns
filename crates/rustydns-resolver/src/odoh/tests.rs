@@ -70,6 +70,11 @@ struct MockState {
     /// exactly what the target received — e.g. that the oblivious wire never
     /// carries an EDNS Client Subnet option.
     captured: Vec<Message>,
+    /// The RAW HTTP bodies the relay/target hop received, most recent last
+    /// (same bound as `captured`). Lets tests assert what the wire actually
+    /// carried before any HPKE decryption — e.g. that the oblivious query is
+    /// ciphertext and leaks no plaintext query name to the hop.
+    captured_raw: Vec<Vec<u8>>,
 }
 
 /// In-process ODoH target + relay. Holds a real HPKE keypair and answers with
@@ -118,6 +123,7 @@ impl MockRelay {
                 rotated: false,
                 config_fetches: 0,
                 captured: Vec::new(),
+                captured_raw: Vec::new(),
             }),
             mode,
             responses,
@@ -175,6 +181,10 @@ impl MockRelay {
             if st.captured.len() >= CAPTURE_CAP {
                 st.captured.remove(0);
             }
+            if st.captured_raw.len() >= CAPTURE_CAP {
+                st.captured_raw.remove(0);
+            }
+            st.captured_raw.push(body.to_vec());
             st.captured.push(query_msg.clone());
         }
         let resp_wire = if matches!(self.mode, MockMode::SignedZone) {
@@ -662,6 +672,48 @@ async fn odoh_oblivious_query_carries_no_edns_client_subnet() {
         );
     }
     // No EDNS at all is equally fine — both shapes satisfy "no ECS".
+}
+
+#[tokio::test]
+async fn odoh_separates_client_identity_from_the_target() {
+    // RFC 9230's core property, pinned at the two observable layers:
+    //
+    // 1. RELAY-BLINDNESS — the HTTP body crossing the oblivious hop is the
+    //    HPKE ciphertext (config id + encrypted plaintext), so the relay (and
+    //    any passive observer on that leg) sees no plaintext query name.
+    // 2. NO CLIENT-DERIVED DATA AT THE TARGET — the decrypted query the target
+    //    receives carries only the DNS message; nothing in it identifies the
+    //    client. IP separation is structural: the client's TCP connection
+    //    terminates at the RELAY (`post_oblivious` posts exclusively to a
+    //    `proxy_urls` entry with ?targethost=&targetpath=), and the RFC 9230
+    //    response format carries no client-derived identifier back through
+    //    the relay.
+    let arm = arm_with_mock_opts(MockMode::AnswerA(Ipv4Addr::new(203, 0, 113, 30)), false);
+    arm.resolve("identity-check.example.", RecordType::A, false)
+        .await
+        .expect("resolve over the oblivious arm");
+
+    let st = mock_state_of(&arm);
+    assert_eq!(st.captured.len(), 1, "the target saw exactly one query");
+    assert_eq!(
+        st.captured[0].queries[0].name().to_string(),
+        "identity-check.example.",
+        "the correct query reached the target"
+    );
+
+    assert_eq!(
+        st.captured_raw.len(),
+        1,
+        "the oblivious hop saw exactly one request body"
+    );
+    let raw = &st.captured_raw[0];
+    let needle = b"identity-check";
+    assert!(
+        !raw.windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle)),
+        "the hop-bound body leaked the plaintext query name: {}",
+        String::from_utf8_lossy(raw)
+    );
 }
 
 #[tokio::test]
