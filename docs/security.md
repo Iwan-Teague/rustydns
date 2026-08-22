@@ -685,6 +685,13 @@ snapshot. Mitigations:
   signed-but-malicious or buggy bundle cannot drive a multi-gigabyte
   `Vec::with_capacity` from a tiny file. The signature is verified before
   the payload is parsed, so untrusted bytes never reach the record loop.
+- Record names are constrained to `<single-label><zone>`: every `label` and
+  alias must be non-empty, ≤ 63 bytes, ASCII, and dot-free. A signature
+  proves the bundle came from the signer — not that every field inside is
+  well-formed — so label validation fails closed at parse time and a
+  compromised or buggy signer cannot mint multi-level names outside the
+  intended `<label>.<zone>` shape or target the zone apex with an empty
+  label.
 - The verifier key must be deployed via the operator's normal config
   channel and never written by `rustydns`. The signing key never leaves
   `rustynetd`.
