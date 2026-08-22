@@ -418,6 +418,31 @@ async fn odoh_garbage_response_is_an_error() {
 }
 
 #[tokio::test]
+async fn odoh_validated_path_rejects_an_expired_signature() {
+    // A DIFFERENT fail-closed mode from the forged-answer case: the data is
+    // bit-exact and signed by the CORRECT (trust-anchored) key — only the
+    // RRSIG validity window has ended (signed 40 days ago with a 30-day
+    // validity). Crypto verifies; TIME does not. The validator must still
+    // mark it BOGUS and the arm must fail closed rather than serve
+    // replayable stale signatures.
+    let (responses, pubkey) = build_signed_zone_expiring_after(
+        "secure.example.",
+        Ipv4Addr::new(192, 0, 2, 53),
+        time::Duration::days(40),
+    );
+    let arm = arm_with_signed_zone(responses, &pubkey);
+    let err = arm
+        .resolve("secure.example.", RecordType::A, false)
+        .await
+        .expect_err("an answer whose RRSIG has expired must fail closed");
+    assert!(
+        matches!(err.kind_label(), "bogus" | "validation"),
+        "expected a DNSSEC failure, got {}",
+        err.kind_label()
+    );
+}
+
+#[tokio::test]
 async fn odoh_private_rdata_filtered_when_enabled() {
     // The rebinding defence applies to ODoH default-arm answers just like the
     // hickory default arm: a private A is stripped and counted.
@@ -540,6 +565,18 @@ async fn odoh_validated_path_fails_closed_when_unvalidatable() {
 /// anchor, so no parent chain is needed). Returns the per-qtype answer records
 /// (A+RRSIG, DNSKEY+RRSIG) and the apex public key to seed the trust anchor.
 fn build_signed_zone(apex: &str, ip: Ipv4Addr) -> (HashMap<RecordType, Vec<Record>>, PublicKeyBuf) {
+    build_signed_zone_expiring_after(apex, ip, time::Duration::hours(1))
+}
+
+/// Like [`build_signed_zone`], but the signatures' inception is pushed back
+/// by `inception_before_now`, so with the signer's fixed 30-day validity the
+/// RRSIGs expire `inception_before_now - 30 days` from now (negative = still
+/// valid, positive past 30 days = already expired).
+fn build_signed_zone_expiring_after(
+    apex: &str,
+    ip: Ipv4Addr,
+    inception_before_now: time::Duration,
+) -> (HashMap<RecordType, Vec<Record>>, PublicKeyBuf) {
     let name = Name::from_ascii(apex).expect("apex name");
     // ECDSA P-256 KSK (zone-key + SEP via DNSKEY::from_key).
     let pkcs8 = EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256).expect("gen key");
@@ -552,8 +589,8 @@ fn build_signed_zone(apex: &str, ip: Ipv4Addr) -> (HashMap<RecordType, Vec<Recor
         name.clone(),
         std::time::Duration::from_secs(30 * 24 * 3600),
     );
-    // Inception an hour ago so the signature is valid "now".
-    let inception = OffsetDateTime::now_utc() - time::Duration::hours(1);
+    // Inception an hour ago by default so the signature is valid "now".
+    let inception = OffsetDateTime::now_utc() - inception_before_now;
 
     // A RRset + its RRSIG.
     let a_record = Record::from_rdata(name.clone(), 300, RData::A(A(ip)));
