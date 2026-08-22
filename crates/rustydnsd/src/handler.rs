@@ -2601,6 +2601,153 @@ mod tests {
         }
     }
 
+    /// Rendered `/metrics` value for one labelled series (0.0 when the series
+    /// has not been created yet — Prometheus omits zero-valued counters).
+    fn counter_value(text: &str, family: &str, label_pair: &str) -> f64 {
+        let needle = format!("{family}{{{label_pair}}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&needle))
+            .and_then(|rest| rest.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_counters_increment_on_real_queries() {
+        // Complements metrics_handler_renders_every_registered_family, which
+        // proves EXPOSITION wiring by calling mutators directly. Here the
+        // counters must move because REAL pipeline traffic flowed: each query
+        // increments rustydns_dns_queries_by_qtype_total at receipt, and the
+        // single respond() path increments
+        // rustydns_dns_responses_by_rcode_total exactly once per reply —
+        // NoError for an authority hit, NXDOMAIN for a blocklist block.
+        use std::sync::atomic::AtomicBool;
+        use tokio_util::sync::CancellationToken;
+
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: vec![static_a("router.mesh", "100.64.0.5")],
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            ..BlocklistConfig::default()
+        }));
+        blocklist.load_trusted("0.0.0.0 blocked.example\n");
+        let mut dns_config = DnsConfig {
+            upstream: UpstreamConfig {
+                resolvers: vec!["https://127.0.0.1:1/dns-query".to_string()],
+                timeout_ms: 500,
+                ..UpstreamConfig::default()
+            },
+            ..Default::default()
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics.clone(),
+            query_log.clone(),
+            rate_limiter,
+            &[],
+            &[],
+        )
+        .expect("handler");
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let port = udp.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server.register_socket(udp);
+
+        // Serve /metrics on a second loopback listener so assertions read what
+        // an operator's Prometheus would scrape.
+        let metrics_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metrics");
+        let mport = metrics_listener.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        tokio::spawn(crate::metrics::serve(
+            metrics,
+            query_log,
+            metrics_listener,
+            "/metrics".to_string(),
+            shutdown.clone(),
+            Arc::new(AtomicBool::new(true)),
+        ));
+
+        let rendered = |mport: u16| async move {
+            reqwest::get(format!("http://127.0.0.1:{mport}/metrics"))
+                .await
+                .expect("scrape /metrics")
+                .text()
+                .await
+                .expect("metrics body")
+        };
+
+        let base = rendered(mport).await;
+        let qtype_a_base =
+            counter_value(&base, "rustydns_dns_queries_by_qtype_total", "qtype=\"A\"");
+        let noerror_base = counter_value(
+            &base,
+            "rustydns_dns_responses_by_rcode_total",
+            "rcode=\"NOERROR\"",
+        );
+        let nxdomain_base = counter_value(
+            &base,
+            "rustydns_dns_responses_by_rcode_total",
+            "rcode=\"NXDOMAIN\"",
+        );
+
+        let ok = query(port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(ok.metadata.response_code, ResponseCode::NoError);
+        let blocked = query(port, "blocked.example.", ProtoRecordType::A).await;
+        assert_eq!(blocked.metadata.response_code, ResponseCode::NXDomain);
+
+        let after = rendered(mport).await;
+        assert_eq!(
+            counter_value(&after, "rustydns_dns_queries_by_qtype_total", "qtype=\"A\""),
+            qtype_a_base + 2.0,
+            "both queries counted by qtype at receipt"
+        );
+        assert_eq!(
+            counter_value(
+                &after,
+                "rustydns_dns_responses_by_rcode_total",
+                "rcode=\"NOERROR\""
+            ),
+            noerror_base + 1.0,
+            "authority hit counted once as noerror"
+        );
+        assert_eq!(
+            counter_value(
+                &after,
+                "rustydns_dns_responses_by_rcode_total",
+                "rcode=\"NXDOMAIN\""
+            ),
+            nxdomain_base + 1.0,
+            "blocklist hit counted once as nxdomain"
+        );
+
+        shutdown.cancel();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn upstream_failure_returns_servfail() {
         // No authority hit, no blocklist match, unreachable upstream →
