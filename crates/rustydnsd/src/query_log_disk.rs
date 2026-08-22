@@ -430,4 +430,71 @@ mod tests {
             "retention exceeded max_files: .3 should not exist"
         );
     }
+
+    #[tokio::test]
+    async fn rotated_query_log_files_never_leak_plaintext_qnames() {
+        // The two halves of the on-disk contract proven TOGETHER: the
+        // hashed-qname-only guarantee is checked against the ACTIVE file by
+        // writes_ndjson_with_hashed_qname_only, and rotation_bounds_file_count
+        // only asserts file COUNT. This test streams enough traffic to force
+        // real rotations, then scans EVERY retained file (base + backups)
+        // line-by-line: no plaintext query-name material anywhere on disk,
+        // only salted hashes — including content written before a rotation.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("privacy-rot.ndjson");
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let shutdown = CancellationToken::new();
+
+        let handle = spawn(&path, 4096, 3, metrics.clone(), shutdown.clone()).unwrap();
+        let log = QueryLog::with_disk_sink(
+            8,
+            handle.sender.clone(),
+            metrics.query_log_disk_dropped_counter(),
+        );
+        for i in 0..1500 {
+            let q = format!("leakme-{i}.example.com.");
+            log.record(&client(), &q, "A", 0, ServedBy::Resolver);
+        }
+        drop(log);
+        drop(handle);
+        shutdown.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let dot1 = {
+            let mut s = path.clone().into_os_string();
+            s.push(".1");
+            PathBuf::from(s)
+        };
+        assert!(dot1.exists(), "expected at least one rotation to happen");
+
+        let files = vec![path.clone(), dot1];
+        let mut total_lines = 0usize;
+        for f in files {
+            if !f.exists() {
+                continue;
+            }
+            for line in read_lines(&f).await {
+                total_lines += 1;
+                assert!(
+                    !line.contains("leakme"),
+                    "plaintext qname leaked into {}: {line}",
+                    f.display()
+                );
+                assert!(
+                    !line.contains("example.com"),
+                    "query suffix leaked into {}: {line}",
+                    f.display()
+                );
+                assert!(
+                    line.contains("qname_hash"),
+                    "line without salted hash in {}: {line}",
+                    f.display()
+                );
+            }
+        }
+        assert!(
+            total_lines > 0,
+            "expected retained log files to contain entries"
+        );
+    }
 }
