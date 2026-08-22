@@ -1279,6 +1279,51 @@ mod tests {
     }
 
     #[test]
+    fn reload_mesh_newer_epoch_outranks_regressed_nonce_and_restart_resets_watermark() {
+        // Two lexicographic-tuple edges the one-dimension-at-a-time tests
+        // above don't pin:
+        //
+        // 1. generated_at is the PRIMARY clock: a bundle with a newer epoch
+        //    is accepted even though its nonce went backwards — nonce only
+        //    breaks ties within the same second, it is not a global counter.
+        //    (Rejection here would wedge a signer whose nonce persisted
+        //    across an epoch bump.)
+        // 2. The watermark is in-memory BY DESIGN: the Rollback warning tells
+        //    operators "restart the daemon to reset the watermark" after a
+        //    legitimate clock reset or re-key. A FRESH Authority loading an
+        //    older-but-fresh bundle must therefore accept it at startup.
+        let now = now_secs();
+        let (bundle_path, key_path) =
+            make_bundle_at(&[("router", "100.64.0.1")], "mesh", now, now + 600, 10);
+        let auth = auth_from(bundle_path.clone(), key_path.clone());
+        assert_eq!(router_ip(&auth), "100.64.0.1");
+
+        // Leg 1: newer epoch (+60s), nonce regressed 10 -> 3. Epoch dominates,
+        // so this is NOT a rollback and must apply.
+        let (newer_epoch_lower_nonce, _) =
+            make_bundle_at(&[("router", "100.64.0.9")], "mesh", now + 60, now + 600, 3);
+        std::fs::copy(&newer_epoch_lower_nonce, &bundle_path).unwrap();
+        let count = auth
+            .reload_mesh()
+            .expect("newer generated_at outranks a lower nonce");
+        assert_eq!(count, Some(1));
+        assert_eq!(router_ip(&auth), "100.64.0.9");
+
+        // Leg 2: restart equivalent — brand-new Authority over an OLDER
+        // bundle (now-120 vs applied now+60) with no in-memory watermark.
+        // Startup load has nothing to compare against; freshness alone gates
+        // it. This is the documented escape hatch from the Rollback warning.
+        let (older_fresh, _) =
+            make_bundle_at(&[("router", "100.64.0.2")], "mesh", now - 120, now + 600, 1);
+        let restarted = auth_from(older_fresh, key_path);
+        assert_eq!(
+            router_ip(&restarted),
+            "100.64.0.2",
+            "a fresh process accepts an older-but-fresh bundle (watermark reset on restart)"
+        );
+    }
+
+    #[test]
     fn reload_mesh_accepts_newer_bundle() {
         // The normal happy path: a genuinely newer bundle advances the zone.
         let now = now_secs();
