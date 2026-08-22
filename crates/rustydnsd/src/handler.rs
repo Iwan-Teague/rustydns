@@ -2090,6 +2090,104 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn regex_rule_blocks_and_sinkholes_through_the_pipeline() {
+        // Regex block rules enforced at the daemon's gate stage: the name is
+        // NOT on any exact blocklist — only the regex `^ads-` matches it —
+        // and with block_response = "sinkhole" it must be answered from the
+        // configured sinkhole IP even though a live plain-UDP upstream stands
+        // ready. The blocklist engine proves regex matching at its own layer
+        // (regex_rule_blocks_matching_qname); this pins enforcement where
+        // resolution happens, so no upstream rdata can leak for a regex hit.
+        use rustydns_core::config::UpstreamProtocol;
+
+        let upstream_port = spawn_a_mock("203.0.113.77").await;
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: Vec::new(),
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            block_response: BlockResponse::Sinkhole,
+            sinkhole_ip: "198.18.0.9".to_string(),
+            regex_rules: vec![r"^ads-".to_string()],
+            ..BlocklistConfig::default()
+        }));
+        // No load_trusted entries at all: the ONLY blocking mechanism in this
+        // test is the regex rule.
+        let mut dns_config = DnsConfig {
+            upstream: UpstreamConfig {
+                resolvers: vec![format!("127.0.0.1:{upstream_port}")],
+                protocol: UpstreamProtocol::Plain,
+                timeout_ms: 1000,
+                ..UpstreamConfig::default()
+            },
+            ..Default::default()
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let query_log = Arc::new(crate::query_log::QueryLog::new(64));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log.clone(),
+            rate_limiter,
+            &[],
+            &[],
+        )
+        .expect("handler");
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let port = udp.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server.register_socket(udp);
+
+        // The regex hit is sinkholed; the upstream answer cannot leak.
+        let resp = query(port, "ads-tracker.example.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        match &resp.answers[0].data {
+            hickory_proto::rr::RData::A(a) => {
+                assert_eq!(a.0.to_string(), "198.18.0.9", "regex hit sinkholed");
+                assert_ne!(
+                    a.0.to_string(),
+                    "203.0.113.77",
+                    "upstream answer leaked through a regex block"
+                );
+            }
+            other => panic!("expected A rdata, got {other:?}"),
+        }
+
+        // A non-matching name on the SAME suffix flows through to the live
+        // upstream untouched (the rule anchors on the `ads-` prefix, not the
+        // domain) — proving the sinkhole came from the regex match itself.
+        let pass = query(port, "docs.example.com.", ProtoRecordType::A).await;
+        assert_eq!(pass.metadata.response_code, ResponseCode::NoError);
+        match &pass.answers[0].data {
+            hickory_proto::rr::RData::A(a) => {
+                assert_eq!(a.0.to_string(), "203.0.113.77", "unmatched name resolved");
+            }
+            other => panic!("expected A rdata, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn blocked_domain_returns_sinkhole_ip_not_upstream_answer() {
         // block_response = "sinkhole": a blocked name must be answered from
         // the CONFIGURED SINKHOLE IP even though a live plain-UDP upstream
