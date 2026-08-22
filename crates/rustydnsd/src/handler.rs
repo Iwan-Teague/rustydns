@@ -1332,6 +1332,78 @@ mod tests {
         assert!(!resp.answers.is_empty());
     }
 
+    /// Two-hop CNAME chain: QNAME → `b.relay.example.` → `ads.tracker-deep.net.`
+    /// (→ A). Only the FINAL hop is on the blocklist, so only a defence that
+    /// follows the whole chain — not just the first CNAME record — can catch
+    /// it.
+    async fn spawn_deep_cname_mock() -> u16 {
+        use hickory_proto::rr::rdata::{A, CNAME};
+        use hickory_proto::rr::{RData, Record};
+
+        let hop_b: &'static str = "b.relay.example.";
+        let hop_c: &'static str = "ads.tracker-deep.net.";
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+        let port = sock.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let (n, src) = match sock.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(q) = query.queries.first() else {
+                    continue;
+                };
+                let owner = q.name().clone();
+                let b = ProtoName::from_ascii(hop_b).unwrap();
+                let c = ProtoName::from_ascii(hop_c).unwrap();
+                let mut resp =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                resp.metadata.recursion_available = true;
+                resp.metadata.response_code = ResponseCode::NoError;
+                resp.add_query(q.clone());
+                resp.add_answer(Record::from_rdata(
+                    owner,
+                    300,
+                    RData::CNAME(CNAME(b.clone())),
+                ));
+                resp.add_answer(Record::from_rdata(b, 300, RData::CNAME(CNAME(c.clone()))));
+                resp.add_answer(Record::from_rdata(
+                    c,
+                    300,
+                    RData::A(A("93.184.216.34".parse().unwrap())),
+                ));
+                if let Ok(bytes) = resp.to_bytes() {
+                    let _ = sock.send_to(&bytes, src).await;
+                }
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn deep_cname_chain_blocked_through_final_hop() {
+        // The blocklist names ONLY the final hop (`ads.tracker-deep.net`);
+        // neither the QNAME nor the intermediate relay matches. The chain
+        // check must walk every CNAME record in the answer and block on the
+        // deep one.
+        let port = spawn_deep_cname_mock().await;
+        let harness =
+            build_cname_harness("0.0.0.0 ads.tracker-deep.net\n", port, true, Vec::new()).await;
+
+        let resp = query(harness.port, "front.clean.example.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NXDomain,
+            "a chain ending in a blocked domain must be blocked at depth 2"
+        );
+        assert!(resp.answers.is_empty());
+    }
+
     /// Build a harness with `[[rewrite]]` rules and optional static records.
     /// The upstream is bogus — rewrites are served before the resolver, so a
     /// rewrite hit never touches the network.
