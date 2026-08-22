@@ -724,6 +724,53 @@ mod tests {
         }
     }
 
+    fn aaaa(name: &str, addr: &str) -> StaticRecord {
+        StaticRecord {
+            name: name.to_string(),
+            record_type: "AAAA".to_string(),
+            address: Some(addr.to_string()),
+            target: None,
+            ttl: 300,
+            client_filter: None,
+        }
+    }
+
+    #[test]
+    fn cname_chain_chases_to_terminal_aaaa_intra_zone() {
+        // RFC 1034 §3.6.2 with a v6 terminal: alias → host (AAAA). The chase
+        // is qtype-aware — querying AAAA follows the CNAME to the IPv6
+        // terminal, while the same chain queried for A must NOT fabricate an
+        // answer from the AAAA (family mismatch at the chain end = NoData
+        // carrying just the CNAME).
+        let auth = Authority::new(cfg(vec![
+            cname("v6alias.lab.example.com", "v6host.lab.example.com"),
+            aaaa("v6host.lab.example.com", "2001:db8::5"),
+        ]))
+        .unwrap();
+
+        let result = auth
+            .lookup("v6alias.lab.example.com", "AAAA")
+            .expect("in zone");
+        assert_eq!(result.len(), 2, "expected [CNAME, AAAA]; got: {result:?}");
+        assert_eq!(result[0].type_name(), "CNAME");
+        match &result[1].data {
+            RecordData::Aaaa(ip) => assert_eq!(ip.to_string(), "2001:db8::5"),
+            other => panic!("expected AAAA record at end of chain, got {other:?}"),
+        }
+
+        // Wrong family: the chain is followed (the CNAME is returned so the
+        // client can re-query), but no A answer is invented from the AAAA.
+        let wrong = auth
+            .lookup("v6alias.lab.example.com", "A")
+            .expect("in zone");
+        assert_eq!(
+            wrong.len(),
+            1,
+            "family-mismatched chase returns only the CNAME"
+        );
+        assert_eq!(wrong[0].type_name(), "CNAME");
+    }
+
     #[test]
     fn static_a_record_exact_match_returns_record() {
         let auth = Authority::new(cfg(vec![a("host.lab.example.com", "10.0.0.5")])).unwrap();
