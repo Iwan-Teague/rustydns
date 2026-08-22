@@ -764,6 +764,32 @@ async fn odoh_validated_path_rejects_a_forged_answer() {
 }
 
 #[tokio::test]
+async fn odoh_validated_path_rejects_an_untrusted_but_valid_signer() {
+    // Distinct failure class from the forged-answer case: here NOTHING is
+    // tampered — the answer is pristine and correctly self-signed by its own
+    // apex key. But the operator's trust anchor names a DIFFERENT key, so the
+    // chain of trust does not terminate at an anchor. The validator must mark
+    // it BOGUS anyway (a valid signature is not enough; it must chain to
+    // TRUST), and the arm must fail closed rather than serve well-signed data
+    // from outside the trust boundary.
+    let (responses, _real_pubkey_unused) =
+        build_signed_zone("secure.example.", Ipv4Addr::new(192, 0, 2, 53));
+    // A second, independently generated key becomes the sole anchor.
+    let (_decoy_zone, decoy_pubkey) =
+        build_signed_zone("decoy.example.", Ipv4Addr::new(192, 0, 2, 154));
+    let arm = arm_with_signed_zone(responses, &decoy_pubkey);
+    let err = arm
+        .resolve("secure.example.", RecordType::A, false)
+        .await
+        .expect_err("an answer whose chain misses the trust anchor must fail closed");
+    assert!(
+        matches!(err.kind_label(), "bogus" | "validation"),
+        "expected a DNSSEC failure, got {}",
+        err.kind_label()
+    );
+}
+
+#[tokio::test]
 async fn odoh_dns_handle_round_trips_a_query() {
     // The OdohHandle is what hickory's DNSSEC validator drives: a Query in,
     // encoded + sent obliviously, the decrypted DnsResponse back out. This is
