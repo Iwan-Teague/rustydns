@@ -2179,6 +2179,143 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn per_client_policies_are_ip_keyed_and_do_not_leak() {
+        // Policy-level counterpart to the rate-limit differential above: two
+        // distinct client IPs in ONE handler must resolve to their OWN
+        // compiled policies. Client A carries an all-day block window (the
+        // schedule gate refuses even authority hits); client B has no policy
+        // at all and must be served the same name — in both directions, and
+        // repeatedly, so neither client's traffic can lift or inherit the
+        // other's state.
+        use hickory_proto::op::Message as ProtoMessage;
+        use hickory_server::net::runtime::TokioTime;
+        use hickory_server::net::xfer::Protocol;
+        use hickory_server::server::{Request as HickoryRequest, RequestHandler};
+        use rustydns_core::config::NodePolicy;
+
+        let windowed = NodePolicy {
+            node_id: None,
+            client_ip: Some("203.0.113.10".to_string()),
+            blocklist_bypass: false,
+            zones_allowed: Vec::new(),
+            log_all_queries: false,
+            block_windows: vec![rustydns_core::config::BlockWindow {
+                days: Vec::new(), // every day
+                start: None,      // all-day
+                end: None,
+                utc_offset_minutes: 0,
+            }],
+            blocklist_group: None,
+        };
+        // B is deliberately ABSENT from the map — default posture, not a
+        // second entry that could alias A's.
+        let policies = vec![windowed];
+
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: vec![static_a("pk.example.", "100.64.0.9")],
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            ..BlocklistConfig::default()
+        }));
+        let mut dns_config = DnsConfig {
+            upstream: rustydns_core::config::UpstreamConfig {
+                resolvers: vec!["127.0.0.1:1".to_string()],
+                protocol: rustydns_core::config::UpstreamProtocol::Plain,
+                timeout_ms: 100,
+                ..rustydns_core::config::UpstreamConfig::default()
+            },
+            ..Default::default()
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            Arc::new(Metrics::new().expect("metrics")),
+            Arc::new(crate::query_log::QueryLog::new(64)),
+            Arc::new(crate::rate_limiter::RateLimiter::new(
+                &rustydns_core::config::RateLimitConfig {
+                    enabled: false,
+                    ..rustydns_core::config::RateLimitConfig::default()
+                },
+            )),
+            &policies,
+            &[],
+        )
+        .expect("handler");
+
+        let responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capturer = CapturingHandler {
+            responses: responses.clone(),
+        };
+
+        let mut query_msg = ProtoMessage::new(0x4321, MessageType::Query, OpCode::Query);
+        query_msg.metadata.recursion_desired = true;
+        query_msg.add_query({
+            let mut q = Query::new();
+            q.set_name(ProtoName::from_ascii("pk.example.").unwrap())
+                .set_query_type(ProtoRecordType::A);
+            q
+        });
+        let raw = query_msg.to_bytes().expect("encode query");
+        let ask = |peer: &str| -> HickoryRequest {
+            HickoryRequest::from_bytes(
+                raw.clone(),
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+                Protocol::Udp,
+            )
+            .expect("build request")
+        };
+
+        // A (policy-keyed, all-day window): refused every time.
+        for leg in 0..2 {
+            let info = handler
+                .handle_request::<_, TokioTime>(&ask("203.0.113.10:53101"), capturer.clone())
+                .await;
+            assert_eq!(
+                info.response_code,
+                ResponseCode::Refused,
+                "leg {leg}: the windowed client's schedule gate must fire"
+            );
+        }
+        // B (no policy entry): served from authority, unaffected by A.
+        for leg in 0..2 {
+            let info = handler
+                .handle_request::<_, TokioTime>(&ask("203.0.113.11:53102"), capturer.clone())
+                .await;
+            assert_eq!(
+                info.response_code,
+                ResponseCode::NoError,
+                "leg {leg}: the unkeyed client must NOT inherit A's window"
+            );
+        }
+        // Interleaved again: A is still refused after B's traffic — policy
+        // state never crossed.
+        let info = handler
+            .handle_request::<_, TokioTime>(&ask("203.0.113.10:53101"), capturer.clone())
+            .await;
+        assert_eq!(info.response_code, ResponseCode::Refused);
+
+        // Decode what went back on the wire for the final pair.
+        let sent = responses.lock().unwrap().clone();
+        assert_eq!(sent.len(), 5);
+        let last_a = ProtoMessage::from_bytes(&sent[4]).expect("decode reply");
+        assert_eq!(last_a.metadata.response_code, ResponseCode::Refused);
+    }
+
     /// Send a question over TCP using the standard 2-byte length prefix
     /// from RFC 1035 §4.2.2. Returns the parsed response.
     async fn query_tcp(port: u16, name: &str, rtype: ProtoRecordType) -> Message {
