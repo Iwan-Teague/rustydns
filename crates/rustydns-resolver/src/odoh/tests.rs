@@ -764,3 +764,142 @@ mod http_cap {
         assert_eq!(body, BODY);
     }
 }
+
+/// Real-TLS coverage for [`super::build_http_client`] — the reqwest client the
+/// production arm uses (the mock transport above never touches it). Mirrors
+/// lib.rs's `min_tls_version_floor_rejects_tls12_only_upstream` differential,
+/// but at the reqwest layer: ONE TLS-1.2-only rustls listener, and only the
+/// client's `min_tls_version` changes between halves. The same self-signed EC
+/// P-256 `localhost` leaf is reused as served cert + injected trust root.
+mod http_tls {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_rustls::TlsAcceptor;
+
+    const FLOOR_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBpjCCAU2gAwIBAgIUH4msZODlyUITY4qNh4Zy3iQ6GmgwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDUzMTIyNTg1MVoYDzIxMjYwNTA3
+MjI1ODUxWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAAQi321SoibBr5yqX+f8XO1mPhaahr1568soaw6eFothmwpv2BKVytPt
+M++E6xpBmIdD4mhTu3uvhg3wqibpkvYso3sweTAdBgNVHQ4EFgQUQMU/jc/PJ3gt
+R+iCyuMVlkuMPUQwHwYDVR0jBBgwFoAUQMU/jc/PJ3gtR+iCyuMVlkuMPUQwFAYD
+VR0RBA0wC4IJbG9jYWxob3N0MAwGA1UdEwEB/wQCMAAwEwYDVR0lBAwwCgYIKwYB
+BQUHAwEwCgYIKoZIzj0EAwIDRwAwRAIgGguAP9CRizUikjwkfgo8pEdRu/ZvI6cG
+threFGzaaJECIHXHcR7aMNF5wT6anz3/VndM0s1gnQtyWBITOHKZ0LYN
+-----END CERTIFICATE-----
+";
+    const FLOOR_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg3eneNckGaJqvOLfi
+3WH4EkMxC0+QnthrXihUDPWzdBWhRANCAAQi321SoibBr5yqX+f8XO1mPhaahr15
+68soaw6eFothmwpv2BKVytPtM++E6xpBmIdD4mhTu3uvhg3wqibpkvYs
+-----END PRIVATE KEY-----
+";
+
+    /// A TLS-**1.2-only** loopback server that answers a completed handshake
+    /// with a minimal HTTP/1.1 200 — enough for reqwest to treat it as a valid
+    /// origin when the client's floor admits TLS 1.2.
+    async fn spawn_tls12_server() -> u16 {
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+        let cert_der =
+            CertificateDer::from_pem_slice(FLOOR_CERT_PEM.as_bytes()).expect("cert parses");
+        let key_der = PrivateKeyDer::from_pem_slice(FLOOR_KEY_PEM.as_bytes()).expect("key parses");
+        let server_cfg =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .expect("server cert/key load");
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acceptor.accept(stream).await {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        // Drain the request head before answering so hyper
+                        // sees a well-formed request/response exchange.
+                        let mut buf = [0u8; 2048];
+                        loop {
+                            match tls.read(&mut buf).await {
+                                Ok(n) if n > 0 => {
+                                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                        let _ = tls
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                            .await;
+                        let _ = tls.shutdown().await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn odoh_http_client(
+        min_tls: TlsVersion,
+        roots: &[rustls_pki_types::CertificateDer<'static>],
+    ) -> reqwest::Client {
+        build_http_client(min_tls, Duration::from_secs(5), roots).expect("odoh http client builds")
+    }
+
+    #[tokio::test]
+    async fn tls13_floor_refuses_a_tls12_only_origin_over_reqwest() {
+        use rustls_pki_types::CertificateDer;
+        use rustls_pki_types::pem::PemObject;
+        let cert_der =
+            CertificateDer::from_pem_slice(FLOOR_CERT_PEM.as_bytes()).expect("cert parses");
+        let port = spawn_tls12_server().await;
+
+        // Tls13 floor → the handshake against the 1.2-only origin MUST fail.
+        let err = odoh_http_client(TlsVersion::Tls13, std::slice::from_ref(&cert_der))
+            .get(format!("https://localhost:{port}/proxy"))
+            .send()
+            .await
+            .expect_err("a TLS-1.3-floor client must refuse a TLS-1.2-only origin");
+
+        // Tls12 floor → the SAME origin completes; only the floor changed.
+        let resp = odoh_http_client(TlsVersion::Tls12, std::slice::from_ref(&cert_der))
+            .get(format!("https://localhost:{port}/proxy"))
+            .send()
+            .await
+            .expect("a TLS-1.2-floor client reaches the 1.2-only origin");
+        assert_eq!(resp.status(), 200);
+        assert!(
+            !err.to_string().to_lowercase().contains("dns error"),
+            "failure must be the TLS handshake, not name resolution: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn https_only_client_refuses_plain_http_url() {
+        let client = odoh_http_client(TlsVersion::Tls13, &[]);
+        let err = client
+            .get("http://127.0.0.1:9/cap")
+            .send()
+            .await
+            .expect_err("https_only must reject plain-HTTP URLs before any I/O");
+        let msg = err.to_string().to_lowercase();
+        // reqwest enforces `https_only` while building the request, so the
+        // rejection surfaces as a builder error — NOT a connect error (the
+        // port is closed, so a client without the flag would report
+        // "connection refused" instead).
+        assert!(
+            msg.contains("builder error") || msg.contains("scheme") || msg.contains("https"),
+            "unexpected rejection reason: {err}"
+        );
+    }
+}
