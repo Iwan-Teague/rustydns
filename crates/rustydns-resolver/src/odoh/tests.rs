@@ -790,6 +790,36 @@ async fn odoh_validated_path_rejects_an_untrusted_but_valid_signer() {
 }
 
 #[tokio::test]
+async fn odoh_missing_rrsig_breaks_the_chain_and_fails_closed() {
+    // A third broken-chain class beside forgery and expiry: the RRSIG is
+    // MISSING entirely. The answer records themselves are pristine (built by
+    // the trusted signer), but the A RRset arrives with its signature link
+    // absent — the validator has nothing to verify, and an unsigned answer in
+    // a zone we expect to be signed must not be served as Secure.
+    let (mut responses, pubkey) =
+        build_signed_zone("secure.example.", Ipv4Addr::new(192, 0, 2, 53));
+    if let Some(a_set) = responses.get_mut(&RecordType::A) {
+        a_set.retain(|r| !matches!(r.data, RData::DNSSEC(DNSSECRData::RRSIG(_))));
+    }
+    assert!(
+        responses[&RecordType::A]
+            .iter()
+            .all(|r| !matches!(r.data, RData::DNSSEC(DNSSECRData::RRSIG(_)))),
+        "fixture should have stripped the A RRSIG"
+    );
+    let arm = arm_with_signed_zone(responses, &pubkey);
+    let err = arm
+        .resolve("secure.example.", RecordType::A, false)
+        .await
+        .expect_err("an unsigned answer in a signed zone must fail closed");
+    assert!(
+        matches!(err.kind_label(), "bogus" | "validation"),
+        "expected a DNSSEC failure, got {}",
+        err.kind_label()
+    );
+}
+
+#[tokio::test]
 async fn odoh_dns_handle_round_trips_a_query() {
     // The OdohHandle is what hickory's DNSSEC validator drives: a Query in,
     // encoded + sent obliviously, the decrypted DnsResponse back out. This is
