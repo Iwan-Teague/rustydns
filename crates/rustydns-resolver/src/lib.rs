@@ -522,7 +522,7 @@ impl Resolver {
 /// Build the hickory `ResolverOpts` for one arm from the shared config.
 /// Extracted from [`build_resolver_arm`] so the security-relevant knobs are
 /// unit-testable without bootstrapping a network resolver.
-const MIN_POSITIVE_CACHE_TTL_SECS: u64 = 2;
+pub const MIN_POSITIVE_CACHE_TTL_SECS: u64 = 2;
 /// Mirror of the cache floor: an upstream cannot wedge an entry in the
 /// cache forever by advertising absurd TTLs — entries are clamped down to
 /// this ceiling so stale answers age out within a bounded window.
