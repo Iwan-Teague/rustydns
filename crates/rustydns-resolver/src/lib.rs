@@ -522,8 +522,17 @@ impl Resolver {
 /// Build the hickory `ResolverOpts` for one arm from the shared config.
 /// Extracted from [`build_resolver_arm`] so the security-relevant knobs are
 /// unit-testable without bootstrapping a network resolver.
+const MIN_POSITIVE_CACHE_TTL_SECS: u64 = 2;
+
 fn build_resolver_opts(config: &DnsConfig, protocol: UpstreamProtocol) -> ResolverOpts {
     let mut opts = ResolverOpts::default();
+    // CACHE-FLOOR: hold low-TTL answers for at least this long so a hostile
+    // upstream cannot force a re-query per lookup with 0-second records
+    // (rapid-re-query amplification against the upstream). Kept small —
+    // legitimate short-TTL records must still expire promptly (fail-fresh
+    // beats stale); the per-client rate limiter bounds the remaining abuse
+    // surface. hickory extends entries whose TTL falls below the floor.
+    opts.positive_min_ttl = Some(Duration::from_secs(MIN_POSITIVE_CACHE_TTL_SECS));
     // PRIVACY: never advertise EDNS0 Client Subnet. hickory does not
     // attach ECS automatically, but we also do not enable edns0
     // unless DNSSEC requires it (which we set below).
