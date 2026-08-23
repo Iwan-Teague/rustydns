@@ -1572,6 +1572,55 @@ async fn mixed_case_lookup_hits_the_same_cache_entry() {
 }
 
 #[tokio::test]
+async fn mixed_case_query_surfaces_canonical_lowercase_answers() {
+    // Observed contract, stated honestly: the upstream echoes whatever case
+    // we put on the wire, but the typed outcome surfaces CANONICAL
+    // LOWERCASE names — `DnsRecord::new` folds by design (matching the
+    // canonical_qname handling used across authority/blocklist/cache), so
+    // this API does not preserve wire case end-to-end. The 0x20
+    // anti-spoofing check happens inside hickory's exchange against the raw
+    // wire question; what we pin here is that case folding never corrupts
+    // DATA, never splits cache entries, and yields one deterministic shape.
+    let mock =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 31), 300)])
+            .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let out = resolver
+        .resolve("MiXeD.CaSe.OrG.", "A")
+        .await
+        .expect("mixed-case resolve");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(
+            *ip,
+            Ipv4Addr::new(203, 0, 113, 31),
+            "folding must never alter record data"
+        ),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    assert_eq!(
+        out.records[0].name, "mixed.case.org.",
+        "surfaced names are canonical lowercase, not wire-echoed"
+    );
+    assert_eq!(mock.query_count(), 1);
+
+    // The same mixed-case spelling again still hits the single folded entry.
+    let out = resolver
+        .resolve("MiXeD.CaSe.OrG.", "A")
+        .await
+        .expect("repeat mixed-case resolve");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 31)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    assert_eq!(mock.query_count(), 1, "folded key serves the repeat");
+
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn cached_answer_expires_at_ttl_and_is_reresolved() {
     // The other half of the cache contract: within the TTL the answer is
     // honoured from cache, but once it expires the entry is dropped and the
