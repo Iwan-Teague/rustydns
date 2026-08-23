@@ -1583,6 +1583,39 @@ async fn cached_answer_expires_at_ttl_and_is_reresolved() {
 }
 
 #[tokio::test]
+async fn zero_ttl_records_are_held_for_the_cache_floor() {
+    // MIN_POSITIVE_CACHE_TTL_SECS: a hostile upstream answering with
+    // TTL=0 records must not force a re-query per lookup (rapid-re-query
+    // DoS against the upstream). The floor holds the entry across an
+    // immediate repeat; the existing TTL-expiry pin proves short-TTL
+    // entries still expire promptly afterwards.
+    let mock =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(9, 9, 9, 9), 0)]).await;
+
+    let cfg = plain_config(&mock.addr_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    let out = resolver
+        .resolve("floor.example.com.", "A")
+        .await
+        .expect("initial resolve");
+    assert_eq!(out.records.len(), 1);
+    assert_eq!(mock.query_count(), 1, "first lookup is a miss");
+
+    let out = resolver
+        .resolve("floor.example.com.", "A")
+        .await
+        .expect("immediate repeat");
+    assert_eq!(out.records.len(), 1);
+    assert_eq!(
+        mock.query_count(),
+        1,
+        "a zero-TTL record must be held for the cache floor, not re-fetched per lookup"
+    );
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn nxdomain_is_a_structured_empty_result_and_repeatable() {
     // A negative answer must never surface as success-with-data or as a
     // generic failure: resolve() maps hickory's no-records error into a
