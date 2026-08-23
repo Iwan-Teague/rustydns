@@ -1670,7 +1670,6 @@ async fn a_and_aaaa_for_same_name_are_separate_cache_entries() {
     // family — instead it must hit the wire for its own type, and BOTH
     // entries must then serve their own families from cache.
     use hickory_proto::rr::rdata::AAAA;
-    let name = Name::from_ascii("dual.example.org.").unwrap();
     let v6 = std::net::Ipv6Addr::LOCALHOST;
     let mock = MockUpstream::new(move |qname, rtype| match rtype {
         RecordType::A => vec![Record::from_rdata(
@@ -1837,6 +1836,47 @@ async fn nxdomain_is_a_structured_empty_result_and_repeatable() {
         assert_eq!(out.private_rdata_dropped, 0);
     }
     assert!(mock.query_count() >= 1, "upstream must have been consulted");
+    mock.shutdown();
+}
+
+#[tokio::test]
+async fn nodata_is_served_as_empty_success_and_distinct_from_nxdomain() {
+    // NODATA (NoError + zero records for an existing name) must surface as
+    // an EMPTY SUCCESS with the nxdomain flag CLEAR — never conflated with
+    // the NXDOMAIN shape. One name-keyed mock serves both rcodes so the two
+    // negative shapes are provably distinguishable at our seam.
+    let mock = MockUpstream::new_with_rcode(|name, _| {
+        if name.to_string().to_lowercase().starts_with("gone") {
+            (ResponseCode::NXDomain, vec![])
+        } else {
+            (ResponseCode::NoError, vec![])
+        }
+    })
+    .await;
+
+    let cfg = plain_config(&mock.addr_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver");
+
+    // NODATA legs: empty success, nxdomain clear, repeatable.
+    for i in 0..2 {
+        let out = resolver
+            .resolve(&format!("nodata{i}.example.org."), "A")
+            .await
+            .expect("NODATA must not be a generic error");
+        assert!(!out.nxdomain, "NODATA must not be flagged as NXDOMAIN");
+        assert!(out.records.is_empty(), "NODATA carries no records");
+        assert_eq!(out.private_rdata_dropped, 0);
+    }
+
+    // Contrast leg: a true NXDOMAIN keeps its own shape.
+    let out = resolver
+        .resolve("gone.example.org.", "A")
+        .await
+        .expect("NXDOMAIN must not be a generic error");
+    assert!(out.nxdomain, "the NXDOMAIN shape must stay distinct");
+    assert!(out.records.is_empty());
+
+    assert!(mock.query_count() >= 3, "upstream must have been consulted");
     mock.shutdown();
 }
 
