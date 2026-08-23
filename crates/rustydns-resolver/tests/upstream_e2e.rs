@@ -817,6 +817,66 @@ async fn compression_pointer_loop_fails_closed() {
 }
 
 #[tokio::test]
+async fn rfc1035_length_limits_fail_closed() {
+    // RFC 1035 §2.3.4: labels are 1..63 octets, names at most 255. A hostile
+    // upstream answering with an oversized label (or an over-long name) must
+    // fail the parse — hickory's decoder enforces the bounds (Label rejects
+    // >63 bytes; Name caps total length) — and our seam must fail closed
+    // rather than surface anything from the malformed reply.
+    let shutdown = CancellationToken::new();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().expect("local_addr");
+    {
+        let sh = shutdown.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    _ = sh.cancelled() => break,
+                    res = socket.recv_from(&mut buf) => {
+                        let Ok((n, src)) = res else { continue };
+                        let Ok(query) = Message::from_bytes(&buf[..n]) else { continue };
+                        let Some(question) = query.queries.first() else { continue };
+                        // Handcrafted reply: valid header + question, then an
+                        // answer whose owner name is a single 70-byte label
+                        // (length byte 0x46 = 70 > 63) — illegal on the wire.
+                        let mut out = Vec::with_capacity(256);
+                        out.extend_from_slice(&query.metadata.id.to_be_bytes());
+                        out.extend_from_slice(&[0x80, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                        for b in question.name().to_string().as_bytes() {
+                            if *b != b'.' && *b != b'\\' { out.push(*b); }
+                            else if *b == b'.' { }
+                        }
+                        out.push(0); // root of question name
+                        out.extend_from_slice(&[0, 1, 0, 1]); // QTYPE=A QCLASS=IN
+                        out.push(0x46); // label length byte: 70 octets
+                        out.extend_from_slice(&[b'a'; 70]);
+                        out.push(0); // end of (illegal) name
+                        out.extend_from_slice(&[0, 1, 0, 1]); // TYPE=A CLASS=IN
+                        out.extend_from_slice(&[0, 0, 0, 60]); // TTL
+                        out.extend_from_slice(&[0, 4, 203, 0, 113, 99]); // RDLENGTH + A
+                        let _ = socket.send_to(&out, src).await;
+                    }
+                }
+            }
+        });
+    }
+
+    let resolver = Resolver::new(plain_config(&addr.to_string()))
+        .await
+        .expect("resolver init");
+    let err = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect_err("a reply with a >63-octet label must fail closed");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "oversized-label reply must fail closed, got {err:?}"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn out_of_bailiwick_answer_records_are_ignored_not_cached() {
     // A hostile upstream answers the victim's query but stuffs an extra
     // record for a DIFFERENT name into the answer section (cache-poisoning
