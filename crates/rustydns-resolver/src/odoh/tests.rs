@@ -736,6 +736,52 @@ async fn odoh_validated_path_accepts_a_signed_answer() {
 }
 
 #[tokio::test]
+async fn odoh_validated_answer_classifies_as_secure() {
+    // The accepts test pins that a complete chain is served; this pins the
+    // CLASSIFICATION itself: driving the same DnssecDnsHandle-over-OdohHandle
+    // stack directly, the validated answer set must classify as Secure via
+    // the same classifier production uses (DnssecSummary::from_records) —
+    // i.e. the served answer is authenticated data, not merely "no error".
+    let (responses, pubkey) = build_signed_zone("secure.example.", Ipv4Addr::new(192, 0, 2, 53));
+    let mut anchor = TrustAnchors::empty();
+    anchor.insert(&pubkey);
+    let target = OdohTarget::parse("https://target.test/dns-query").expect("parse target");
+    let handle = OdohHandle {
+        transport: Arc::new(OdohTransport {
+            targets: vec![target],
+            proxy_urls: vec!["https://proxy.test/".to_string()],
+            http: OdohHttp::Mock(Arc::new(MockRelay::signed(responses))),
+            randomize: false,
+            pad_queries: false,
+        }),
+    };
+    let validating = DnssecDnsHandle::with_trust_anchor(handle, Arc::new(anchor));
+    let query = Query::query(Name::from_ascii("secure.example.").unwrap(), RecordType::A);
+    let response = validating
+        .lookup(query, DnsRequestOptions::default())
+        .first_answer()
+        .await
+        .expect("a complete DS->DNSKEY->RRSIG chain must validate");
+
+    use hickory_proto::dnssec::DnssecSummary;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        matches!(
+            DnssecSummary::from_records(response.answers.iter()),
+            DnssecSummary::Secure
+        ),
+        "the validated answer must classify as Secure"
+    );
+    assert!(
+        response
+            .answers
+            .iter()
+            .any(|r| matches!(r.data, RData::DNSSEC(DNSSECRData::RRSIG(_)))),
+        "the RRSIG chain material must travel with the answer"
+    );
+}
+
+#[tokio::test]
 async fn odoh_validated_path_rejects_a_forged_answer() {
     // Same signed zone, but the A record's address is swapped while keeping the
     // original (now-mismatched) RRSIG — a forgery. The validator must mark it
