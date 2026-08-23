@@ -727,6 +727,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn any_refusal_metric_increments_and_renders() {
+        // The ANY-gate refusal path must be observable: inc_policy_refused_any
+        // is the only mutator wired to gate_any_qtype, so the family must
+        // render with the exact incremented value.
+        let m = Arc::new(Metrics::new().unwrap());
+        m.inc_policy_refused_any();
+        m.inc_policy_refused_any();
+        let resp = metrics_handler(m.clone()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = std::str::from_utf8(&body).expect("utf-8 body");
+        assert!(
+            body.contains("rustydns_policy_refused_any_total 2"),
+            "ANY-refusal metric missing or wrong value: {}",
+            body.lines()
+                .filter(|l| l.contains("refused_any"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn metrics_handler_renders_every_registered_family() {
         let m = Arc::new(Metrics::new().unwrap());
 
