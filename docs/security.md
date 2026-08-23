@@ -637,6 +637,32 @@ a parsing vulnerability in `hickory-server` or `hyper`. Mitigations:
   DoH clients share the proxy's loopback identity — apply rate limiting at the proxy.)
 - Operators should place a reverse proxy with request size limits and rate limiting
   in front of any externally reachable DoH endpoint.
+- Input validation on both verbs (RFC 8484): POST requires the
+  `application/dns-message` content type (`415` otherwise, parameters tolerated);
+  GET rejects malformed base64url (`400`), and an oversized `dns=` parameter can
+  never reach the parser — a shared gate rejects empty messages and anything over
+  65 535 bytes with `413` for both verbs. Unsupported HTTP methods are rejected
+  before DNS processing (`405`; `HEAD` via the GET route's missing-parameter `400`).
+
+### Listener Hardening (Amplification Defence)
+
+- **ANY (qtype 255) queries are REFUSED** before the pipeline (RFC 8482
+  minimal-answer posture) — an ANY answer can be arbitrarily large, so serving one
+  makes the resolver an amplification vector. Counted by
+  `rustydns_policy_refused_any_total`.
+- **EDNS buffer advertisements are clamped** to 4096 bytes: a client advertising a
+  64 KiB receive buffer gets that ceiling echoed straight back in older designs,
+  inviting oversized-datagram/fragmentation abuse. Sub-cap advertisements pass
+  through untouched; exactly-at-cap passes unclamped.
+- **UDP replies never exceed the datagram cap**: the response is measured after
+  encoding; if it exceeds the cap (512 classic, or the clamped advertised payload),
+  answers are dropped with the TC bit set until it fits (RFC-appropriate truncation)
+  rather than shipping a fragmented oversized datagram. TCP/DoT/DoQ are exempt
+  (stream transports have no datagram limit).
+- **Inbound bounding**: datagrams beyond hickory's 4096-byte receive buffer cannot
+  decode as valid DNS and are dropped; query names that terminate early with
+  trailing garbage (or never terminate) are likewise rejected before any pipeline
+  stage runs.
 
 ### Slow Loris on Blocklist Fetch
 
