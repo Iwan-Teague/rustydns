@@ -764,6 +764,59 @@ async fn mismatched_question_section_is_rejected_as_spoofed() {
 }
 
 #[tokio::test]
+async fn compression_pointer_loop_fails_closed() {
+    // A hostile upstream sends a response whose answer NAME is a compression
+    // pointer pointing at ITSELF (0xC0|self-offset). hickory's decoder
+    // structurally forbids non-prior pointers (PointerNotPriorToLabel), so
+    // the message can never decompress — the loop is bounded by the parser,
+    // and our seam must fail closed rather than surface any answer.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().expect("local_addr");
+    let shutdown = CancellationToken::new();
+    let sh = shutdown.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            tokio::select! {
+                _ = sh.cancelled() => break,
+                res = socket.recv_from(&mut buf) => {
+                    let Ok((_, src)) = res else { continue };
+
+                    // Handcrafted wire bytes: header + one question
+                    // (victim.example.org. A IN) + one answer whose name is a
+                    // pointer to itself (offset 37 = 0x25).
+                    let mut raw: Vec<u8> = Vec::new();
+                    raw.extend_from_slice(&[0x12, 0x34, 0x80, 0x00]); // id, QR
+                    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QD=1 AN=1
+                    raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                    raw.extend_from_slice(b"\x06victim\x07example\x03org\x00");
+                    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+                    raw.extend_from_slice(&[0xC0, 0x25]); // self-referential ptr
+                    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+                    raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
+                    raw.extend_from_slice(&[0x00, 0x04, 203, 0, 113, 99]);
+
+                    let _ = socket.send_to(&raw, src).await;
+                }
+            }
+        }
+    });
+
+    let resolver = Resolver::new(plain_config(&addr.to_string()))
+        .await
+        .expect("resolver init");
+    let err = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect_err("a looping message must fail closed, never serve");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "pointer-loop reply must fail closed, got {err:?}"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn out_of_bailiwick_answer_records_are_ignored_not_cached() {
     // A hostile upstream answers the victim's query but stuffs an extra
     // record for a DIFFERENT name into the answer section (cache-poisoning
