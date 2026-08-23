@@ -1220,6 +1220,42 @@ mod tests {
     }
 
     #[test]
+    fn dedup_collapses_case_variant_duplicates_and_survives_degenerate_names() {
+        // Mutation-tested: removing the dedup_identical call fails the wire
+        // pin (duplicate_records_are_deduplicated_in_answers). These edges
+        // go further:
+        // 1. Case-variant duplicates collapse — DnsRecord::new lowercases at
+        //    construction, so the two spellings are byte-identical by the
+        //    time the key is built.
+        // 2. Degenerate names (root ".") must not panic inside the key
+        //    builder.
+        let mut records = vec![
+            DnsRecord::new(
+                "Router.Mesh.",
+                RecordData::A(Ipv4Addr::new(1, 2, 3, 4)),
+                Duration::from_secs(60),
+            ),
+            DnsRecord::new(
+                "router.mesh.",
+                RecordData::A(Ipv4Addr::new(1, 2, 3, 4)),
+                Duration::from_secs(60),
+            ),
+            DnsRecord::new(
+                ".",
+                RecordData::Txt(vec![b"root".to_vec()]),
+                Duration::from_secs(30),
+            ),
+        ];
+        let dropped = dedup_identical(&mut records);
+        assert_eq!(dropped, 1, "the case-variant duplicate must collapse");
+        assert_eq!(records.len(), 2);
+        // The survivor is the canonical lowercase spelling.
+        assert_eq!(records[0].name, "router.mesh.");
+        // The root-name record survives untouched (distinct name+data+ttl).
+        assert_eq!(records[1].name, ".");
+    }
+
+    #[test]
     fn case_randomization_enabled_only_for_plain_udp() {
         // DNS 0x20 knob wiring: the anti-spoofing case randomisation is
         // enabled ONLY on the plain-UDP arm — the one transport with no
