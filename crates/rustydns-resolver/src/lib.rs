@@ -403,8 +403,9 @@ impl Resolver {
             Ok(lookup) => {
                 let mut records = lookup_to_dns_records(lookup.answers());
                 let mut dropped: u32 = 0;
+                dropped += filter_out_of_bailiwick(&mut records, name);
                 if on_default && self.config.upstream.block_private_rdata {
-                    dropped = filter_private_rdata(&mut records);
+                    dropped += filter_private_rdata(&mut records);
                 }
                 tracing::trace!(
                     qtype = %record_type,
@@ -925,6 +926,46 @@ pub(crate) fn filter_private_rdata(records: &mut Vec<DnsRecord>) -> u32 {
         tracing::warn!(
             dropped,
             "rebinding defence: dropped upstream A/AAAA record(s) with private rdata"
+        );
+    }
+    dropped
+}
+
+/// Drop answer records whose owner name is neither the queried name nor a
+/// name reached by following CNAME links from it within the same answer set.
+///
+/// A hostile (or merely broken) upstream can stuff extra records — for names
+/// the client never asked about — into the answer section of a legitimate
+/// reply. Serving or caching those is cache-poisoning bait: the resolver's
+/// cache is keyed on the queried name, but the planted records would still be
+/// handed to the caller. Legitimate CNAME chains are preserved by walking the
+/// links: every owner reachable from the qname through in-answer CNAMEs stays.
+/// Applied unconditionally (unlike the opt-in rebinding defence) — an upstream
+/// has no business answering for names we did not ask it about.
+pub(crate) fn filter_out_of_bailiwick(records: &mut Vec<DnsRecord>, qname: &str) -> u32 {
+    let canonical = |n: &str| n.trim_end_matches('.').to_ascii_lowercase();
+    let mut allowed: std::collections::HashSet<String> = [canonical(qname)].into();
+    loop {
+        let mut grew = false;
+        for r in records.iter() {
+            if let RecordData::Cname(target) = &r.data
+                && allowed.contains(&canonical(&r.name))
+                && allowed.insert(canonical(target))
+            {
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let before = records.len();
+    records.retain(|r| allowed.contains(&canonical(&r.name)));
+    let dropped = (before - records.len()) as u32;
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "bailiwick defence: dropped upstream record(s) for unrequested names"
         );
     }
     dropped
