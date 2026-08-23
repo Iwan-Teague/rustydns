@@ -1236,6 +1236,40 @@ mod tests {
     }
 
     #[test]
+    fn bailiwick_filter_terminates_on_cyclic_cname_links() {
+        // Edge for the bailiwick fixpoint walk: a hostile answer whose CNAME
+        // links form a CYCLE (victim -> a -> victim) plus records owned by
+        // every link member must terminate (the allowed-set insert is
+        // idempotent at fixpoint) and keep exactly the chain members.
+        let mut records = vec![
+            DnsRecord::new(
+                "victim.example.org.",
+                RecordData::Cname("a.example.org.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "a.example.org.",
+                RecordData::Cname("victim.example.org.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "a.example.org.",
+                RecordData::A(Ipv4Addr::new(203, 0, 113, 70)),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "outsider.example.net.",
+                RecordData::A(Ipv4Addr::new(6, 6, 6, 6)),
+                Duration::from_secs(300),
+            ),
+        ];
+        let dropped = filter_out_of_bailiwick(&mut records, "victim.example.org.");
+        assert_eq!(dropped, 1, "the out-of-chain record must be counted");
+        assert_eq!(records.len(), 3, "chain members survive, outsiders go");
+        assert!(records.iter().all(|r| r.name.ends_with("example.org.")));
+    }
+
+    #[test]
     fn zone_no_match_for_unrelated() {
         assert!(!zone_matches("example.com.", "lan."));
         assert!(!zone_matches("notlan.", "lan."));
