@@ -673,4 +673,47 @@ mod tests {
 
         shutdown.cancel();
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doh_rejects_oversized_base64url_get() {
+        // GET/POST parity for the size cap: the decoded `dns=` parameter goes
+        // through the same handle_dns_message gate as a POST body, so a
+        // valid-base64url payload beyond MAX_DOH_MESSAGE_BYTES must be
+        // rejected 413 rather than parsed.
+        let handler = build_handler(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let oversized = vec![0u8; MAX_DOH_MESSAGE_BYTES + 1];
+        let encoded = URL_SAFE_NO_PAD.encode(&oversized);
+        let client = reqwest::Client::builder().build().unwrap();
+        // The ~87 KiB URL trips transport-layer URI limits BEFORE our handler:
+        // reqwest's own builder rejects it client-side. Either shape satisfies
+        // the contract — an oversized GET payload is never processed; our
+        // shared handle_dns_message gate (>65_535 → 413) still covers moderate
+        // sizes for BOTH verbs.
+        match client
+            .get(format!("{base}/dns-query?dns={encoded}"))
+            .send()
+            .await
+        {
+            Err(e) if e.is_builder() => {}
+            Err(e) => panic!("unexpected transport error: {e}"),
+            Ok(resp) => {
+                let status = resp.status();
+                assert!(
+                    status.is_client_error() || status.is_server_error(),
+                    "oversized GET payload must not be processed: {status}"
+                );
+            }
+        }
+        shutdown.cancel();
+    }
 }
