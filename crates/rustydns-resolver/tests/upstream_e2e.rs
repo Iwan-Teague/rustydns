@@ -1663,6 +1663,77 @@ async fn concurrent_identical_queries_are_coalesced() {
 }
 
 #[tokio::test]
+async fn a_and_aaaa_for_same_name_are_separate_cache_entries() {
+    // The cache key is (qname, qtype, qclass): an A and an AAAA for the SAME
+    // name must be independent entries. If the key were qname-only, the
+    // second lookup would be served from the first entry with the wrong
+    // family — instead it must hit the wire for its own type, and BOTH
+    // entries must then serve their own families from cache.
+    use hickory_proto::rr::rdata::AAAA;
+    let name = Name::from_ascii("dual.example.org.").unwrap();
+    let v6 = std::net::Ipv6Addr::LOCALHOST;
+    let mock = MockUpstream::new(move |qname, rtype| match rtype {
+        RecordType::A => vec![Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 15))),
+        )],
+        RecordType::AAAA => vec![Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::AAAA(AAAA(v6)),
+        )],
+        _ => Vec::new(),
+    })
+    .await;
+
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let a_out = resolver
+        .resolve("dual.example.org.", "A")
+        .await
+        .expect("A lookup must succeed");
+    assert_eq!(a_out.records.len(), 1);
+    match &a_out.records[0].data {
+        RecordData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 15)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    assert_eq!(mock.query_count(), 1, "the A leg is the first wire query");
+
+    let aaaa_out = resolver
+        .resolve("dual.example.org.", "AAAA")
+        .await
+        .expect("AAAA lookup must succeed");
+    assert!(
+        aaaa_out
+            .records
+            .iter()
+            .any(|r| matches!(r.data, RecordData::Aaaa(_))),
+        "the AAAA lookup must not be served from the A entry: {aaaa_out:?}"
+    );
+    assert_eq!(
+        mock.query_count(),
+        2,
+        "the AAAA lookup must go to the wire — a different qtype is a different cache entry"
+    );
+
+    // Re-resolve the A: served from its own cache entry, no third wire hit.
+    let again = resolver
+        .resolve("dual.example.org.", "A")
+        .await
+        .expect("repeat A lookup must succeed");
+    assert_eq!(again.records.len(), 1);
+    assert_eq!(
+        mock.query_count(),
+        2,
+        "both entries are cached independently"
+    );
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn zero_ttl_records_are_held_for_the_cache_floor() {
     // MIN_POSITIVE_CACHE_TTL_SECS: a hostile upstream answering with
     // TTL=0 records must not force a re-query per lookup (rapid-re-query
