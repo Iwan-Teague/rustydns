@@ -44,6 +44,7 @@ pub struct Metrics {
     policy_zone_denied_total: IntCounter,
     policy_schedule_blocked_total: IntCounter,
     policy_rate_limited_total: IntCounter,
+    policy_refused_any_total: IntCounter,
     private_rdata_dropped_total: IntCounter,
     query_log_disk_written_total: IntCounter,
     query_log_disk_dropped_total: IntCounter,
@@ -191,6 +192,12 @@ impl Metrics {
             "Queries refused with REFUSED because the source IP exceeded \
              the per-client token-bucket rate limit",
         )?;
+        let policy_refused_any_total = register_counter(
+            &registry,
+            "rustydns_policy_refused_any_total",
+            "ANY (qtype 255) queries refused with REFUSED (RFC 8482 \
+             minimal-answer posture)",
+        )?;
         let query_log_disk_written_total = register_counter(
             &registry,
             "rustydns_query_log_disk_written_total",
@@ -238,6 +245,7 @@ impl Metrics {
             policy_zone_denied_total,
             policy_schedule_blocked_total,
             policy_rate_limited_total,
+            policy_refused_any_total,
             private_rdata_dropped_total,
             query_log_disk_written_total,
             query_log_disk_dropped_total,
@@ -390,6 +398,11 @@ impl Metrics {
     /// Increment when the per-source-IP rate limiter refused a query.
     pub fn inc_policy_rate_limited(&self) {
         self.policy_rate_limited_total.inc();
+    }
+
+    /// Increment when an ANY (qtype 255) query is refused (RFC 8482).
+    pub fn inc_policy_refused_any(&self) {
+        self.policy_refused_any_total.inc();
     }
 
     /// Add `n` to the rebinding-defence drop counter. Callers pass the
