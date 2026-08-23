@@ -992,6 +992,48 @@ async fn aaaa_query_never_surfaces_a_spurious_a_record() {
 }
 
 #[tokio::test]
+async fn duplicate_records_are_deduplicated_in_answers() {
+    // A hostile upstream can repeat one record many times in a single reply
+    // (RFC-legal on the wire, but pure amplification at our seam: N identical
+    // entries handed to callers, cached, and rendered). Identical records
+    // must collapse to one.
+    let name = Name::from_ascii("dup.example.org.").unwrap();
+    let mock = MockUpstream::new(move |qname, _| {
+        if qname.to_lowercase() == name.to_lowercase() {
+            vec![
+                a_record(&name, Ipv4Addr::new(203, 0, 113, 10), 300),
+                a_record(&name, Ipv4Addr::new(203, 0, 113, 10), 300),
+                a_record(&name, Ipv4Addr::new(203, 0, 113, 10), 300),
+            ]
+        } else {
+            vec![a_record(qname, Ipv4Addr::new(203, 0, 113, 11), 300)]
+        }
+    })
+    .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let out = resolver
+        .resolve("dup.example.org.", "A")
+        .await
+        .expect("the legitimate record must resolve");
+    assert_eq!(
+        out.records.len(),
+        1,
+        "identical records must collapse to one, got {:?}",
+        out.records
+    );
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 10)),
+        other => panic!("expected the A record, got {other:?}"),
+    }
+    // Distinct records sharing a name (a real RRset with different values)
+    // are NOT duplicates and must survive dedup.
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same

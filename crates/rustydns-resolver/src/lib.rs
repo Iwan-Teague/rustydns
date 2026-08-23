@@ -405,6 +405,7 @@ impl Resolver {
                 let mut dropped: u32 = 0;
                 dropped += filter_out_of_bailiwick(&mut records, name);
                 dropped += filter_wrong_type(&mut records, record_type);
+                dropped += dedup_identical(&mut records);
                 if on_default && self.config.upstream.block_private_rdata {
                     dropped += filter_private_rdata(&mut records);
                 }
@@ -943,6 +944,7 @@ pub(crate) fn filter_private_rdata(records: &mut Vec<DnsRecord>) -> u32 {
 /// links: every owner reachable from the qname through in-answer CNAMEs stays.
 /// Applied unconditionally (unlike the opt-in rebinding defence) — an upstream
 /// has no business answering for names we did not ask it about.
+///
 /// Answer sanity: keep only records of the REQUESTED type, plus CNAME links
 /// (which surface the chain so the caller can follow it). A hostile upstream
 /// can ride a legitimate reply with same-name wrong-type filler — TXT spam
@@ -963,6 +965,23 @@ pub(crate) fn filter_wrong_type(records: &mut Vec<DnsRecord>, qtype: RecordType)
             dropped,
             "answer sanity: dropped upstream record(s) of an unrequested type"
         );
+    }
+    dropped
+}
+
+/// Answer sanity: collapse byte-identical repeated records. Repeating an
+/// identical RR in a message is RFC-legal, but surfacing N copies to the
+/// caller is pure amplification (and cache-bloat) surface at our seam.
+/// Stable dedup over `(name, rdata, ttl)` — genuine multi-value RRsets
+/// (different rdata or TTLs) survive untouched. Unconditional, like the
+/// other answer defences.
+pub(crate) fn dedup_identical(records: &mut Vec<DnsRecord>) -> u32 {
+    let before = records.len();
+    let mut seen = std::collections::HashSet::new();
+    records.retain(|r| seen.insert(format!("{}|{:?}|{:?}", r.name, r.data, r.ttl)));
+    let dropped = (before - records.len()) as u32;
+    if dropped > 0 {
+        tracing::debug!("dedup: collapsed repeated identical upstream record(s)");
     }
     dropped
 }
