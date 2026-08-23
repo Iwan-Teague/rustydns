@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use hickory_proto::op::{Header, HeaderCounts, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, PTR, SRV, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_proto::serialize::binary::BinEncoder;
 use hickory_server::net::runtime::Time;
+use hickory_server::net::xfer::Protocol;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use tracing::{debug, warn};
@@ -310,7 +312,7 @@ impl DnsHandler {
         mut builder: MessageResponseBuilder<'_>,
         response_code: ResponseCode,
         authoritative: bool,
-        answers: Vec<Record>,
+        mut answers: Vec<Record>,
     ) -> ResponseInfo {
         // Single send choke point for every response path — count the final
         // rcode here, mapped to a bounded label set (see `rcode_metric_label`).
@@ -352,6 +354,43 @@ impl DnsHandler {
         metadata.response_code = response_code;
         metadata.authoritative = authoritative;
         metadata.recursion_available = true;
+
+        // UDP responses must never exceed the applicable datagram cap: the
+        // classic 512-byte limit without EDNS, or the (already-clamped)
+        // advertised payload with it. hickory's encoder happily emits an
+        // arbitrarily large answer over UDP, so we shed trailing records
+        // here and mark the message TC — the client then retries over TCP.
+        if request.protocol() == Protocol::Udp {
+            let cap: usize = match request.edns.as_ref() {
+                Some(e) => (e.max_payload() as usize).clamp(512, MAX_EDNS_PAYLOAD as usize),
+                None => 512,
+            };
+            let measure = |ans: &[Record], tc: bool, m0: Metadata| -> Option<usize> {
+                let mut m = m0;
+                m.truncation = tc;
+                let b = MessageResponseBuilder::from_message_request(request);
+                let r = b.build(
+                    m,
+                    ans.iter(),
+                    std::iter::empty::<&Record>(),
+                    std::iter::empty::<&Record>(),
+                    std::iter::empty::<&Record>(),
+                );
+                let mut scratch = Vec::with_capacity(cap * 2);
+                let mut enc = BinEncoder::new(&mut scratch);
+                r.destructive_emit(&mut enc).ok()?;
+                Some(scratch.len())
+            };
+            if measure(&answers, false, metadata).is_none_or(|n| n > cap) {
+                metadata.truncation = true;
+                while !answers.is_empty()
+                    && measure(&answers, true, metadata).is_none_or(|n| n > cap)
+                {
+                    answers.pop();
+                    warn!("udp response exceeded its cap; truncated to fit (TC set)");
+                }
+            }
+        }
 
         let response = builder.build(
             metadata,
@@ -2607,6 +2646,81 @@ mod tests {
             Some(1232),
             "sub-cap advertisements must be honoured as-is"
         );
+    }
+
+    #[tokio::test]
+    async fn udp_reply_never_exceeds_cap_and_sets_tc_when_truncated() {
+        // 80 same-name A records (~2.3 KB of answer rdata alone) overflow the
+        // classic 512-byte UDP limit and stay under the 4096 EDNS clamp —
+        // exercising BOTH caps. Whatever hickory's emit path decides, the
+        // datagram on the wire must never exceed the applicable cap, and a
+        // reply that had to shed records must say so with TC.
+        let mut huge = Vec::new();
+        for i in 0..80u32 {
+            let ip = format!("10.9.{}.{}", (i / 256) as u8, (i % 256) as u8);
+            huge.push(static_a("huge.mesh", &ip));
+        }
+        let harness = build_harness(
+            huge,
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+        let send_with = |edns_payload: Option<u16>| {
+            let mut msg = Message::new(0x4242, MessageType::Query, OpCode::Query);
+            msg.metadata.recursion_desired = true;
+            msg.add_query({
+                let mut q = Query::new();
+                q.set_name(ProtoName::from_ascii("huge.mesh.").expect("name"));
+                q.set_query_type(ProtoRecordType::A);
+                q
+            });
+            if let Some(max) = edns_payload {
+                let mut edns = hickory_proto::op::Edns::new();
+                edns.set_max_payload(max);
+                msg.edns = Some(edns);
+            }
+            msg.to_bytes().expect("encode")
+        };
+
+        // Leg A: no EDNS → the classic 512-byte cap applies.
+        client
+            .send_to(&send_with(None), format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+        let buf_a = [0u8; 65535];
+        let mut buf_a = buf_a;
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf_a))
+            .await
+            .expect("reply within timeout")
+            .expect("udp recv");
+        assert!(
+            n <= 512,
+            "no-EDNS reply exceeded the classic UDP cap: {n} bytes"
+        );
+        let resp = Message::from_bytes(&buf_a[..n]).expect("decode reply");
+        assert!(
+            resp.metadata.truncation || n <= 512,
+            "truncated reply must carry TC"
+        );
+
+        // Leg B: advertise 4096 (our clamp) → reply stays within it.
+        client
+            .send_to(
+                &send_with(Some(4096)),
+                format!("127.0.0.1:{}", harness.port),
+            )
+            .await
+            .expect("send");
+        let mut buf_b = [0u8; 65535];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf_b))
+            .await
+            .expect("reply within timeout")
+            .expect("udp recv");
+        assert!(n <= 4096, "EDNS-clamped reply exceeded 4096: {n} bytes");
     }
 
     #[tokio::test(flavor = "current_thread")]
