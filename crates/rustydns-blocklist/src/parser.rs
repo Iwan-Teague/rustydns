@@ -436,6 +436,35 @@ mod tests {
         assert_eq!(detect_format("||ads.example.com^\n"), ListFormat::AdGuard);
     }
 
+    #[test]
+    fn auto_detect_routes_each_format_and_kind_without_cross_contamination() {
+        // The four canonical one-liners through the PUBLIC auto-detecting
+        // entry: each sample must land in its own parser and emerge with the
+        // right entry KIND (block-exact / block-wildcard / allow), proving no
+        // format's syntax is silently reinterpreted as another's.
+        assert!(parse("0.0.0.0 ads.example.com\n").contains(&exact("ads.example.com")));
+        assert!(parse("tracker.example.net\n").contains(&exact("tracker.example.net")));
+        assert!(
+            parse("*.example-ads.com CNAME .\n").contains(&wildcard("example-ads.com")),
+            "an RPZ wildcard must survive auto-detection"
+        );
+        assert!(
+            parse("@@||safe.example.com^\n").contains(&allow("safe.example.com")),
+            "an AdGuard allow rule must reach the AdGuard parser and stay an Allow"
+        );
+
+        // Routing precedence on genuinely ambiguous shapes:
+        // - the @@ allow sigil is part of the AdGuard signature (previously
+        //   only the block form was pinned);
+        assert_eq!(
+            detect_format("@@||safe.example.com^\n"),
+            ListFormat::AdGuard
+        );
+        // - an IP-led RR-type line belongs to an RPZ zone file, not a hosts
+        //   file: the RPZ sniff deliberately runs BEFORE the hosts check.
+        assert_eq!(detect_format("0.0.0.0 CNAME .\n"), ListFormat::Rpz);
+    }
+
     // --- hosts --------------------------------------------------------------
 
     #[test]
