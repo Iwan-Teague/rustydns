@@ -105,6 +105,15 @@ Recursive resolver forwarding to upstream servers using DoH (default) or DoQ. Pr
 
 **There is no stale-answer mode.** When `fail_closed = true` (the default), a failure of all upstreams returns `SERVFAIL`. Returning a stale answer without indicating staleness is a silent privacy degradation — a client might rely on that answer for a domain that has since changed, or the cached answer may have been for a different client's query.
 
+**Answer-defence pipeline.** Every upstream answer passes through four unconditional filters in `resolve_via_hickory` before it is surfaced (none are operator knobs — a poisoning defence is not an option):
+
+1. **Bailiwick** — records whose owner is not the queried name or reached via in-answer CNAME links from it are dropped (`filter_out_of_bailiwick`). Legitimate chains survive; planted records for unrequested names cannot ride a reply.
+2. **Type sanity** — wrong-type filler for the queried name is dropped; CNAME chain links and the requested record family survive, so multi-value RRsets and chains still surface (`filter_wrong_type`).
+3. **De-duplication** — byte-identical repeats collapse (no amplification via repeated records); genuine multi-value RRsets survive.
+4. **Rebinding defence (opt-in)** — private rdata stripped when `upstream.block_private_rdata = true`.
+
+Cache bounds are enforced on every arm: entries live at least 2 s (`positive_min_ttl` — no re-query-per-lookup DoS via zero-TTL records) and at most 24 h (`positive_max_ttl` — no absurd-TTL entry wedged forever). Concurrent identical lookups share one in-flight exchange (request coalescing).
+
 **Conditional forwarding.** `[[upstream.routes]]` attaches a list of resolvers (and an upstream protocol) to a DNS zone. A query whose qname falls inside that zone is forwarded to that route's resolvers instead of the global `upstream.resolvers` list. Longest matching zone wins. Each route gets its own hickory resolver instance; all privacy/security settings (`fail_closed`, `min_tls_version`, `dnssec_validation`, `randomize_upstream_selection`, etc.) are inherited from the global config — there are no per-route escape hatches. Authority and blocklist still run **before** route selection — the pipeline order is unchanged.
 
 ### `rustydns-blocklist`
