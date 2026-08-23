@@ -798,6 +798,91 @@ async fn resolver_never_sends_edns_client_subnet() {
 }
 
 #[tokio::test]
+async fn no_upstream_member_ever_sees_edns_client_subnet_in_randomised_pool() {
+    // PRIVACY (RFC 7871), generalized: the single-upstream wire pin above
+    // proves one config never sends ECS; this drives a TWO-member randomized
+    // pool (randomize_upstream_selection = true, the production default) and
+    // asserts EVERY outgoing query on EVERY upstream member is ECS-free. The
+    // guarantee is per-query-per-upstream by construction — hickory 0.26 has
+    // no ECS option at all (ResolverOpts carries nothing like it), so DoH/DoQ
+    // arms share the same request builder and cannot carry one either; only
+    // the plain arm can observe it on raw UDP wire.
+    use hickory_proto::rr::rdata::opt::EdnsCode;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    async fn ecs_inspector(
+        saw_ecs: Arc<AtomicBool>,
+        hits: Arc<AtomicUsize>,
+    ) -> std::net::SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let (n, src) = match socket.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                hits.fetch_add(1, Ordering::SeqCst);
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                if query
+                    .edns
+                    .as_ref()
+                    .is_some_and(|e| e.option(EdnsCode::Subnet).is_some())
+                {
+                    saw_ecs.store(true, Ordering::SeqCst);
+                }
+                let Some(q) = query.queries.first() else {
+                    continue;
+                };
+                let mut resp =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                resp.metadata.response_code = ResponseCode::NoError;
+                resp.add_query(q.clone());
+                resp.add_answer(a_record(q.name(), Ipv4Addr::new(9, 9, 9, 9), 30));
+                if let Ok(bytes) = resp.to_bytes() {
+                    let _ = socket.send_to(&bytes, src).await;
+                }
+            }
+        });
+        addr
+    }
+
+    let saw_ecs_a = Arc::new(AtomicBool::new(false));
+    let saw_ecs_b = Arc::new(AtomicBool::new(false));
+    let hits_a = Arc::new(AtomicUsize::new(0));
+    let hits_b = Arc::new(AtomicUsize::new(0));
+    let addr_a = ecs_inspector(saw_ecs_a.clone(), hits_a.clone()).await;
+    let addr_b = ecs_inspector(saw_ecs_b.clone(), hits_b.clone()).await;
+
+    let mut cfg = plain_config(&addr_a.to_string());
+    cfg.upstream.resolvers.push(addr_b.to_string());
+    cfg.privacy.randomize_upstream_selection = true;
+    cfg.upstream.dnssec_validation = true; // EDNS0 on → meaningful absence
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    // Cache-busting names force fresh lookups across the pool.
+    for i in 0..6 {
+        let _ = resolver
+            .resolve(&format!("ecs-pool-{i}.example.org."), "A")
+            .await;
+    }
+
+    assert!(
+        hits_a.load(Ordering::SeqCst) > 0 && hits_b.load(Ordering::SeqCst) > 0,
+        "both pool members must be exercised: a={} b={}",
+        hits_a.load(Ordering::SeqCst),
+        hits_b.load(Ordering::SeqCst)
+    );
+    assert!(
+        !saw_ecs_a.load(Ordering::SeqCst) && !saw_ecs_b.load(Ordering::SeqCst),
+        "no upstream member may ever receive an EDNS Client Subnet option"
+    );
+}
+
+#[tokio::test]
 async fn nxdomain_upstream_sets_nxdomain_flag() {
     // Upstream says the name does not exist (NXDOMAIN, no answers). The
     // resolver must surface that as an empty outcome with nxdomain = true so
