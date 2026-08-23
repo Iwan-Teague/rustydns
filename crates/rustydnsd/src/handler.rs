@@ -2772,6 +2772,61 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn malformed_query_names_are_never_processed() {
+        // RFC 1035 names terminate at a zero-length label. A datagram whose
+        // question section carries trailing garbage after that terminator,
+        // or one whose name never terminates before end-of-packet, must
+        // never be processed into a served answer.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+        let build = |mut wire: Vec<u8>| {
+            let mut msg = vec![0x77, 0x77, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+            msg.append(&mut wire);
+            // qtype A + class IN close out the question.
+            msg.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            msg
+        };
+
+        // Leg A: name terminates early ('a'), then trailing label garbage.
+        let trailing_garbage = build(vec![
+            1, b'a', 0, 1, b'b', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'o', b'r', b'g',
+            0,
+        ]);
+
+        // Leg B: unterminated name — no zero-length root label at all.
+        let unterminated = build(vec![1, b'a', 1, b'b']);
+
+        for wire in [trailing_garbage, unterminated] {
+            client
+                .send_to(&wire, format!("127.0.0.1:{}", harness.port))
+                .await
+                .expect("send");
+            let mut buf = [0u8; 512];
+            match tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await {
+                Err(_) => {}
+                Ok(Ok((n, _))) => {
+                    if let Ok(msg) = Message::from_bytes(&buf[..n]) {
+                        assert!(
+                            !(msg.metadata.response_code == ResponseCode::NoError
+                                && !msg.answers.is_empty()
+                                && msg.metadata.authoritative),
+                            "malformed query produced a served answer"
+                        );
+                    }
+                }
+                Ok(Err(e)) => panic!("socket error on malformed query: {e}"),
+            }
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_domain_returns_nxdomain() {
         let harness = build_harness(
