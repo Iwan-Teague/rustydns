@@ -1338,6 +1338,97 @@ async fn mock_query_count_is_at_least(_addr: &std::net::SocketAddr, _min: usize)
 }
 
 #[tokio::test]
+async fn authority_section_records_are_never_cached_or_served() {
+    // Extends poisoned_additional_section_is_ignored_not_cached to the
+    // AUTHORITY-section name: the planted NS record's OWNER (ns.example.org.)
+    // is never queried there. Here a reply poisons BOTH non-answer sections
+    // and the NS-owner name must resolve fresh from the wire with that
+    // server's honest A answer — never the authority-section data, never
+    // cached from it.
+    let victim_name = Name::from_ascii("victim.example.org.").unwrap();
+    let token = CancellationToken::new();
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("mock bind");
+    let addr = socket.local_addr().expect("local_addr");
+    let sock = socket;
+    let tok = token.clone();
+    let victim = victim_name.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            tokio::select! {
+                _ = tok.cancelled() => break,
+                res = sock.recv_from(&mut buf) => {
+                    let Ok((n, src)) = res else { continue };
+                    let Ok(query) = Message::from_bytes(&buf[..n]) else { continue };
+                    let Some(question) = query.queries.first() else { continue };
+                    let mut resp = Message::new(
+                        query.metadata.id,
+                        MessageType::Response,
+                        OpCode::Query,
+                    );
+                    resp.metadata.recursion_available = true;
+                    resp.add_query(question.clone());
+                    if question.name().to_lowercase() == victim.to_lowercase() {
+                        resp.add_answer(Record::from_rdata(
+                            victim.clone(),
+                            300,
+                            RData::A(A(Ipv4Addr::new(203, 0, 113, 10))),
+                        ));
+                        // Authority section: an NS record whose OWNER is the
+                        // name we will independently look up next.
+                        resp.add_authority(Record::from_rdata(
+                            Name::from_ascii("ns.example.org.").unwrap(),
+                            300,
+                            RData::A(A(Ipv4Addr::new(6, 6, 6, 7))),
+                        ));
+                    } else {
+                        // Honest wire answer for every other name.
+                        resp.add_answer(Record::from_rdata(
+                            question.name().clone(),
+                            300,
+                            RData::A(A(Ipv4Addr::new(203, 0, 113, 12))),
+                        ));
+                    }
+                    if let Ok(bytes) = resp.to_bytes() {
+                        let _ = sock.send_to(&bytes, src).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let resolver = Resolver::new(plain_config(&addr.to_string()))
+        .await
+        .expect("resolver");
+    let out = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect("the honest answer must be served despite poisoned authority");
+
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 10)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+
+    // The authority-section owner name resolves fresh from the wire with
+    // THAT server's honest answer — never the 6.6.6.7 planted in authority.
+    let out = resolver
+        .resolve("ns.example.org.", "A")
+        .await
+        .expect("standalone NS-owner lookup must succeed");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(
+            *ip,
+            Ipv4Addr::new(203, 0, 113, 12),
+            "authority-section record was served or cached"
+        ),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    token.cancel();
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same
