@@ -1918,6 +1918,83 @@ async fn servfail_is_never_cached_as_a_negative_answer() {
 }
 
 #[tokio::test]
+async fn refused_responses_are_not_cached_and_upstream_stays_usable() {
+    // A REFUSED rcode is a transient upstream judgement, not data: it must
+    // surface as an error (never as a negative/empty answer), never enter
+    // the cache, and the upstream must remain fully usable afterwards.
+    let refused_name = Name::from_ascii("refused.example.org.").unwrap();
+    let good_name = Name::from_ascii("healthy.example.org.").unwrap();
+    let token = CancellationToken::new();
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("mock bind");
+    let addr = socket.local_addr().expect("local_addr");
+    let sock = socket;
+    let tok = token.clone();
+    let refused = refused_name.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            tokio::select! {
+                _ = tok.cancelled() => break,
+                res = sock.recv_from(&mut buf) => {
+                    let Ok((n, src)) = res else { continue };
+                    let Ok(query) = Message::from_bytes(&buf[..n]) else { continue };
+                    let Some(question) = query.queries.first() else { continue };
+                    let mut resp = Message::new(
+                        query.metadata.id,
+                        MessageType::Response,
+                        OpCode::Query,
+                    );
+                    resp.metadata.recursion_available = true;
+                    resp.add_query(question.clone());
+                    if question.name().to_lowercase() == refused.to_lowercase() {
+                        resp.metadata.response_code = ResponseCode::Refused;
+                    } else {
+                        resp.add_answer(Record::from_rdata(
+                            question.name().clone(),
+                            300,
+                            RData::A(A(Ipv4Addr::new(203, 0, 113, 20))),
+                        ));
+                    }
+                    if let Ok(bytes) = resp.to_bytes() {
+                        let _ = sock.send_to(&bytes, src).await;
+                    }
+                }
+            }
+        }
+    });
+    drop(good_name);
+
+    let resolver = Resolver::new(plain_config(&addr.to_string()))
+        .await
+        .expect("resolver");
+
+    // Leg 1-2: REFUSED must error (never a typed empty answer), and the
+    // repeat must go back to the wire — refusals are not cacheable data.
+    let err = resolver
+        .resolve("refused.example.org.", "A")
+        .await
+        .expect_err("REFUSED must not surface as an empty success");
+    assert!(matches!(err, RustyDnsError::AllUpstreamsFailed), "{err:?}");
+    let err = resolver
+        .resolve("refused.example.org.", "A")
+        .await
+        .expect_err("a REFUSED lookup must be retried against the upstream");
+    assert!(matches!(err, RustyDnsError::AllUpstreamsFailed), "{err:?}");
+
+    // Leg 3: the upstream is not disabled — a healthy name still resolves.
+    let out = resolver
+        .resolve("healthy.example.org.", "A")
+        .await
+        .expect("upstream must stay usable after REFUSED replies");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 20)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    token.cancel();
+}
+
+#[tokio::test]
 async fn route_dispatch_uses_zone_specific_upstream() {
     // Default mock answers everything with 1.1.1.1.
     let default_mock =
