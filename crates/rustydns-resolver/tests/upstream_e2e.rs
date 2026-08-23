@@ -1633,6 +1633,36 @@ async fn stale_entry_is_replaced_by_fresh_data_after_expiry() {
 }
 
 #[tokio::test]
+async fn concurrent_identical_queries_are_coalesced() {
+    // Thundering-herd defence: hickory's pool keeps an active_requests map
+    // (CacheKey -> SharedLookup) so concurrent identical lookups SHARE one
+    // in-flight exchange instead of each hitting the wire. Pinned at our
+    // seam: two simultaneous resolves for the same name must produce ONE
+    // upstream datagram, and both callers get the answer.
+    let mock =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 14), 300)])
+            .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let (a, b) = tokio::join!(
+        resolver.resolve("coalesce.example.org.", "A"),
+        resolver.resolve("coalesce.example.org.", "A")
+    );
+    let a = a.expect("first concurrent lookup");
+    let b = b.expect("second concurrent lookup");
+    assert_eq!(a.records.len(), 1);
+    assert_eq!(b.records.len(), 1);
+    assert_eq!(
+        mock.query_count(),
+        1,
+        "concurrent identical lookups must be coalesced into a single upstream request"
+    );
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn zero_ttl_records_are_held_for_the_cache_floor() {
     // MIN_POSITIVE_CACHE_TTL_SECS: a hostile upstream answering with
     // TTL=0 records must not force a re-query per lookup (rapid-re-query
