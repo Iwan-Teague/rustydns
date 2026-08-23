@@ -675,6 +675,34 @@ async fn odoh_oblivious_query_carries_no_edns_client_subnet() {
 }
 
 #[tokio::test]
+async fn odoh_query_ids_vary_per_query() {
+    // Transaction-ID randomisation at the seam we own: the inner DNS message
+    // id built by build_query_wire comes from rand::random(), so consecutive
+    // oblivious queries must not share (or trivially cycle) ids — a
+    // predictable id space would let an off-path attacker guess the id and
+    // race a spoofed response. The plain/DoH/DoQ arms delegate wire-id
+    // generation to hickory's exchange; this pins OUR construction.
+    let arm = arm_with_mock_opts(MockMode::AnswerA(Ipv4Addr::new(203, 0, 113, 21)), false);
+    for i in 0..10 {
+        arm.resolve(&format!("txid-{i}.example."), RecordType::A, false)
+            .await
+            .expect("each query must resolve over the oblivious arm");
+    }
+    let captured = captured_queries_of(&arm);
+    assert_eq!(captured.len(), 10, "the target saw every query");
+    let distinct: std::collections::HashSet<u16> = captured.iter().map(|m| m.metadata.id).collect();
+    assert!(
+        distinct.len() > 1,
+        "query ids were degenerate across {0} queries: {distinct:?}",
+        captured.len()
+    );
+    // With 16-bit ids drawn randomly, all-equal or fully-sequential ids
+    // across ten draws are astronomically unlikely unless generation is
+    // deterministic; what we pin here is non-degeneracy, not cryptographic
+    // proof of entropy.
+}
+
+#[tokio::test]
 async fn odoh_separates_client_identity_from_the_target() {
     // RFC 9230's core property, pinned at the two observable layers:
     //
