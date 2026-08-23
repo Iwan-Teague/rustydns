@@ -14,7 +14,8 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
-use axum::http::StatusCode;
+use axum::http::header;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use base64::Engine;
@@ -109,9 +110,34 @@ async fn handle_get(
 async fn handle_post(
     State(state): State<DohState>,
     ConnectInfo(src): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // RFC 8484 §6.1: a DoH POST carries `application/dns-message`. Anything
+    // else is not a DNS message by the client's own declaration — reject it
+    // at the HTTP layer instead of feeding arbitrary bytes to the parser.
+    if !is_dns_message_content_type(&headers) {
+        return Response::builder()
+            .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+            .header(header::ACCEPT, "application/dns-message")
+            .body(Body::from("content-type must be application/dns-message"))
+            .unwrap();
+    }
     handle_dns_message(state.handler.clone(), src, body.to_vec()).await
+}
+
+/// True iff the request declares the RFC 8484 DNS media type. Parameters
+/// (`;charset=…`) are tolerated per MIME rules; matching on the bare type is
+/// case-insensitive.
+fn is_dns_message_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/dns-message"))
+        })
 }
 
 async fn handle_dns_message(handler: Arc<DnsHandler>, src: SocketAddr, bytes: Vec<u8>) -> Response {
@@ -561,6 +587,66 @@ mod tests {
             resp.status(),
             413,
             "oversized DoH POST must be rejected with 413 Payload Too Large"
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doh_rejects_non_dns_message_content_types_on_post() {
+        // RFC 8484 §6.1: the POST media type is part of the contract. A
+        // client that declares any other type — or none — is not sending a
+        // DNS message and must get 415 before the body reaches the parser.
+        let handler = build_handler(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+        let client = reqwest::Client::new();
+        let query = build_query("router.mesh.", ProtoRecordType::A);
+
+        // Wrong types AND a missing header all land on the same rejection.
+        for ct in [
+            "text/plain",
+            "application/json",
+            "application/octet-stream",
+            "",
+        ] {
+            let mut req = client.post(format!("{base}/dns-query")).body(query.clone());
+            if !ct.is_empty() {
+                req = req.header("content-type", ct);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "content-type {ct:?} must be rejected with 415"
+            );
+            // And never a DNS-format reply.
+            assert_ne!(
+                resp.headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/dns-message"),
+                "a rejected POST must not produce a DNS response"
+            );
+        }
+
+        // Control: parameters after the media type are tolerated (MIME rules).
+        let ok = client
+            .post(format!("{base}/dns-query"))
+            .header("content-type", "application/dns-message; charset=utf-8")
+            .body(query)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            ok.status(),
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "media-type parameters must not cause a rejection"
         );
 
         shutdown.cancel();
