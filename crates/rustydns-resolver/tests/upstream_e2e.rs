@@ -273,6 +273,46 @@ async fn randomised_selection_rotates_across_two_live_upstreams() {
 }
 
 #[tokio::test]
+async fn dead_route_upstream_fails_closed_without_falling_back_to_default() {
+    // The closest real "variant upstream" in rustydns is a conditional-
+    // forwarding route. When the route's resolver is unreachable, queries for
+    // the routed zone must fail closed EXACTLY like a dead default arm — they
+    // are never retried against the global pool, which would silently leak
+    // the zone's names to an unrouted resolver. The control leg proves the
+    // default arm was alive and would have answered.
+    let live =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 1), 60)]).await;
+    let mut cfg = plain_config(&live.addr_string());
+    cfg.upstream.routes.push(UpstreamRoute {
+        zone: "corp.example.".to_string(),
+        resolvers: vec!["127.0.0.1:1".to_string()],
+        protocol: UpstreamProtocol::Plain,
+    });
+    let resolver = Resolver::new(cfg).await.expect("resolver");
+
+    // Routed name + dead route resolver → fail closed (no default fallback).
+    let err = resolver
+        .resolve("host.corp.example.", "A")
+        .await
+        .expect_err("dead route must fail closed");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "expected AllUpstreamsFailed from the dead route, got {err:?}"
+    );
+
+    // Control: an UNROUTED name still resolves through the live default arm.
+    let out = resolver
+        .resolve("unrouted.example.org.", "A")
+        .await
+        .expect("default arm must still resolve");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 1)),
+        other => panic!("expected an A record from the default arm, got {other:?}"),
+    }
+    live.shutdown();
+}
+
+#[tokio::test]
 async fn plain_upstream_randomises_query_name_case_0x20() {
     // DNS 0x20: over PLAIN UDP (no channel integrity) the resolver randomises
     // the QNAME case and requires the response to echo it back, so an off-path
