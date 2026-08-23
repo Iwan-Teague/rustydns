@@ -1044,6 +1044,74 @@ mod tests {
     }
 
     #[test]
+    fn signature_binds_every_header_field_tamper_rejected() {
+        // The signature covers the ENTIRE payload — every header field
+        // (zone_name, generated_at_unix, expires_at_unix, nonce) and every
+        // record line — so there is no field an attacker can rewrite after
+        // signing without invalidating the attestation. Flip one byte inside
+        // three different header/record values (format stays `key=value`, so
+        // parsing would happily accept the mutation if verification were not
+        // performed first); each must fail as SignatureMismatch. This is the
+        // closest analogue rustydns has to a "head attestation over a tuple":
+        // the tuple here is the whole payload, and it is bound by one
+        // signature over verbatim bytes.
+        let now = now();
+
+        // Locate the payload region: everything before the LAST
+        // "\nsignature=" marker.
+        let payload_end = |wire: &[u8]| -> usize {
+            wire.windows(11)
+                .rposition(|w| w == b"\nsignature=")
+                .expect("signed bundle has a signature marker")
+        };
+        let flip = |wire: &mut Vec<u8>, marker: &[u8]| {
+            let start = wire
+                .windows(marker.len())
+                .position(|w| w == marker)
+                .expect("marker present");
+            let idx = start + marker.len(); // first byte of the VALUE
+            wire[idx] ^= 0x01; // ASCII letter/digit → different byte, still valid UTF-8
+        };
+
+        for (i, field_marker) in [
+            b"zone_name=".as_slice(),
+            b"generated_at_unix=".as_slice(),
+            b"record.0.label=".as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut wire, key_hex) =
+                build_signed_bundle("mesh", &[("router", "100.64.0.5", &[])], now, now + 300);
+            assert!(
+                flip_target_within_payload(&wire, field_marker, payload_end(&wire)),
+                "tamper target must lie inside the signed region"
+            );
+            flip(&mut wire, field_marker);
+            let err = load_mesh_bundle(
+                &write_temp(&wire, &format!("field-tamper-{i}")),
+                &write_temp(key_hex.as_bytes(), &format!("field-tamper-key-{i}")),
+                "mesh.",
+                600,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, MeshBundleError::SignatureMismatch),
+                "tampered {field:?} must fail signature verification: {err:?}",
+                field = String::from_utf8_lossy(field_marker)
+            );
+        }
+    }
+
+    /// True when `marker`'s value byte sits before `payload_end` (inside the
+    /// signed region rather than in the trailing `signature=` hex).
+    fn flip_target_within_payload(wire: &[u8], marker: &[u8], payload_end: usize) -> bool {
+        wire.windows(marker.len())
+            .position(|w| w == marker)
+            .is_some_and(|start| start + marker.len() < payload_end)
+    }
+
+    #[test]
     fn rejects_dotted_label() {
         let now = now();
         let (wire, key_hex) =
