@@ -266,6 +266,8 @@ For a detailed description of each component, see [`docs/architecture.md`](docs/
 - **Optional socket activation** (`install/rustydns.socket`) — systemd binds `:53`/`:853` and passes the fds in, so the daemon runs with **zero** capabilities
 - **Config file permission check** at startup — world-readable config is a hard error
 - **`deny_unknown_fields`** on config structs — typos that would silently disable security options are caught at startup
+- **Answer-defence pipeline** — upstream answers pass four unconditional filters (bailiwick, type sanity, de-duplication, rebinding defence); poisoned or injected records can never surface
+- **Listener amplification defences** — ANY (qtype 255) refused per RFC 8482, EDNS buffer advertisements clamped to 4096, UDP replies capped with TC-on-truncation, oversized/malformed inbound datagrams dropped
 
 Read the full threat model and deployment checklist in [`docs/security.md`](docs/security.md).
 
