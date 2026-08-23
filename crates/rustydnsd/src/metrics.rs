@@ -622,6 +622,57 @@ mod tests {
         assert!(body.contains("\"qname_hash\":\""));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn queries_endpoint_never_leaks_qnames_and_stays_bounded() {
+        // Minimal privacy logging contract, end-to-end through the endpoint:
+        // record far more DISTINCT real query names than the ring can hold,
+        // then assert (a) not one plaintext name or even its domain fragment
+        // survives into the rendered JSON — only salted hashes may represent
+        // a query name, and (b) the endpoint reflects the ring bound: count
+        // collapses to capacity and exactly `capacity` entries are emitted.
+        let log = Arc::new(QueryLog::new(4));
+        let client = ClientId::from_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)));
+        for i in 0..10u32 {
+            let name = format!("leaky-{i}.example.org.");
+            log.record(&client, &name, "A", 0, ServedBy::Resolver);
+        }
+
+        let resp = queries_handler(log.clone()).await;
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body collect");
+        let body = std::str::from_utf8(&body).expect("utf-8 body");
+
+        // Privacy half: no full query name — and not even the shared domain
+        // fragment any of them carried — may appear anywhere in the payload.
+        assert!(
+            !body.contains("leaky-"),
+            "plaintext query-name stem leaked into /queries"
+        );
+        assert!(
+            !body.contains("example.org"),
+            "query domain fragment leaked into /queries"
+        );
+        for i in 0..10u32 {
+            assert!(!body.contains(&format!("leaky-{i}")));
+        }
+
+        // Every surviving entry still carries its salted hash + anonymised
+        // client — the redacted representation is what serves, not silence.
+        let entries = body.matches("\"qname_hash\":\"").count();
+        assert_eq!(
+            entries, 4,
+            "endpoint must emit exactly one entry per survivor"
+        );
+        assert_eq!(entries, body.matches("/anon").count());
+
+        // Boundedness half: the ring evicted down to capacity, and the
+        // endpoint reports that honestly instead of growing without limit.
+        assert!(body.contains("\"capacity\":4"));
+        assert!(body.contains("\"count\":4"));
+    }
+
     #[test]
     fn qtype_and_rcode_label_vectors_increment_and_stay_bounded() {
         let m = Metrics::new().unwrap();
