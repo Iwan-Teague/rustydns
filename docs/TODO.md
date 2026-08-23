@@ -325,6 +325,30 @@ blocklist groups shipped — `[[blocklist.groups]]` named sets + a
 
 ## Opportunistic hardening (found by re-scouring; shipped)
 
+- **Resolver answer-defence pipeline — DONE.** Every upstream answer now
+  passes four unconditional filters in `resolve_via_hickory` before it
+  reaches the caller: bailiwick (records must be owned by the queried name
+  or a CNAME-linked target — hostile extras for unrequested names are
+  dropped), wrong-type (only requested-family records plus chain links
+  survive; TXT spam next to a requested A is dropped), de-duplication
+  (byte-identical repeats collapse; genuine multi-value RRsets survive),
+  and the opt-in private-rdata rebinding defence. Each filter is
+  mutation-tested and pinned at the wire level, with cycle-termination and
+  case/degenerate-input units.
+- **Cache-bounds suite — DONE.** `positive_min_ttl`/`positive_max_ttl`
+  wired into every arm's resolver options (2s floor / 86400s ceiling) so a
+  hostile upstream can neither force per-lookup re-queries nor wedge cache
+  entries forever; at-floor boundary honoured-not-extended; expiry →
+  fresh-refetch replacement proven by differing post-expiry answers.
+- **Listener hardening — DONE.** ANY (qtype 255) queries refused (RFC 8482)
+  with their own metric; EDNS payload advertisements clamped to 4096
+  (exactly-at-cap passthrough pinned); UDP replies bounded to the datagram
+  cap with TC-on-truncation; oversized inbound datagrams and malformed
+  query names dropped before parsing.
+- **DoH input hardening — DONE.** RFC 8484 §6.1 content-type enforced on
+  POST (415); oversized base64url GET payloads rejected (shared
+  handle_dns_message gate: empty→400, >65_535→413).
+
 - **DNS 0x20 query-name case randomisation on the plain path — DONE.** A
   re-audit of the hickory 0.26 API surfaced `ResolverOpts.case_randomization`
   (absent before). `build_resolver_arm` now enables it for **plain UDP**
@@ -333,7 +357,12 @@ blocklist groups shipped — `[[blocklist.groups]]` named sets + a
   already authenticates). A case-mismatch is rejected → SERVFAIL (fail-closed).
   Tested: `upstream_e2e::plain_upstream_randomises_query_name_case_0x20` proves
   the wire QNAME comes back mixed-case for plain; the existing plain e2e tests
-  confirm 0x20 round-trips without regression.
+  confirm 0x20 round-trips without regression. Since then the full defence is
+  pinned four ways: rejection of a case-mismatched response
+  (`plain_upstream_rejects_case_mismatched_response_0x20`), causal isolation
+  (`plain_upstream_0x20_rejection_is_caused_by_case_mismatch_alone`), knob
+  wiring (`case_randomization_enabled_only_for_plain_udp`), and per-query case
+  variation (`plain_upstream_0x20_case_pattern_varies_across_queries`).
 - **Re-verified the upstream-blocked items (1.1/1.2/2.1) against hickory
   0.26.1:** query minimisation is still absent, and `DnsRequestOptions` still
   carries a literal `// TODO: add EDNS options here?` with no padding field and
