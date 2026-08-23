@@ -1572,6 +1572,52 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn empty_upstream_list_fails_closed_at_every_layer() {
+        // Consolidation pin per operator request: an empty resolver list must
+        // fail closed at BOTH enforcement layers — the config validator and
+        // Resolver construction — so no code path can ever reach a resolve()
+        // without an explicit upstream. There is no plaintext/system fallback
+        // to fall back TO: pseudo-schemes like system:/// are rejected as
+        // scheme mismatches under every protocol (pinned in core config).
+        let mut cfg = DnsConfig {
+            server: Default::default(),
+            upstream: Default::default(),
+            authority: Default::default(),
+            blocklist: Default::default(),
+            privacy: Default::default(),
+            metrics: Default::default(),
+            rate_limit: Default::default(),
+            policy: Vec::new(),
+            rewrite: Vec::new(),
+            safesearch: Default::default(),
+        };
+        cfg.upstream.resolvers.clear();
+
+        // Layer 1: config validation refuses.
+        let err = rustydns_core::config::validate_config(&cfg)
+            .expect_err("validator must refuse empty resolvers");
+        match &err {
+            RustyDnsError::Config(msg) => {
+                assert!(
+                    msg.contains("at least one"),
+                    "validator message must name the contract: {msg}"
+                );
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+
+        // Layer 2: even if validation were bypassed, construction itself
+        // refuses — no Resolver instance exists to attempt resolution with.
+        let err = Resolver::new(cfg.clone()).await.unwrap_err();
+        match err {
+            RustyDnsError::Config(msg) => {
+                assert!(msg.contains("empty"), "msg={msg}");
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
     // --- TLS 1.3 floor (upstream.min_tls_version) -------------------------
     //
     // `build_tls_client_config` is the single place where
