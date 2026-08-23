@@ -702,6 +702,30 @@ fn parse_u16(sr: &StaticRecord, label: &str, value: &str) -> AuthorityResult<u16
 mod tests {
     use super::*;
 
+    /// Known-answer test for the sha2 0.10→0.11 migration (48db534): the
+    /// well-known NIST vectors pin the exact digest output, so any silent
+    /// output change in the migrated crate is caught.
+    #[test]
+    fn sha256_known_answer_vectors() {
+        use sha2::{Digest, Sha256};
+
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+        // NIST FIPS 180-4 example: SHA-256("abc")
+        let d = Sha256::digest(b"abc");
+        assert_eq!(
+            hex(&d),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        // SHA-256("") — the empty-input edge.
+        let d = Sha256::digest(b"");
+        assert_eq!(
+            hex(&d),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
     fn cfg(records: Vec<StaticRecord>) -> AuthorityConfig {
         AuthorityConfig {
             mesh_zone_bundle_path: None,
