@@ -715,6 +715,39 @@ async fn cache_serves_repeat_query_without_upstream_hit() {
 }
 
 #[tokio::test]
+async fn nxdomain_is_a_structured_empty_result_and_repeatable() {
+    // A negative answer must never surface as success-with-data or as a
+    // generic failure: resolve() maps hickory's no-records error into a
+    // typed empty outcome with the nxdomain flag set (lib.rs
+    // no_records_outcome). Negative-cache bounds are hickory-internal and
+    // keyed on SOA TTLs this mock does not emit, so repeat behaviour is
+    // observed honestly: each attempt stays on the wire or is served from
+    // whatever internal cache exists — either way the result keeps its
+    // shape and never grows records.
+    let mock =
+        MockUpstream::new_with_rcode(|_, _| (hickory_proto::op::ResponseCode::NXDomain, vec![]))
+            .await;
+
+    let cfg = plain_config(&mock.addr_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    for i in 0..2 {
+        let out = resolver
+            .resolve("missing.example.org.", "A")
+            .await
+            .unwrap_or_else(|e| panic!("leg {i}: NXDOMAIN must not be a generic error: {e}"));
+        assert!(out.nxdomain, "leg {i}: nxdomain flag must be set");
+        assert!(
+            out.records.is_empty(),
+            "leg {i}: negative answers carry no records"
+        );
+        assert_eq!(out.private_rdata_dropped, 0);
+    }
+    assert!(mock.query_count() >= 1, "upstream must have been consulted");
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn route_dispatch_uses_zone_specific_upstream() {
     // Default mock answers everything with 1.1.1.1.
     let default_mock =
