@@ -764,6 +764,64 @@ async fn mismatched_question_section_is_rejected_as_spoofed() {
 }
 
 #[tokio::test]
+async fn out_of_bailiwick_answer_records_are_ignored_not_cached() {
+    // A hostile upstream answers the victim's query but stuffs an extra
+    // record for a DIFFERENT name into the answer section (cache-poisoning
+    // bait). Only records matching the queried name may surface, and the
+    // planted record must never be cached: a later query for the planted
+    // name must go back to the wire instead of being served from poison.
+    let victim_name = Name::from_ascii("victim.example.org.").unwrap();
+    let evil_name = Name::from_ascii("evil.example.org.").unwrap();
+    let mock = MockUpstream::new(move |name, _| {
+        if name == &victim_name {
+            vec![
+                a_record(name, Ipv4Addr::new(203, 0, 113, 10), 300),
+                a_record(&evil_name, Ipv4Addr::new(6, 6, 6, 6), 300),
+            ]
+        } else {
+            vec![a_record(name, Ipv4Addr::new(203, 0, 113, 11), 300)]
+        }
+    })
+    .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    // The victim's answer surfaces ONLY the matching record.
+    let out = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect("the legitimate answer must resolve");
+    assert_eq!(out.records.len(), 1, "planted extra record leaked through");
+    match &out.records[0].data {
+        RecordData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 10)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+
+    let after_victim = mock.query_count();
+
+    // The planted name was never cached: resolving it goes to the wire and
+    // gets the mock's honest per-name answer, not the poisoned 6.6.6.6.
+    let evil_out = resolver
+        .resolve("evil.example.org.", "A")
+        .await
+        .expect("the planted name must be resolved fresh");
+    match evil_out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_ne!(
+            *ip,
+            Ipv4Addr::new(6, 6, 6, 6),
+            "out-of-bailiwick planted record was served or cached"
+        ),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    assert!(
+        mock.query_count() > after_victim,
+        "planted-name resolution must hit the wire (nothing cached from the poisoned answer)"
+    );
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same
