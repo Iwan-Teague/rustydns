@@ -32,7 +32,7 @@ use rustydns_core::config::BlocklistConfig;
 use rustydns_core::{IpDenylist, RegexRules};
 
 use crate::allowlist::Allowlist;
-use crate::parser::{ParsedEntry, parse};
+use crate::parser::{parse, ParsedEntry};
 
 /// Whether a blocklist source is trusted to provide allowlist/passthru entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +403,43 @@ mod tests {
     fn does_not_block_unrelated() {
         let e = load("0.0.0.0 ads.example.com\n");
         assert!(!e.is_blocked("safe.example.com"));
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped_and_never_disable_the_blocklist() {
+        // A garbled or hostile source must degrade to "fewer entries", never
+        // to "no blocklist": valid lines survive, malformed lines are dropped
+        // with a warning, and the engine stays fully armed.
+        let e = load(concat!(
+            "0.0.0.0 ads.example.com\n",      // valid hosts entry
+            "# a comment line\n",             // skipped: comment
+            "\n",                             // skipped: blank
+            "10.0.0.1 tracker.example.net\n", // valid hosts entry
+            "0.0.0.0\n",                      // skipped: no domain token
+            "!!! not an ip or domain !!!\n",  // skipped: unparseable line
+            "....\n",                         // skipped: empty labels only
+        ));
+        assert!(
+            e.is_blocked("ads.example.com"),
+            "valid entries must survive"
+        );
+        assert!(
+            e.is_blocked("tracker.example.net"),
+            "valid entries must survive"
+        );
+        assert!(
+            !e.is_blocked("clean.example.org"),
+            "engine must stay scoped"
+        );
+        assert_eq!(e.entry_count(), 2, "only the well-formed lines load");
+
+        // An all-garbage reload leaves an (honestly) empty engine — but must
+        // not panic or wedge it: a subsequent good source re-arms it.
+        let e2 = engine();
+        e2.load("bad\u{7f}domain.example\n...\n\n");
+        assert_eq!(e2.entry_count(), 0);
+        e2.load("0.0.0.0 ads.example.com\n");
+        assert!(e2.is_blocked("ads.example.com"));
     }
 
     #[test]
