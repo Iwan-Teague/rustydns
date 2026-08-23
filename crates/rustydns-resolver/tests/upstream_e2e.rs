@@ -822,6 +822,63 @@ async fn out_of_bailiwick_answer_records_are_ignored_not_cached() {
 }
 
 #[tokio::test]
+async fn cross_zone_cname_is_served_as_a_chain_and_never_cached_as_authoritative() {
+    use hickory_proto::rr::rdata::CNAME;
+
+    // Following an in-answer CNAME to another zone IS correct resolver
+    // behaviour (RFC 1034): the chain is served honestly. The SAFETY pin is
+    // the second half: the out-of-zone target's data from that answer is
+    // never cached as authoritative for standalone lookups of the target
+    // name — those resolve fresh from the wire. Complements the bailiwick
+    // filter pin, which drops NON-CNAME planted records outright; chains
+    // survive by design via its link-walk.
+    let victim_name = Name::from_ascii("victim.example.org.").unwrap();
+    let cdn_name = Name::from_ascii("cdn.otherzone.net.").unwrap();
+    let mock = MockUpstream::new(move |name, _| {
+        if name == &victim_name {
+            vec![
+                Record::from_rdata(name.clone(), 300, RData::CNAME(CNAME(cdn_name.clone()))),
+                a_record(&cdn_name, Ipv4Addr::new(198, 51, 100, 7), 300),
+            ]
+        } else {
+            vec![a_record(name, Ipv4Addr::new(203, 0, 113, 44), 300)]
+        }
+    })
+    .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let out = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect("the cross-zone chain must be served");
+    assert!(!out.records.is_empty(), "chain must surface records");
+
+    // The standalone lookup of the out-of-zone target must go back to the
+    // wire and get THAT server's honest answer — not the data planted in the
+    // victim reply.
+    let after_victim = mock.query_count();
+    let out = resolver
+        .resolve("cdn.otherzone.net.", "A")
+        .await
+        .expect("standalone target lookup must succeed");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(
+            *ip,
+            Ipv4Addr::new(203, 0, 113, 44),
+            "out-of-zone target data was served from the victim answer's cached chain"
+        ),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    assert!(
+        mock.query_count() > after_victim,
+        "out-of-zone target must be resolved fresh from the wire"
+    );
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same
