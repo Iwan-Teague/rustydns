@@ -219,7 +219,7 @@ pub fn parse_rpz(content: &str) -> Vec<ParsedEntry> {
         }
 
         if rdata == "rpz-passthru." || rdata == "rpz-passthru" {
-            if let Some(d) = validate_and_normalize(name) {
+            if let Some(d) = validate_allow_entry(name) {
                 entries.push(ParsedEntry::Allow(d));
             }
         } else if rdata == "." {
@@ -260,7 +260,7 @@ pub fn parse_adguard(content: &str) -> Vec<ParsedEntry> {
             if let Some(caret) = rest.find('^') {
                 let domain_part = &rest[..caret];
                 if !domain_part.contains('/')
-                    && let Some(d) = validate_and_normalize(domain_part)
+                    && let Some(d) = validate_allow_entry(domain_part)
                 {
                     entries.push(ParsedEntry::Allow(d));
                 }
@@ -355,6 +355,25 @@ fn strip_comment(line: &str, marker: char) -> &str {
     } else {
         line
     }
+}
+
+/// Validate an ALLOWLIST entry: the ordinary domain rules plus the ≥2-label
+/// TLD guard. A bare-TLD allow entry (`com`, `org`) would whitelist every
+/// domain under it via the suffix walk, so — exactly like the config-file
+/// guard in `validate_config` — it is refused at parse time rather than
+/// admitted from a (trusted) source. Returns `None` when the entry must be
+/// skipped.
+fn validate_allow_entry(s: &str) -> Option<String> {
+    let d = validate_and_normalize(s)?;
+    if !d.contains('.') {
+        tracing::warn!(
+            domain = %d,
+            "skipped allowlist entry: single-label / TLD-level entries are not allowed \
+             (an entry for a TLD would unblock every domain under it)"
+        );
+        return None;
+    }
+    Some(d)
 }
 
 fn is_ip_address(s: &str) -> bool {

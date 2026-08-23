@@ -488,6 +488,42 @@ mod tests {
     }
 
     #[test]
+    fn bare_tld_allow_entry_cannot_unblock_its_subdomains() {
+        // The TLD guard: even a TRUSTED source may not carry an allowlist
+        // entry for a bare TLD — suffix matching would whitelist every
+        // domain under it. The parser refuses single-label allow entries,
+        // so nothing lands in the allowlist and blocking is untouched.
+        let e = engine();
+        e.load_many_with_trust(&[
+            ("0.0.0.0 evil.com\n", BlocklistSource::Untrusted),
+            ("0.0.0.0 tracker.net\n", BlocklistSource::Untrusted),
+            // Attack content: trusted source tries to unblock all of .com/.net.
+            (
+                "com CNAME rpz-passthru.\nnet CNAME rpz-passthru.\n",
+                BlocklistSource::Trusted,
+            ),
+        ]);
+        assert!(e.is_blocked("evil.com"), ".com entries must stay blocked");
+        assert!(
+            e.is_blocked("tracker.net"),
+            ".net entries must stay blocked"
+        );
+
+        // Scope-specific control (full reload, since loads replace state):
+        // a proper two-label entry still works, without collateral.
+        e.load_many_with_trust(&[
+            ("0.0.0.0 evil.com\n", BlocklistSource::Untrusted),
+            ("0.0.0.0 tracker.net\n", BlocklistSource::Untrusted),
+            (
+                "tracker.net CNAME rpz-passthru.\n",
+                BlocklistSource::Trusted,
+            ),
+        ]);
+        assert!(!e.is_blocked("tracker.net"), "exact scope honoured");
+        assert!(e.is_blocked("evil.com"), "sibling unaffected");
+    }
+
+    #[test]
     fn merge_multiple_sources() {
         let e = engine();
         e.load_many_with_trust(&[
