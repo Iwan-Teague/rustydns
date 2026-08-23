@@ -2578,6 +2578,43 @@ mod tests {
         validate_config(&cfg).expect("a complete disk-log config must pass");
     }
 
+    #[test]
+    fn privacy_defaults_are_the_fail_safe_posture() {
+        // The AGENTS.md privacy invariants are about DEFAULTS: an operator who
+        // writes no [privacy] section at all gets the safe posture, never the
+        // convenient one. Pin every default so a future edit cannot silently
+        // flip one (e.g. turning on disk logging or client-IP logging).
+        let p = PrivacyConfig::default();
+        assert!(
+            p.query_minimization,
+            "RFC 7816 minimisation scaffolding defaults ON"
+        );
+        assert!(p.no_edns_client_subnet, "ECS stripping must default ON");
+        assert!(p.upstream_padding, "padding preference must default ON");
+        assert!(
+            p.randomize_upstream_selection,
+            "upstream randomisation must default ON"
+        );
+        assert!(
+            !p.query_log_to_disk,
+            "no query history on disk by default (hard invariant)"
+        );
+        assert!(
+            p.query_log_disk_path.is_none(),
+            "no disk path unless opted in"
+        );
+        assert!(
+            !p.log_client_ips,
+            "client IPs must be anonymised by default (hard invariant)"
+        );
+        assert!(
+            p.query_log_ring_size > 0 && p.query_log_ring_size <= 100_000,
+            "ring buffer must be bounded and non-degenerate: {}",
+            p.query_log_ring_size
+        );
+        assert!(p.query_log_max_file_bytes > 0, "disk cap must be bounded");
+    }
+
     // --- rate_limit -------------------------------------------------
 
     #[test]
