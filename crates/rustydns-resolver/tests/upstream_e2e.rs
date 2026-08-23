@@ -817,6 +817,65 @@ async fn compression_pointer_loop_fails_closed() {
 }
 
 #[tokio::test]
+async fn txid_mismatch_is_dropped_not_served() {
+    // The exchange correlates replies to pending queries by 16-bit
+    // transaction ID. A hostile reply with a FOREIGN id (a guessed or
+    // replayed id that matches no outstanding query) is not correlated —
+    // it must never surface as an answer at our seam. hickory owns the
+    // correlation; we pin the observable fail-closed contract.
+    let token = CancellationToken::new();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().expect("local_addr");
+    let sock = socket;
+    let tok = token.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            tokio::select! {
+                _ = tok.cancelled() => break,
+                res = sock.recv_from(&mut buf) => {
+                    let Ok((n, src)) = res else { continue };
+                    let Ok(mut query) = Message::from_bytes(&buf[..n]) else { continue };
+                    let Some(question) = query.queries.first() else { continue };
+                    let mut resp = Message::new(
+                        query.metadata.id,
+                        MessageType::Response,
+                        OpCode::Query,
+                    );
+                    resp.metadata.recursion_available = true;
+                    resp.add_query(question.clone());
+                    resp.add_answer(Record::from_rdata(
+                        question.name().clone(),
+                        300,
+                        RData::A(A(Ipv4Addr::new(6, 6, 6, 6))),
+                    ));
+                    if let Ok(mut bytes) = resp.to_bytes() {
+                        // Corrupt the transaction ID so the reply matches NO
+                        // pending exchange.
+                        bytes[0] = 0xDE;
+                        bytes[1] = 0xAD;
+                        let _ = sock.send_to(&bytes, src).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let resolver = Resolver::new(plain_config(&addr.to_string()))
+        .await
+        .expect("resolver");
+    let err = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect_err("a mismatched-id reply must never be served");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "txid-mismatched reply must fail closed, got {err:?}"
+    );
+    token.cancel();
+}
+
+#[tokio::test]
 async fn rfc1035_length_limits_fail_closed() {
     // RFC 1035 §2.3.4: labels are 1..63 octets, names at most 255. A hostile
     // upstream answering with an oversized label (or an over-long name) must
