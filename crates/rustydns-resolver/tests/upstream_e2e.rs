@@ -67,7 +67,26 @@ impl MockUpstream {
 
     /// Like [`MockUpstream::new`], but the responder also chooses the
     /// response code — used to drive NXDOMAIN vs NODATA classification.
+    /// Like [`MockUpstream::new`], but every reply carries the TC bit set.
+    async fn new_truncating<F>(responder: F) -> Self
+    where
+        F: Fn(&Name, RecordType) -> Vec<Record> + Send + Sync + 'static,
+    {
+        Self::new_inner(
+            move |name, rtype| (ResponseCode::NoError, responder(name, rtype)),
+            true,
+        )
+        .await
+    }
+
     async fn new_with_rcode<F>(responder: F) -> Self
+    where
+        F: Fn(&Name, RecordType) -> (ResponseCode, Vec<Record>) + Send + Sync + 'static,
+    {
+        Self::new_inner(responder, false).await
+    }
+
+    async fn new_inner<F>(responder: F, truncating: bool) -> Self
     where
         F: Fn(&Name, RecordType) -> (ResponseCode, Vec<Record>) + Send + Sync + 'static,
     {
@@ -107,6 +126,11 @@ impl MockUpstream {
                         resp.add_query(question.clone());
                         for rec in answers {
                             resp.add_answer(rec);
+                        }
+                        if truncating {
+                            // RFC 1035 §4.1.1: the answer is cut off and the
+                            // client must retry over TCP.
+                            resp.metadata.truncation = true;
                         }
                         if let Ok(bytes) = resp.to_bytes() {
                             let _ = socket.send_to(&bytes, src).await;
@@ -317,6 +341,39 @@ async fn oversized_upstream_reply_is_bounded_not_buffered_forever() {
         );
     }
     giant.shutdown();
+}
+
+#[tokio::test]
+async fn tc_marked_udp_reply_is_never_served_as_the_final_answer() {
+    // RFC 1035 §4.2.1: a UDP reply with TC set is an instruction to retry
+    // over TCP, not an answer. hickory owns that fallback
+    // (name_server_pool: on truncation it disables UDP for the server and
+    // re-queues it as TCP), so what we pin at our seam is the observable
+    // half: a truncated reply is NEVER surfaced as a final answer. Our mock
+    // is UDP-only, so the mandated TCP retry cannot complete and the query
+    // must fail closed (AllUpstreamsFailed) rather than serve the cut-off
+    // payload.
+    let mock = MockUpstream::new_truncating(|name, _| {
+        vec![a_record(name, Ipv4Addr::new(203, 0, 113, 42), 60)]
+    })
+    .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let err = resolver
+        .resolve("tc.example.org.", "A")
+        .await
+        .expect_err("a TC-marked UDP answer must never be served as final");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "expected fail-closed after uncompletable TCP retry, got {err:?}"
+    );
+    // hickory re-queues and re-attempts the server several times before
+    // giving up; what matters is that every attempt stayed on the wire and
+    // none of them produced a served truncated answer.
+    assert!(mock.query_count() >= 1, "the mock must have been consulted");
+    mock.shutdown();
 }
 
 #[tokio::test]
