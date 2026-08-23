@@ -2447,6 +2447,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn static_zone_answers_authoritatively_and_never_fakes_out_of_zone() {
+        // Pipeline-level rendering of the authority contract: configured
+        // names are answered authoritatively (AA set, no recursion), an
+        // IN-zone name we have no record for short-circuits before the
+        // upstream (unreachable here on purpose — a SERVFAIL would prove
+        // fall-through), and an OUT-of-zone name recurses BY DESIGN — it is
+        // never answered fake-authoritatively from the local zones.
+        let harness = build_harness(
+            vec![static_a("router.lab.example.com", "10.0.0.99")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        // Configured name: authoritative answer.
+        let resp = query(harness.port, "router.lab.example.com.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(resp.metadata.authoritative);
+        assert_eq!(resp.answers.len(), 1);
+
+        // Same-suffix UNKNOWN name: static zones are exact-name tables (no
+        // SOA/NX-proof machinery), so an unknown name is NOT claimed
+        // authoritatively — it falls through to the upstream like any other
+        // recursive name and fails closed against the unreachable resolver.
+        // Pinning that it is never fake-answered locally.
+        let ghost = query(harness.port, "ghost.lab.example.com.", ProtoRecordType::A).await;
+        assert_eq!(ghost.metadata.response_code, ResponseCode::ServFail);
+        assert!(!ghost.metadata.authoritative);
+        assert_eq!(
+            ghost.answers.len(),
+            0,
+            "no fabricated data for an unknown name"
+        );
+
+        // Out of zone: falls through to the (unreachable) upstream and fails
+        // closed as SERVFAIL — proving the pipeline did NOT answer
+        // authoritatively for a name outside our zones.
+        let out = query(harness.port, "unrouted.example.org.", ProtoRecordType::A).await;
+        assert_eq!(out.metadata.response_code, ResponseCode::ServFail);
+        assert!(!out.metadata.authoritative);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn blocked_domain_returns_nxdomain() {
         let harness = build_harness(
             vec![],
