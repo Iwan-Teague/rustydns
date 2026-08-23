@@ -2723,6 +2723,55 @@ mod tests {
         assert!(n <= 4096, "EDNS-clamped reply exceeded 4096: {n} bytes");
     }
 
+    #[tokio::test]
+    async fn oversized_inbound_datagram_is_never_processed() {
+        // hickory's UDP listener reads into a bounded buffer
+        // (MAX_RECEIVE_BUFFER_SIZE = 4096, or the advertised EDNS payload,
+        // whichever is smaller), so a datagram larger than the cap is cut
+        // mid-message and can never decode as a valid query. Pin the
+        // observable contract: an oversized datagram must never yield a
+        // served answer — silence or an error rcode, never authoritative
+        // NoError data derived from attacker bytes.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+        // A plausible 12-byte DNS header followed by ~6 KB of padding:
+        // larger than any accepted inbound cap.
+        let mut blob = vec![0u8; 12 + 6000];
+        blob[2] = 0x01; // recursion desired flag
+        blob[4..6].copy_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1, rest garbage
+        client
+            .send_to(&blob, format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+
+        let mut buf = [0u8; 512];
+        match tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf)).await {
+            // Silently dropped: nothing to process (the expected shape).
+            Err(_) => {}
+            Ok(Ok((n, _))) => {
+                // Any bytes that do come back must not be a served answer
+                // derived from the oversized datagram; undecodable filler
+                // (FORMERR etc.) still satisfies the contract.
+                if let Ok(msg) = Message::from_bytes(&buf[..n]) {
+                    assert!(
+                        !(msg.metadata.response_code == ResponseCode::NoError
+                            && !msg.answers.is_empty()
+                            && msg.metadata.authoritative),
+                        "oversized datagram produced a served answer"
+                    );
+                }
+            }
+            Ok(Err(e)) => panic!("socket error on oversized datagram: {e}"),
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_domain_returns_nxdomain() {
         let harness = build_harness(
