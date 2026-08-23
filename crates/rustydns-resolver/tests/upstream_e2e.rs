@@ -1377,6 +1377,63 @@ async fn nodata_upstream_leaves_nxdomain_clear() {
     );
 }
 
+#[tokio::test]
+async fn no_client_identifying_data_leaves_on_the_wire_without_edns() {
+    // PRIVACY, generalized beyond ECS: the resolver's upstream path takes
+    // ONLY a name and a record type — there is no parameter through which a
+    // client address could even enter the query. With DNSSEC validation off
+    // (so nothing forces EDNS0), the outgoing query must carry NO OPT
+    // pseudo-section at all: no extension mechanism exists on the wire for
+    // any client-derived data to ride. The ECS pins prove the option is
+    // absent when EDNS0 IS forced on; this proves the whole channel is
+    // absent when it is not.
+    let saw_opt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = saw_opt.clone();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (n, src) = match socket.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                continue;
+            };
+            if query.edns.is_some() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let Some(q) = query.queries.first() else {
+                continue;
+            };
+            let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.add_query(q.clone());
+            resp.add_answer(a_record(q.name(), Ipv4Addr::new(1, 2, 3, 4), 300));
+            if let Ok(bytes) = resp.to_bytes() {
+                let _ = socket.send_to(&bytes, src).await;
+            }
+        }
+    });
+
+    let cfg = plain_config(&addr.to_string()); // dnssec_validation=false by default here
+    assert!(
+        !cfg.upstream.dnssec_validation,
+        "fixture must be the no-EDNS case"
+    );
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+    let out = resolver
+        .resolve("example.com.", "A")
+        .await
+        .expect("plain resolution must succeed");
+    assert_eq!(out.records.len(), 1);
+    assert!(
+        !saw_opt.load(Ordering::SeqCst),
+        "queries without EDNS needs must carry no OPT section at all"
+    );
+}
+
 // `_unused_addr_string` is referenced indirectly via SocketAddr usage
 // above; keep this dead import suppressor so the test file lints clean
 // even if a future test deletes the only IpAddr usage.
