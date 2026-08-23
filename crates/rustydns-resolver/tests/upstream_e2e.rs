@@ -715,6 +715,60 @@ async fn cache_serves_repeat_query_without_upstream_hit() {
 }
 
 #[tokio::test]
+async fn cached_answer_expires_at_ttl_and_is_reresolved() {
+    // The other half of the cache contract: within the TTL the answer is
+    // honoured from cache, but once it expires the entry is dropped and the
+    // upstream is consulted again — a stale answer must never keep being
+    // served. The cache clock (like the cache itself) is hickory-owned; what
+    // we pin at our seam is the observable miss → hit → expiry-refetch cycle.
+    let mock =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(9, 9, 9, 9), 1)]).await;
+
+    let cfg = plain_config(&mock.addr_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    // Miss: first resolve reaches the mock.
+    let _ = resolver
+        .resolve("ttl.example.com.", "A")
+        .await
+        .expect("first resolve");
+    let after_miss = mock.query_count();
+    assert_eq!(after_miss, 1, "first resolve must reach the upstream");
+
+    // Hit: an immediate repeat is served from cache while the record is
+    // fresh (TTL 1s — well beyond this step).
+    let out = resolver
+        .resolve("ttl.example.com.", "A")
+        .await
+        .expect("cached repeat");
+    assert_eq!(out.records.len(), 1);
+    match &out.records[0].data {
+        RecordData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(9, 9, 9, 9)),
+        other => panic!("expected A record, got {other:?}"),
+    }
+    assert_eq!(
+        mock.query_count(),
+        after_miss,
+        "fresh entry must be honoured from cache, not refetched"
+    );
+
+    // Expiry: sleep past the TTL (+ generous margin for scheduler jitter on
+    // slow CI) and the same query must go back to the wire — the cached
+    // copy is gone, not served stale forever.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let out = resolver
+        .resolve("ttl.example.com.", "A")
+        .await
+        .expect("post-TTL re-resolve");
+    assert_eq!(out.records.len(), 1);
+    assert!(
+        mock.query_count() > after_miss,
+        "expired entry must be re-resolved from upstream (mock count {} stayed flat)",
+        mock.query_count()
+    );
+}
+
+#[tokio::test]
 async fn nxdomain_is_a_structured_empty_result_and_repeatable() {
     // A negative answer must never surface as success-with-data or as a
     // generic failure: resolve() maps hickory's no-records error into a
