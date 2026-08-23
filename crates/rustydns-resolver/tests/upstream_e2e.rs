@@ -1147,6 +1147,80 @@ async fn duplicate_records_are_deduplicated_in_answers() {
 }
 
 #[tokio::test]
+async fn hostile_opt_record_is_parsed_safely_and_never_trusted() {
+    // An upstream reply carrying a hostile OPT (DO=1, 64 KiB payload
+    // advertisement, unknown option with junk) must change nothing at our
+    // seam: resolve_via_hickory consumes only lookup.answers() — the OPT's
+    // flags and options are decoded but never consulted for serving
+    // decisions. The honest answer rides through untouched.
+    use hickory_proto::op::Edns;
+    use hickory_proto::rr::rdata::opt::EdnsOption;
+
+    let victim_name = Name::from_ascii("victim.example.org.").unwrap();
+    let (addr, shutdown) = {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let token = CancellationToken::new();
+        let sh = token.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                tokio::select! {
+                    _ = sh.cancelled() => break,
+                    res = socket.recv_from(&mut buf) => {
+                        let Ok((n, src)) = res else { continue };
+                        let Ok(query) = Message::from_bytes(&buf[..n]) else { continue };
+                        let Some(question) = query.queries.first() else { continue };
+                        let mut resp = Message::new(
+                            query.metadata.id,
+                            MessageType::Response,
+                            OpCode::Query,
+                        );
+                        resp.metadata.recursion_available = true;
+                        resp.add_query(question.clone());
+                        resp.add_answer(Record::from_rdata(
+                            victim_name.clone(),
+                            300,
+                            RData::A(A(Ipv4Addr::new(203, 0, 113, 10))),
+                        ));
+                        // The hostile part: DO bit set, an oversized buffer
+                        // advertisement, and an unknown option code with junk.
+                        let mut edns = Edns::new();
+                        edns.set_dnssec_ok(true).set_max_payload(65535);
+                        edns.options_mut()
+                            .insert(EdnsOption::Unknown(65001, vec![0xde, 0xad]));
+                        resp.edns = Some(edns);
+                        if let Ok(bytes) = resp.to_bytes() {
+                            let _ = socket.send_to(&bytes, src).await;
+                        }
+                    }
+                }
+            }
+        });
+        (addr, token)
+    };
+
+    let resolver = Resolver::new(plain_config(&addr.to_string()))
+        .await
+        .expect("resolver");
+    let out = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect("the honest answer behind a hostile OPT must be served");
+    assert_eq!(
+        out.records.len(),
+        1,
+        "hostile OPT changed the served answer"
+    );
+    match &out.records[0].data {
+        RecordData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 10)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    assert_eq!(out.private_rdata_dropped, 0);
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same
