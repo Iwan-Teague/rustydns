@@ -1583,6 +1583,56 @@ async fn cached_answer_expires_at_ttl_and_is_reresolved() {
 }
 
 #[tokio::test]
+async fn stale_entry_is_replaced_by_fresh_data_after_expiry() {
+    // The miss→hit→refetch cycle is pinned elsewhere; this proves the
+    // REFETCHED answer actually replaces the expired entry's data — the
+    // upstream changes its answer after the first call, and the post-expiry
+    // lookup must surface the NEW value, not a stale copy.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mock = MockUpstream::new(move |name, _| {
+        let n = seen.fetch_add(1, Ordering::SeqCst);
+        let ip = if n == 0 {
+            Ipv4Addr::new(203, 0, 113, 10)
+        } else {
+            Ipv4Addr::new(203, 0, 113, 11)
+        };
+        vec![Record::from_rdata(name.clone(), 1, RData::A(A(ip)))]
+    })
+    .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let out = resolver
+        .resolve("fresh.example.org.", "A")
+        .await
+        .expect("first resolve");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 10)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+
+    // Past TTL (1s) and past the 2s positive_min_ttl floor.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let out = resolver
+        .resolve("fresh.example.org.", "A")
+        .await
+        .expect("post-expiry re-resolve");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(
+            *ip,
+            Ipv4Addr::new(203, 0, 113, 11),
+            "expired entry was not replaced with fresh data"
+        ),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    assert_eq!(mock.query_count(), 2, "each lookup must hit the wire once");
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn zero_ttl_records_are_held_for_the_cache_floor() {
     // MIN_POSITIVE_CACHE_TTL_SECS: a hostile upstream answering with
     // TTL=0 records must not force a re-query per lookup (rapid-re-query
