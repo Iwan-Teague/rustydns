@@ -404,6 +404,7 @@ impl Resolver {
                 let mut records = lookup_to_dns_records(lookup.answers());
                 let mut dropped: u32 = 0;
                 dropped += filter_out_of_bailiwick(&mut records, name);
+                dropped += filter_wrong_type(&mut records, record_type);
                 if on_default && self.config.upstream.block_private_rdata {
                     dropped += filter_private_rdata(&mut records);
                 }
@@ -942,6 +943,60 @@ pub(crate) fn filter_private_rdata(records: &mut Vec<DnsRecord>) -> u32 {
 /// links: every owner reachable from the qname through in-answer CNAMEs stays.
 /// Applied unconditionally (unlike the opt-in rebinding defence) — an upstream
 /// has no business answering for names we did not ask it about.
+/// Answer sanity: keep only records of the REQUESTED type, plus CNAME links
+/// (which surface the chain so the caller can follow it). A hostile upstream
+/// can ride a legitimate reply with same-name wrong-type filler — TXT spam
+/// next to a requested A, for example. Multi-record RRsets of the requested
+/// type are legal DNS and stay served; only foreign types are dropped.
+/// Applied unconditionally — like the bailiwick defence, this is not a knob.
+pub(crate) fn filter_wrong_type(records: &mut Vec<DnsRecord>, qtype: RecordType) -> u32 {
+    let before = records.len();
+    records.retain(|r| match &r.data {
+        // Chain links always survive — they ARE how the answer explains itself.
+        RecordData::Cname(_) => true,
+        other => type_label_matches(qtype, other),
+    });
+    let dropped = (before - records.len()) as u32;
+    if dropped > 0 {
+        tracing::warn!(
+            qtype = %qtype,
+            dropped,
+            "answer sanity: dropped upstream record(s) of an unrequested type"
+        );
+    }
+    dropped
+}
+
+/// Does `data` carry the record type `qtype` asks for?
+fn type_label_matches(qtype: RecordType, data: &RecordData) -> bool {
+    let want = qtype_name(qtype);
+    matches!(
+        (want, data),
+        ("A", RecordData::A(_)) | ("AAAA", RecordData::Aaaa(_))
+    ) || match data {
+        RecordData::Ptr(_) => want == "PTR",
+        RecordData::Ns(_) => want == "NS",
+        RecordData::Mx { .. } => want == "MX",
+        RecordData::Srv { .. } => want == "SRV",
+        RecordData::Txt(_) => want == "TXT",
+        _ => false,
+    }
+}
+
+fn qtype_name(qtype: RecordType) -> &'static str {
+    match qtype {
+        RecordType::A => "A",
+        RecordType::AAAA => "AAAA",
+        RecordType::CNAME => "CNAME",
+        RecordType::PTR => "PTR",
+        RecordType::NS => "NS",
+        RecordType::MX => "MX",
+        RecordType::SRV => "SRV",
+        RecordType::TXT => "TXT",
+        _ => "",
+    }
+}
+
 pub(crate) fn filter_out_of_bailiwick(records: &mut Vec<DnsRecord>, qname: &str) -> u32 {
     let canonical = |n: &str| n.trim_end_matches('.').to_ascii_lowercase();
     let mut allowed: std::collections::HashSet<String> = [canonical(qname)].into();
