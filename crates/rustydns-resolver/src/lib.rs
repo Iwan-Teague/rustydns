@@ -523,6 +523,10 @@ impl Resolver {
 /// Extracted from [`build_resolver_arm`] so the security-relevant knobs are
 /// unit-testable without bootstrapping a network resolver.
 const MIN_POSITIVE_CACHE_TTL_SECS: u64 = 2;
+/// Mirror of the cache floor: an upstream cannot wedge an entry in the
+/// cache forever by advertising absurd TTLs — entries are clamped down to
+/// this ceiling so stale answers age out within a bounded window.
+const MAX_POSITIVE_CACHE_TTL_SECS: u64 = 86400;
 
 fn build_resolver_opts(config: &DnsConfig, protocol: UpstreamProtocol) -> ResolverOpts {
     let mut opts = ResolverOpts::default();
@@ -533,6 +537,8 @@ fn build_resolver_opts(config: &DnsConfig, protocol: UpstreamProtocol) -> Resolv
     // beats stale); the per-client rate limiter bounds the remaining abuse
     // surface. hickory extends entries whose TTL falls below the floor.
     opts.positive_min_ttl = Some(Duration::from_secs(MIN_POSITIVE_CACHE_TTL_SECS));
+    // CACHE-CEILING: clamp absurd TTLs so no entry outlives a bounded window.
+    opts.positive_max_ttl = Some(Duration::from_secs(MAX_POSITIVE_CACHE_TTL_SECS));
     // PRIVACY: never advertise EDNS0 Client Subnet. hickory does not
     // attach ECS automatically, but we also do not enable edns0
     // unless DNSSEC requires it (which we set below).
@@ -1190,6 +1196,27 @@ mod tests {
         assert!(zone_matches("foo.lan.", "lan."));
         assert!(zone_matches("foo.bar.lan.", "lan."));
         assert!(zone_matches("FOO.LAN", "lan."));
+    }
+
+    #[test]
+    fn cache_ttl_floor_and_ceiling_are_wired() {
+        // The floor (rapid-re-query DoS defence) and the ceiling (no entry
+        // wedged forever by absurd upstream TTLs) must both be wired into
+        // every arm's resolver options.
+        let cfg = DnsConfig::default();
+        let opts = build_resolver_opts(&cfg, UpstreamProtocol::Plain);
+        assert_eq!(
+            opts.positive_min_ttl,
+            Some(Duration::from_secs(MIN_POSITIVE_CACHE_TTL_SECS))
+        );
+        assert_eq!(
+            opts.positive_max_ttl,
+            Some(Duration::from_secs(MAX_POSITIVE_CACHE_TTL_SECS))
+        );
+        // The wiring is arm-independent: DoH gets the same bounds.
+        let doh_opts = build_resolver_opts(&cfg, UpstreamProtocol::Doh);
+        assert_eq!(doh_opts.positive_min_ttl, opts.positive_min_ttl);
+        assert_eq!(doh_opts.positive_max_ttl, opts.positive_max_ttl);
     }
 
     #[test]
