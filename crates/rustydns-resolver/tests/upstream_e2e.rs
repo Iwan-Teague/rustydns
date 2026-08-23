@@ -835,7 +835,7 @@ async fn txid_mismatch_is_dropped_not_served() {
                 _ = tok.cancelled() => break,
                 res = sock.recv_from(&mut buf) => {
                     let Ok((n, src)) = res else { continue };
-                    let Ok(mut query) = Message::from_bytes(&buf[..n]) else { continue };
+                    let Ok(query) = Message::from_bytes(&buf[..n]) else { continue };
                     let Some(question) = query.queries.first() else { continue };
                     let mut resp = Message::new(
                         query.metadata.id,
@@ -872,6 +872,114 @@ async fn txid_mismatch_is_dropped_not_served() {
         matches!(err, RustyDnsError::AllUpstreamsFailed),
         "txid-mismatched reply must fail closed, got {err:?}"
     );
+    token.cancel();
+}
+
+#[tokio::test]
+async fn spoofed_source_reply_is_dropped() {
+    // Off-path spoofing defence: a connected UDP socket only receives
+    // datagrams from its connected peer (kernel filtering), so an answer
+    // arriving from ANY other source can never be correlated to the
+    // exchange. Pinned end-to-end with ONE combined task owning BOTH
+    // sockets: the victim query (arriving on sock_a) is answered ONLY via
+    // sock_b — a different loopback source — so the resolver must never
+    // correlate it and must fail closed. The control name is answered from
+    // the CORRECT socket, proving the drop was caused by the source, not
+    // the payload.
+    let token = CancellationToken::new();
+
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.expect("mock bind a");
+    let addr_a = sock_a.local_addr().expect("local_addr a");
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.expect("mock bind b");
+
+    let victim = Name::from_ascii("victim.example.org.").unwrap();
+    let control = Name::from_ascii("control.example.org.").unwrap();
+    let attacker_ip = Ipv4Addr::new(6, 6, 6, 6);
+
+    let task_token = token.clone();
+    let mut task_buf_a = [0u8; 1500];
+    let mut task_buf_b = [0u8; 1500];
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = task_token.cancelled() => break,
+                res = sock_a.recv_from(&mut task_buf_a) => {
+                    let Ok((n, src)) = res else { continue };
+                    let Ok(query) = Message::from_bytes(&task_buf_a[..n]) else { continue };
+                    let Some(question) = query.queries.first() else { continue };
+                    let is_victim =
+                        question.name().to_lowercase() == victim.to_lowercase();
+                    let is_control =
+                        question.name().to_lowercase() == control.to_lowercase();
+
+                    if is_victim {
+                        // SPOOF: answer from the WRONG socket.
+                        let mut resp = Message::new(
+                            query.metadata.id,
+                            MessageType::Response,
+                            OpCode::Query,
+                        );
+                        resp.add_query(question.clone());
+                        resp.add_answer(Record::from_rdata(
+                            victim.clone(),
+                            300,
+                            RData::A(A(attacker_ip)),
+                        ));
+                        if let Ok(bytes) = resp.to_bytes() {
+                            let _ = sock_b.send_to(&bytes, src).await;
+                        }
+                    } else if is_control {
+                        // CONTROL: answer from the CORRECT socket.
+                        let mut resp = Message::new(
+                            query.metadata.id,
+                            MessageType::Response,
+                            OpCode::Query,
+                        );
+                        resp.metadata.recursion_available = true;
+                        resp.add_query(question.clone());
+                        resp.add_answer(Record::from_rdata(
+                            control.clone(),
+                            300,
+                            RData::A(A(Ipv4Addr::new(203, 0, 113, 44))),
+                        ));
+                        if let Ok(bytes) = resp.to_bytes() {
+                            let _ = sock_a.send_to(&bytes, src).await;
+                        }
+                    }
+                }
+                res = sock_b.recv_from(&mut task_buf_b) => {
+                    // Nothing should ever arrive on the spoofer socket; drain
+                    // errors only.
+                    let _ = res;
+                }
+            }
+        }
+    });
+
+    let resolver = Resolver::new(plain_config(&addr_a.to_string()))
+        .await
+        .expect("resolver");
+    let err = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect_err("a spoofed-source reply must never be served");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "spoofed-source reply must fail closed, got {err:?}"
+    );
+
+    let out = resolver
+        .resolve("control.example.org.", "A")
+        .await
+        .expect("control lookup over the correct socket must succeed");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(
+            *ip,
+            Ipv4Addr::new(203, 0, 113, 44),
+            "the drop was caused by the source, not the payload"
+        ),
+        other => panic!("expected an A record, got {other:?}"),
+    }
     token.cancel();
 }
 
