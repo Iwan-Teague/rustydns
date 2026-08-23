@@ -670,6 +670,100 @@ async fn plain_upstream_0x20_rejection_is_caused_by_case_mismatch_alone() {
 }
 
 #[tokio::test]
+async fn mismatched_question_section_is_rejected_as_spoofed() {
+    // Bailiwick / question-match check at our seam: a reply whose QUESTION
+    // section does not match the query that was sent must never be surfaced
+    // as an answer, even when the id matches and the rcode is clean. Two
+    // dedicated mocks, one per mismatch flavour:
+    //  - wrong NAME: replies to anything with a question for other.example.
+    //  - wrong TYPE: keeps the name but answers AAAA to an A query.
+    // hickory's exchange validates the response question against the
+    // outstanding query; a mismatch aborts the exchange and the resolver
+    // must fail closed rather than accept cross-named/cross-typed data.
+
+    async fn spoofing_mock(wrong_type: bool) -> (std::net::SocketAddr, CancellationToken) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = socket.local_addr().expect("local_addr");
+        let shutdown = CancellationToken::new();
+        let sh = shutdown.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                tokio::select! {
+                    _ = sh.cancelled() => break,
+                    res = socket.recv_from(&mut buf) => {
+                        let (n, src) = match res {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                            continue;
+                        };
+                        let Some(question) = query.queries.first() else {
+                            continue;
+                        };
+                        let wrong_name =
+                            Name::from_ascii("other.example.").expect("static name");
+                        let qname = if wrong_type {
+                            question.name().clone()
+                        } else {
+                            wrong_name.clone()
+                        };
+                        let qtype = if wrong_type {
+                            RecordType::AAAA
+                        } else {
+                            question.query_type()
+                        };
+                        let mut resp = Message::new(
+                            query.metadata.id,
+                            MessageType::Response,
+                            OpCode::Query,
+                        );
+                        resp.metadata.recursion_available = true;
+                        resp.metadata.response_code = ResponseCode::NoError;
+                        resp.add_query(hickory_proto::op::Query::query(qname, qtype));
+                        if let Ok(bytes) = resp.to_bytes() {
+                            let _ = socket.send_to(&bytes, src).await;
+                        }
+                    }
+                }
+            }
+        });
+        (addr, shutdown)
+    }
+
+    // Leg A — wrong NAME in the question section: rejected.
+    let (addr_a, shut_a) = spoofing_mock(false).await;
+    let resolver_a = Resolver::new(plain_config(&addr_a.to_string()))
+        .await
+        .expect("resolver init");
+    let err = resolver_a
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect_err("a reply for a different name must be rejected");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "wrong-name reply must fail closed, got {err:?}"
+    );
+    shut_a.cancel();
+
+    // Leg B — right NAME, wrong TYPE (AAAA to an A query): rejected too.
+    let (addr_b, shut_b) = spoofing_mock(true).await;
+    let resolver_b = Resolver::new(plain_config(&addr_b.to_string()))
+        .await
+        .expect("resolver init");
+    let err = resolver_b
+        .resolve("typed.example.org.", "A")
+        .await
+        .expect_err("a reply with a mismatched question type must be rejected");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "wrong-type reply must fail closed, got {err:?}"
+    );
+    shut_b.cancel();
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same
