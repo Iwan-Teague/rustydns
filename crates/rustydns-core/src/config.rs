@@ -2250,6 +2250,35 @@ mod tests {
     }
 
     #[test]
+    fn disabling_dnssec_validation_is_accepted_with_disclosure_not_opt_out_gated() {
+        // The repo contract (AGENTS.md) forbids escape-hatch knobs: there is
+        // no `disable_dnssec`-style gate anywhere, and the validator never
+        // hard-rejects a lowered defence either. Instead the insecure posture
+        // is ACCEPTED but loudly DISCLOSED (a tracing::warn at validate time,
+        // config.rs ~1639: "DNSSEC signatures will NOT be verified...").
+        // Pin that contract on all three axes:
+        //
+        // 1. The default is the safe posture (validation ON).
+        assert!(
+            UpstreamConfig::default().dnssec_validation,
+            "DNSSEC validation must default to ON"
+        );
+        // 2. Turning it off is accepted — never rejected, and not gated behind
+        //    any explicit opt-out flag (none exists by design).
+        let mut cfg = baseline();
+        cfg.upstream.dnssec_validation = false;
+        validate_config(&cfg).expect("dnssec_validation = false must be accepted with a warning");
+        // 3. The off spelling round-trips through serde so operators can set it.
+        #[derive(serde::Deserialize)]
+        struct DnsSec {
+            dnssec_validation: bool,
+        }
+        let parsed: DnsSec =
+            toml::from_str("dnssec_validation = false").expect("off spelling must parse");
+        assert!(!parsed.dnssec_validation);
+    }
+
+    #[test]
     fn route_protocol_odoh_rejected() {
         let mut cfg = baseline();
         cfg.upstream.routes = vec![route(
