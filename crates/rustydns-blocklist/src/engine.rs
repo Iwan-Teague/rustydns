@@ -32,7 +32,7 @@ use rustydns_core::config::BlocklistConfig;
 use rustydns_core::{IpDenylist, RegexRules};
 
 use crate::allowlist::Allowlist;
-use crate::parser::{parse, ParsedEntry};
+use crate::parser::{ParsedEntry, parse};
 
 /// Whether a blocklist source is trusted to provide allowlist/passthru entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
