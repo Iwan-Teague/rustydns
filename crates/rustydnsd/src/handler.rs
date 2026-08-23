@@ -492,6 +492,20 @@ impl DnsHandler {
         }
     }
 
+    /// ANY (qtype 255) queries are REFUSED: an ANY answer can be arbitrarily
+    /// large (every record the zone holds), making the resolver an
+    /// amplification vector, and RFC 8482 documents refusal as the compliant
+    /// minimal-answer posture. Nothing here serves zone transfers by any
+    /// other name.
+    fn gate_any_qtype(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
+        if ctx.qtype == RecordType::ANY {
+            self.metrics.inc_policy_refused_any();
+            Some(Reply::reject(ResponseCode::Refused))
+        } else {
+            None
+        }
+    }
+
     /// Scheduled block window (TODO 8.5): if the client is inside an active
     /// `[[policy.block_windows]]` window, refuse every query before the
     /// pipeline (e.g. "kids' devices off after 22:00").
@@ -850,6 +864,7 @@ impl RequestHandler for DnsHandler {
         if let Some(reply) = self
             .gate_rate_limit(&ctx)
             .or_else(|| self.gate_opcode(request, &ctx))
+            .or_else(|| self.gate_any_qtype(&ctx))
             .or_else(|| self.gate_class(&ctx))
         {
             return self
@@ -2488,6 +2503,24 @@ mod tests {
         let out = query(harness.port, "unrouted.example.org.", ProtoRecordType::A).await;
         assert_eq!(out.metadata.response_code, ResponseCode::ServFail);
         assert!(!out.metadata.authoritative);
+    }
+
+    #[tokio::test]
+    async fn any_query_is_refused_against_amplification() {
+        // RFC 8482 posture: ANY (qtype 255) invites the largest possible
+        // answer, so the gate refuses before authority/blocklist/resolver —
+        // the unreachable upstream proves no fall-through happened.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let resp = query(harness.port, "any.example.org.", ProtoRecordType::ANY).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
+        assert!(resp.answers.is_empty(), "ANY must never carry answers");
+        assert!(!resp.metadata.authoritative);
     }
 
     #[tokio::test(flavor = "current_thread")]
