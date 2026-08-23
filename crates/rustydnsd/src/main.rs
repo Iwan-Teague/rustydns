@@ -2075,4 +2075,46 @@ mod tests {
         assert!(al2.doh_token.is_none());
         assert!(al2.metrics_token.is_none());
     }
+
+    #[test]
+    fn metrics_listen_bind_safety_forces_non_loopback_to_loopback() {
+        // The unauthenticated metrics endpoint is the bind-safety invariant
+        // this daemon enforces: config warns on non-loopback, and the runtime
+        // FORCES the address to loopback while preserving the operator's
+        // port. (DNS listeners are intentionally operator-bindable — see the
+        // ServerConfig docs; no expose flag exists by design.)
+        let v4 = rustydns_core::config::MetricsConfig {
+            listen: "0.0.0.0:9153".to_string(),
+            ..Default::default()
+        };
+        let forced = metrics_listen_addr(&v4).expect("v4 parse");
+        assert!(
+            forced.ip().is_loopback(),
+            "non-loopback IPv4 must be forced"
+        );
+        assert_eq!(forced.port(), 9153, "port must be preserved when forcing");
+
+        let v6 = rustydns_core::config::MetricsConfig {
+            listen: "[::]:9153".to_string(),
+            ..Default::default()
+        };
+        let forced6 = metrics_listen_addr(&v6).expect("v6 parse");
+        assert_eq!(
+            forced6.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(forced6.port(), 9153);
+
+        let looped = rustydns_core::config::MetricsConfig {
+            listen: "127.0.0.1:9153".to_string(),
+            ..Default::default()
+        };
+        let passthrough = metrics_listen_addr(&looped).expect("loopback parse");
+        assert_eq!(passthrough.ip().to_string(), "127.0.0.1");
+
+        // The default posture is already safe.
+        let default_addr = metrics_listen_addr(&rustydns_core::config::MetricsConfig::default())
+            .expect("default parse");
+        assert!(default_addr.ip().is_loopback());
+    }
 }
