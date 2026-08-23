@@ -110,6 +110,7 @@ still serving from the previous valid `ArcSwap` snapshot.
 | `rustydns_policy_blocklist_bypass_total`          | counter | Queries where `blocklist_bypass=true` actually changed the outcome       |
 | `rustydns_policy_zone_denied_total`               | counter | Queries refused because they fell outside `zones_allowed`                |
 | `rustydns_policy_rate_limited_total`              | counter | Queries refused because the source IP exceeded the per-client rate limit |
+| `rustydns_policy_refused_any_total`               | counter | ANY (qtype 255) queries refused with REFUSED (RFC 8482 minimal-answer posture) |
 | `rustydns_resolver_private_rdata_dropped_total`   | counter | A/AAAA records stripped by the DNS-rebinding defence (per record, not per query) |
 
 `blocklist_bypass_total` only increments when the bypass *changed
