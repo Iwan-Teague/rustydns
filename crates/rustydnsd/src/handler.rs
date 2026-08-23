@@ -3400,6 +3400,138 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn doq_listener_refuses_non_quic_datagram_on_its_port() {
+        // Mirror of the DoT plaintext pin, for the QUIC transport: the DoQ
+        // port is a UDP socket owned by quinn, so an attacker's "plaintext
+        // connection" is a raw unframed DNS datagram with no QUIC long
+        // header. The engine must drop it silently — no parseable RFC 9250
+        // reply may ever come back. The real-QUIC happy path is proven
+        // end-to-end by tests/sighup_reload.rs::daemon_serves_doq_queries;
+        // successful registration on a bound socket is the liveness proof
+        // here.
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use rustydns_blocklist::BlocklistEngine;
+        use rustydns_core::config::{RateLimitConfig, ServerConfig as RsServerConfig};
+        use tokio::net::UdpSocket;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let cert_path = std::env::temp_dir().join(format!("rustydns-doq-plain-cert-{id}.pem"));
+        let key_path = std::env::temp_dir().join(format!("rustydns-doq-plain-key-{id}.pem"));
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(crate::test_pem::TEST_LEAF_CERT_PEM.as_bytes())
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(crate::test_pem::TEST_LEAF_KEY_PEM.as_bytes())
+            .unwrap();
+
+        let _guard = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: vec![static_a("router.mesh", "100.64.0.8")],
+                poll_interval_secs: 30,
+            })
+            .expect("authority"),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            ..Default::default()
+        }));
+        let mut dns_config = DnsConfig::default();
+        dns_config.upstream.resolvers = vec!["https://127.0.0.1:1/dns-query".to_string()];
+        dns_config.upstream.timeout_ms = 500;
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            Arc::new(crate::query_log::QueryLog::new(16)),
+            Arc::new(crate::rate_limiter::RateLimiter::new(&RateLimitConfig {
+                enabled: false,
+                ..Default::default()
+            })),
+            &[],
+            &[],
+        )
+        .expect("handler");
+
+        // doq-ALPN TLS config (distinct from DoT's no-ALPN config).
+        let server_cfg = RsServerConfig {
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
+            ..Default::default()
+        };
+        let doq_tls = crate::load_doq_tls_config(&server_cfg).expect("doq tls config");
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = udp.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server
+            .register_quic_listener_and_tls_config(udp, Duration::from_secs(5), doq_tls)
+            .expect("register quic listener");
+
+        // A plain DNS query on the wire — no QUIC long header, no ALPN, no
+        // RFC 9250 framing. Quinn cannot interpret this as a connection and
+        // must discard it.
+        let build_query = |msg_id: u16| -> Vec<u8> {
+            let mut msg = Message::new(msg_id, MessageType::Query, OpCode::Query);
+            msg.metadata.recursion_desired = true;
+            msg.add_query(Query::query(
+                "router.mesh.".parse().expect("name"),
+                ProtoRecordType::A,
+            ));
+            msg.to_bytes().expect("encode query").to_vec()
+        };
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&build_query(0x2222), format!("127.0.0.1:{port}"))
+            .await
+            .expect("send raw datagram");
+
+        let mut buf = [0u8; 512];
+        match timeout(Duration::from_secs(1), client.recv_from(&mut buf)).await {
+            // Expected: the non-QUIC datagram is dropped silently and nothing
+            // ever comes back.
+            Err(_) => {}
+            Ok(Ok((n, _))) => {
+                // Defensive: even if some bytes were somehow produced, they
+                // must not be a valid RFC 9250-framed reply to OUR query id.
+                if n > 2 {
+                    let framed = &buf[2..n]; // strip the length prefix
+                    if let Ok(reply) = Message::from_bytes(framed) {
+                        assert_ne!(
+                            reply.metadata.id, 0x2222_u16,
+                            "non-QUIC datagram elicited a DNS response"
+                        );
+                    }
+                }
+            }
+            Ok(Err(e)) => panic!("unexpected io error on DoQ probe: {e}"),
+        }
+
+        drop(server);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn policy_blocklist_bypass_lets_blocked_name_through() {
         // The query loopback originates from 127.0.0.1, so put a policy
         // for that IP. With blocklist_bypass = true the same name that
