@@ -1529,6 +1529,49 @@ async fn cache_serves_repeat_query_without_upstream_hit() {
 }
 
 #[tokio::test]
+async fn mixed_case_lookup_hits_the_same_cache_entry() {
+    // DNS names are case-insensitive (RFC 1035 §2.3.3): the cache must fold
+    // name case, so Example.COM hits the example.com entry instead of
+    // minting a second cache entry and re-querying the upstream.
+    let mock =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 30), 300)])
+            .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let out = resolver
+        .resolve("case.example.org.", "A")
+        .await
+        .expect("first resolve");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(*ip, Ipv4Addr::new(203, 0, 113, 30)),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    assert_eq!(mock.query_count(), 1, "miss must hit the wire once");
+
+    let out = resolver
+        .resolve("CASE.EXAMPLE.ORG.", "A")
+        .await
+        .expect("mixed-case resolve");
+    match out.records.first().map(|r| &r.data) {
+        Some(RecordData::A(ip)) => assert_eq!(
+            *ip,
+            Ipv4Addr::new(203, 0, 113, 30),
+            "case-folded lookup returned different data"
+        ),
+        other => panic!("expected an A record, got {other:?}"),
+    }
+    assert_eq!(
+        mock.query_count(),
+        1,
+        "the mixed-case lookup must hit the cached entry instead of re-querying upstream"
+    );
+
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn cached_answer_expires_at_ttl_and_is_reresolved() {
     // The other half of the cache contract: within the TTL the answer is
     // honoured from cache, but once it expires the entry is dropped and the
