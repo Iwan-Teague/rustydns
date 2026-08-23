@@ -3232,6 +3232,174 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dot_listener_refuses_plaintext_connection_on_its_port() {
+        // DoT is RFC 7858: the port speaks TLS and NOTHING else. Control
+        // leg proves the port serves real TLS DNS; attack leg connects a
+        // RAW TCP client sending unencrypted wire-format DNS bytes and
+        // must observe the handshake fail (EOF/reset/timeout) — never a
+        // parseable DNS reply on the plaintext path.
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::ClientConfig;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+
+        use crate::test_pem::{TEST_CA_PEM, TEST_CERT_CN, TEST_LEAF_CERT_PEM, TEST_LEAF_KEY_PEM};
+
+        let _ = tokio_rustls::rustls::crypto::CryptoProvider::install_default(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        );
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let cert_path = std::env::temp_dir().join(format!("rustydns-dot-plain-cert-{id}.pem"));
+        let key_path = std::env::temp_dir().join(format!("rustydns-dot-plain-key-{id}.pem"));
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(TEST_LEAF_CERT_PEM.as_bytes())
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(TEST_LEAF_KEY_PEM.as_bytes())
+            .unwrap();
+
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: vec![static_a("router.mesh", "100.64.0.8")],
+                poll_interval_secs: 30,
+            })
+            .unwrap(),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            ..BlocklistConfig::default()
+        }));
+        let mut dns_config = DnsConfig::default();
+        dns_config.upstream.resolvers = vec!["https://127.0.0.1:1/dns-query".to_string()];
+        dns_config.upstream.timeout_ms = 500;
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.unwrap());
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            Arc::new(crate::query_log::QueryLog::new(16)),
+            Arc::new(crate::rate_limiter::RateLimiter::new(
+                &rustydns_core::config::RateLimitConfig {
+                    enabled: false,
+                    ..rustydns_core::config::RateLimitConfig::default()
+                },
+            )),
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        use rustydns_core::config::ServerConfig as RsServerConfig;
+        let tls_server_config = crate::load_tls_config(&RsServerConfig {
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
+            ..RsServerConfig::default()
+        })
+        .expect("load_tls_config");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server
+            .register_tls_listener_with_tls_config(
+                listener,
+                Duration::from_secs(5),
+                tls_server_config,
+            )
+            .expect("register_tls_listener_with_tls_config");
+
+        // Shared wire query for both legs.
+        let build_query = |id: u16| {
+            let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
+            msg.metadata.recursion_desired = true;
+            msg.add_query({
+                let mut q = Query::new();
+                q.set_name(ProtoName::from_ascii("router.mesh.").unwrap())
+                    .set_query_type(ProtoRecordType::A);
+                q
+            });
+            let body = msg.to_bytes().expect("encode query");
+            let mut framed = (body.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&body);
+            framed
+        };
+
+        // --- Leg A (control): a proper TLS client gets a real answer. ---
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(TEST_CA_PEM.as_bytes()).expect("parse CA"))
+            .expect("add CA");
+        let connector = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("tcp connect");
+        let mut tls = connector
+            .connect(
+                ServerName::try_from(TEST_CERT_CN.to_string()).expect("server name"),
+                tcp,
+            )
+            .await
+            .expect("tls handshake");
+        tls.write_all(&build_query(0x1111)).await.expect("write");
+        let mut len_buf = [0u8; 2];
+        tls.read_exact(&mut len_buf).await.expect("read length");
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        tls.read_exact(&mut resp_buf).await.expect("read body");
+        let resp = Message::from_bytes(&resp_buf).expect("decode response");
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        drop(tls);
+
+        // --- Leg B (attack): plaintext client sends raw DNS bytes. ---
+        let raw_query = build_query(0x2222);
+        let mut plain = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("plaintext tcp connect succeeds (TCP layer)");
+        plain.write_all(&raw_query).await.expect("write plaintext");
+
+        // The TLS acceptor cannot parse our DNS bytes as a ClientHello, so
+        // the server must abort the connection: the read side sees EOF /
+        // reset / an error — never a well-formed DNS response.
+        let mut buf = vec![0u8; 512];
+        let outcome = tokio::time::timeout(Duration::from_secs(5), plain.read(&mut buf)).await;
+        match outcome {
+            Ok(Ok(0)) => { /* clean EOF — connection refused at protocol level */ }
+            Ok(Ok(n)) => {
+                // Any bytes that DID arrive must not decode as the DNS
+                // response we asked for (defence-in-depth: garbage from a
+                // failed handshake must never look like a valid reply).
+                assert!(
+                    Message::from_bytes(&buf[..n]).is_err(),
+                    "plaintext client received a parseable DNS response"
+                );
+            }
+            Ok(Err(_)) => { /* connection reset / io error — expected */ }
+            Err(_) => panic!("plaintext connection neither closed nor errored"),
+        }
+
+        drop(server);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn policy_blocklist_bypass_lets_blocked_name_through() {
         // The query loopback originates from 127.0.0.1, so put a policy
         // for that IP. With blocklist_bypass = true the same name that
