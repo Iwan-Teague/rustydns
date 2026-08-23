@@ -939,6 +939,59 @@ async fn answer_sanity_only_the_requested_type_surfaces() {
 }
 
 #[tokio::test]
+async fn aaaa_query_never_surfaces_a_spurious_a_record() {
+    // The explicit AAAA direction of the answer-sanity enforcement: an A
+    // query was pinned in answer_sanity_only_the_requested_type_surfaces;
+    // here the same filter_wrong_type mechanism must drop same-name A filler
+    // riding a AAAA answer, while the legitimate AAAA record (and any legal
+    // multi-record AAAA RRset) stays served.
+    use hickory_proto::rr::rdata::{A, AAAA};
+
+    let victim_name = Name::from_ascii("v6victim.example.org.").unwrap();
+    let mock = MockUpstream::new(move |name, _| {
+        if name.to_lowercase() == victim_name.to_lowercase() {
+            vec![
+                Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(192, 0, 2, 1)))),
+                Record::from_rdata(
+                    name.clone(),
+                    300,
+                    RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
+                ),
+            ]
+        } else {
+            vec![a_record(name, Ipv4Addr::new(203, 0, 113, 12), 300)]
+        }
+    })
+    .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let out = resolver
+        .resolve("v6victim.example.org.", "AAAA")
+        .await
+        .expect("the legitimate AAAA record must survive the sanity filter");
+    assert!(
+        out.records
+            .iter()
+            .all(|r| !matches!(r.data, RecordData::A(_))),
+        "spurious A record surfaced on a AAAA query: {:?}",
+        out.records
+    );
+    assert!(
+        out.records.iter().any(
+            |r| matches!(&r.data, RecordData::Aaaa(ip) if *ip == std::net::Ipv6Addr::LOCALHOST)
+        ),
+        "the legitimate AAAA record must survive"
+    );
+    assert_eq!(
+        out.private_rdata_dropped, 1,
+        "the A filler must be counted as dropped"
+    );
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same
