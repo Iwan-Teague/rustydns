@@ -675,6 +675,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn doh_get_without_dns_param_is_rejected() {
+        // axum 0.7→0.8 migration pin (d097ffe): the Query<DohQuery>
+        // extractor must still reject a parameter-less GET with 400 before
+        // any DNS processing — the HEAD leg of the verb-rejection test trips
+        // this path indirectly; here it is pinned directly so a silent
+        // extractor behaviour change across the migration cannot slip
+        // through.
+        let handler = build_handler(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .get(format!("{base}/dns-query"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "a GET without ?dns= must be rejected by the extractor"
+        );
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok());
+        assert_ne!(
+            ct,
+            Some("application/dns-message"),
+            "missing dns= parameter produced a DNS-shaped response"
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn doh_rejects_oversized_base64url_get() {
         // GET/POST parity for the size cap: the decoded `dns=` parameter goes
         // through the same handle_dns_message gate as a POST body, so a
