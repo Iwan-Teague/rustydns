@@ -2027,7 +2027,7 @@ mod tests {
             "in-range values must be honoured"
         );
         assert_eq!(shutdown_timeout_from(Some("60")), Duration::from_secs(60));
-        for bad in ["0", "99", "abc", ""] {
+        for bad in ["0", "99", "abc", "", " 5", "5 "] {
             assert_eq!(
                 shutdown_timeout_from(Some(bad)),
                 Duration::from_secs(10),
