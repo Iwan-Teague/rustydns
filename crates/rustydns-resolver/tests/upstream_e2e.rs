@@ -1881,6 +1881,43 @@ async fn nodata_is_served_as_empty_success_and_distinct_from_nxdomain() {
 }
 
 #[tokio::test]
+async fn servfail_is_never_cached_as_a_negative_answer() {
+    // An upstream SERVFAIL is an ERROR, not a negative answer: it must fail
+    // closed at our seam and never be cached as if the name were known-absent
+    // — every lookup must re-query while the upstream is failing.
+    let mock = MockUpstream::new_with_rcode(|_, _| (ResponseCode::ServFail, vec![])).await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    // Leg 1: observe the failure shape honestly.
+    let first = resolver.resolve("fail.example.org.", "A").await;
+
+    match &first {
+        Ok(out) => panic!(
+            "SERVFAIL surfaced as an empty success: {out:?} — errors must not \
+             masquerade as negative answers"
+        ),
+        Err(RustyDnsError::AllUpstreamsFailed) => {}
+        Err(other) => panic!("unexpected error shape: {other:?}"),
+    }
+    let after_first = mock.query_count();
+    assert!(after_first >= 1, "upstream must have been consulted");
+
+    // Leg 2: the error must NOT have poisoned the cache — the repeat goes
+    // back to the wire and fails again.
+    resolver
+        .resolve("fail.example.org.", "A")
+        .await
+        .expect_err("a repeated lookup during upstream failure must fail again");
+    assert!(
+        mock.query_count() > after_first,
+        "the failed lookup was cached; every attempt must re-query"
+    );
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn route_dispatch_uses_zone_specific_upstream() {
     // Default mock answers everything with 1.1.1.1.
     let default_mock =
