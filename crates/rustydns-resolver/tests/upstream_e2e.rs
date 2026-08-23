@@ -208,6 +208,71 @@ async fn happy_path_a_query_returns_record() {
 }
 
 #[tokio::test]
+async fn randomised_selection_rotates_across_two_live_upstreams() {
+    // privacy.randomize_upstream_selection = true must map to hickory's
+    // RoundRobin server-ordering strategy (build_resolver_opts), so the
+    // pool has no static single-upstream preference: across N cache-busting
+    // lookups BOTH configured upstreams carry traffic. hickory races pool
+    // members and keeps the first success, so which mock's ANSWER arrives
+    // first is timing — what our knob owns is that every member is asked
+    // (no starvation/bias in who serves) and nothing outside the set can
+    // ever answer. A third, unreachable resolver proves an unhealthy member
+    // neither wedges resolution nor contributes answers.
+    let a =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 1), 300)]).await;
+    let b =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 2), 300)]).await;
+    let dead =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 9), 300)]).await;
+    let dead_port = {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("grab port");
+        let p = s.local_addr().expect("port").port();
+        drop(s);
+        p
+    };
+    let dead_addr = format!("127.0.0.1:{dead_port}");
+    drop(dead); // its responder task is gone — the URL is now unreachable
+
+    let mut cfg = plain_config(&a.addr_string());
+    cfg.upstream.resolvers = vec![a.addr_string(), b.addr_string(), dead_addr];
+    cfg.privacy.randomize_upstream_selection = true;
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    for i in 0..10 {
+        let name = format!("rot{i}.example.org.");
+        let out = resolver.resolve(&name, "A").await.expect("resolve");
+        for rec in &out.records {
+            if let RecordData::A(ip) = &rec.data {
+                seen.insert(ip.to_string());
+            }
+        }
+    }
+
+    assert!(
+        seen.contains("203.0.113.1") && seen.contains("203.0.113.2"),
+        "selection must rotate across both live upstreams, got {seen:?}"
+    );
+    assert_eq!(
+        seen.len(),
+        2,
+        "only configured LIVE upstreams may answer: {seen:?}"
+    );
+    assert!(
+        a.query_count() > 0,
+        "upstream A never selected — static single-upstream bias"
+    );
+    assert!(
+        b.query_count() > 0,
+        "upstream B never selected — static single-upstream bias"
+    );
+
+    a.shutdown();
+    b.shutdown();
+}
+
+#[tokio::test]
 async fn plain_upstream_randomises_query_name_case_0x20() {
     // DNS 0x20: over PLAIN UDP (no channel integrity) the resolver randomises
     // the QNAME case and requires the response to echo it back, so an off-path
