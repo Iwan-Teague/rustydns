@@ -879,6 +879,66 @@ async fn cross_zone_cname_is_served_as_a_chain_and_never_cached_as_authoritative
 }
 
 #[tokio::test]
+async fn answer_sanity_only_the_requested_type_surfaces() {
+    // Injected-record sanity: an A-query reply stuffed with same-name junk
+    // (a TXT record riding alongside the legit A) and other-name extras must
+    // surface ONLY the requested type for the queried name. Same-name
+    // multi-A RRsets are legal DNS and stay served; what must never surface
+    // is wrong-type filler or other-name bait.
+    use hickory_proto::rr::rdata::{CNAME, TXT};
+
+    let victim = Name::from_ascii("victim.example.org.").unwrap();
+    let evil = Name::from_ascii("evil.example.net.").unwrap();
+    let mock = MockUpstream::new(move |name, _| {
+        if name == &victim {
+            vec![
+                a_record(&victim, Ipv4Addr::new(203, 0, 113, 10), 300),
+                Record::from_rdata(
+                    victim.clone(),
+                    300,
+                    RData::TXT(TXT::new(vec!["junk".to_string()])),
+                ),
+                Record::from_rdata(victim.clone(), 300, RData::CNAME(CNAME(evil.clone()))),
+                a_record(&evil, Ipv4Addr::new(6, 6, 6, 6), 300),
+            ]
+        } else {
+            vec![a_record(name, Ipv4Addr::new(203, 0, 113, 11), 300)]
+        }
+    })
+    .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let out = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect("the legitimate A record must survive the sanity filter");
+    // The type filter keeps CNAME chain links (that is how the answer
+    // explains itself) and requested-type records — so the linked target's A
+    // legitimately rides the chain. What must NOT surface is the foreign-TYPE
+    // filler.
+    assert!(
+        out.records
+            .iter()
+            .all(|r| !matches!(r.data, RecordData::Txt(_))),
+        "wrong-type filler surfaced: {:?}",
+        out.records
+    );
+    assert!(
+        out.records
+            .iter()
+            .any(|r| matches!(&r.data, RecordData::A(ip) if *ip == Ipv4Addr::new(203, 0, 113, 10))),
+        "the legitimate A record must survive"
+    );
+    assert_eq!(
+        out.private_rdata_dropped, 1,
+        "the TXT filler must be counted as dropped"
+    );
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn fail_closed_when_no_upstream_responds() {
     // Bind a UDP socket to capture a port, then DROP the socket so the
     // port is free. The chance of another process binding the same
