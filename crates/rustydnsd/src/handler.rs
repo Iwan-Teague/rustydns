@@ -2646,6 +2646,24 @@ mod tests {
             Some(1232),
             "sub-cap advertisements must be honoured as-is"
         );
+
+        // Leg 3: exactly-at-cap is the strict-inequality boundary — an
+        // advertisement of precisely MAX_EDNS_PAYLOAD passes through
+        // untouched (no clamping, no alteration).
+        client
+            .send_to(&send_with(4096), format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("reply within timeout")
+            .expect("udp recv");
+        let resp = Message::from_bytes(&buf[..n]).expect("decode reply");
+        assert_eq!(
+            resp.edns.as_ref().map(|e| e.max_payload()),
+            Some(4096),
+            "exactly-at-cap advertisements must pass through unclamped"
+        );
     }
 
     #[tokio::test]
