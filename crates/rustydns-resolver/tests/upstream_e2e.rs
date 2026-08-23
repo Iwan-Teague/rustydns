@@ -2025,6 +2025,46 @@ async fn zero_ttl_records_are_held_for_the_cache_floor() {
 }
 
 #[tokio::test]
+async fn ttl_equal_to_floor_is_honoured_not_extended() {
+    // Boundary: an entry whose TTL EQUALS the floor already satisfies it —
+    // the floor clamps only strictly-below entries, so a TTL=2 record must
+    // behave exactly like its own TTL (held across an immediate repeat,
+    // neither extended nor rejected). Complements the zero-TTL (clamped UP)
+    // and huge-TTL (clamped DOWN) pins.
+    let mock = MockUpstream::new(|name, _| {
+        vec![a_record(
+            name,
+            Ipv4Addr::new(9, 9, 9, 9),
+            rustydns_resolver::MIN_POSITIVE_CACHE_TTL_SECS as u32,
+        )]
+    })
+    .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    let out = resolver
+        .resolve("atfloor.example.com.", "A")
+        .await
+        .expect("first resolve");
+    assert_eq!(out.records.len(), 1);
+    assert_eq!(mock.query_count(), 1, "miss must hit the wire once");
+
+    let out = resolver
+        .resolve("atfloor.example.com.", "A")
+        .await
+        .expect("immediate repeat");
+    assert_eq!(out.records.len(), 1);
+    assert_eq!(
+        mock.query_count(),
+        1,
+        "an at-floor record is cached for its own TTL and served on the repeat"
+    );
+
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn huge_ttl_records_are_clamped_to_the_cache_ceiling() {
     // Mirror of the cache floor: an absurd TTL must not wedge the entry in
     // the cache forever. hickory clamps entries above positive_max_ttl down
