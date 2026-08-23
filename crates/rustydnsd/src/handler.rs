@@ -321,7 +321,25 @@ impl DnsHandler {
         // EDNS opt-record lives on `MessageRequest::edns` directly.
         // The builder's `.edns()` now takes `&Edns` (borrowed,
         // tied to the request's lifetime).
-        if let Some(edns) = request.edns.as_ref() {
+        // Clamp oversized client buffer-size advertisements: echoing a
+        // 64 KiB advertisement verbatim advertises our willingness to
+        // emit/accept oversized datagrams — needless amplification and
+        // fragmentation surface. The advertised value never needs to be
+        // larger than what we will actually put on the wire. Hoisted so the
+        // borrow outlives the builder's use below.
+        const MAX_EDNS_PAYLOAD: u16 = 4096;
+        let clamped_edns = request
+            .edns
+            .as_ref()
+            .filter(|e| e.max_payload() > MAX_EDNS_PAYLOAD)
+            .map(|e| {
+                let mut c = e.clone();
+                c.set_max_payload(MAX_EDNS_PAYLOAD);
+                c
+            });
+        if let Some(clamped) = clamped_edns.as_ref() {
+            builder.edns(clamped);
+        } else if let Some(edns) = request.edns.as_ref() {
             builder.edns(edns);
         }
 
@@ -2521,6 +2539,74 @@ mod tests {
         assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
         assert!(resp.answers.is_empty(), "ANY must never carry answers");
         assert!(!resp.metadata.authoritative);
+    }
+
+    #[tokio::test]
+    async fn oversized_edns_payload_advertisement_is_clamped() {
+        // A client advertising a huge EDNS buffer must not pull an
+        // equally-huge advertised ceiling back out of us: responses clamp the
+        // advertisement to 4096, while sub-cap advertisements pass through
+        // untouched (EDNS semantics preserved for normal clients).
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+        let send_with = |payload_max: u16| {
+            let mut msg = Message::new(0x7777, MessageType::Query, OpCode::Query);
+            msg.metadata.recursion_desired = true;
+            msg.add_query({
+                let mut q = Query::new();
+                q.set_name(ProtoName::from_ascii("router.mesh.").expect("name"));
+                q.set_query_type(ProtoRecordType::A);
+                q
+            });
+            let mut edns = hickory_proto::op::Edns::new();
+            edns.set_max_payload(payload_max);
+            msg.edns = Some(edns);
+            msg.to_bytes().expect("encode")
+        };
+
+        // Leg 1: oversized advertisement comes back clamped to 4096.
+        client
+            .send_to(&send_with(8192), format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+        let mut buf = [0u8; 4096];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("reply within timeout")
+            .expect("udp recv");
+        let resp = Message::from_bytes(&buf[..n]).expect("decode reply");
+        let advertised = resp
+            .edns
+            .as_ref()
+            .map(|e| e.max_payload())
+            .expect("reply must carry EDNS when queried with EDNS");
+        assert!(
+            advertised <= 4096,
+            "oversized EDNS advertisement was echoed verbatim: {advertised}"
+        );
+
+        // Leg 2: a modest advertisement passes through unchanged.
+        client
+            .send_to(&send_with(1232), format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("reply within timeout")
+            .expect("udp recv");
+        let resp = Message::from_bytes(&buf[..n]).expect("decode reply");
+        assert_eq!(
+            resp.edns.as_ref().map(|e| e.max_payload()),
+            Some(1232),
+            "sub-cap advertisements must be honoured as-is"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
