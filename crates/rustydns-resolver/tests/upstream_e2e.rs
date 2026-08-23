@@ -460,6 +460,61 @@ async fn plain_upstream_randomises_query_name_case_0x20() {
 }
 
 #[tokio::test]
+async fn plain_upstream_0x20_case_pattern_varies_across_queries() {
+    // Variation half of DNS 0x20: not only must the outgoing QNAME be
+    // mixed-case, the case PATTERN must differ between queries — a resolver
+    // that applied one deterministic mixed-case spelling to every lookup
+    // would pass the single-query pin above while still handing an off-path
+    // spoofer a constant target. The knob itself is hickory-owned
+    // (ResolverOpts.case_randomization, wired for Plain only by
+    // build_resolver_opts); what we pin here is the observable: repeated
+    // queries for the SAME name arrive with DIFFERENT exact-case spellings,
+    // every one of them carrying uppercase bits.
+    let seen_labels: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen_labels.clone();
+    let mock = MockUpstream::new(move |name, _| {
+        if let Some(first) = name.iter().next() {
+            recorder.lock().unwrap().push(first.to_vec());
+        }
+        vec![a_record(name, Ipv4Addr::new(1, 2, 3, 4), 300)]
+    })
+    .await;
+
+    let cfg = plain_config(&mock.addr_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    // Distinct domains (cache-busting) that SHARE the long first label, so
+    // every recorded spelling is comparable against the others.
+    for i in 0..8 {
+        let name = format!("case-vary-long-label.example{i}.org.");
+        let out = resolver.resolve(&name, "A").await.expect("resolve");
+        assert_eq!(out.records.len(), 1);
+    }
+
+    let labels = seen_labels.lock().unwrap().clone();
+    assert!(
+        labels.len() >= 4,
+        "expected several wire queries (cache may absorb some): {}",
+        labels.len()
+    );
+    let spellings: std::collections::HashSet<String> = labels
+        .iter()
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .collect();
+    assert!(
+        spellings.len() > 1,
+        "case pattern was identical across queries — randomisation degenerate: {spellings:?}"
+    );
+    for l in &labels {
+        assert!(
+            l.iter().any(u8::is_ascii_uppercase),
+            "every query must still carry mixed-case bits: {l:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn plain_upstream_rejects_case_mismatched_response_0x20() {
     use hickory_proto::op::Query;
 
