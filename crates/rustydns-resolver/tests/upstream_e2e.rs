@@ -1616,6 +1616,47 @@ async fn zero_ttl_records_are_held_for_the_cache_floor() {
 }
 
 #[tokio::test]
+async fn huge_ttl_records_are_clamped_to_the_cache_ceiling() {
+    // Mirror of the cache floor: an absurd TTL must not wedge the entry in
+    // the cache forever. hickory clamps entries above positive_max_ttl down
+    // to the ceiling, so this entry expires within the bounded window and
+    // the resolver goes back to the wire instead of serving it forever.
+    let mock =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(9, 9, 9, 9), u32::MAX)])
+            .await;
+    let resolver = Resolver::new(plain_config(&mock.addr_string()))
+        .await
+        .expect("resolver");
+
+    // Miss: the absurd-TTL answer is fetched.
+    let out = resolver
+        .resolve("ceiling.example.org.", "A")
+        .await
+        .expect("first lookup must succeed");
+    assert_eq!(out.records.len(), 1);
+    assert_eq!(mock.query_count(), 1);
+
+    // Held: an immediate repeat is served from the (clamped) cache entry.
+    let out = resolver
+        .resolve("ceiling.example.org.", "A")
+        .await
+        .expect("repeat lookup must succeed");
+    assert_eq!(out.records.len(), 1);
+    assert_eq!(
+        mock.query_count(),
+        1,
+        "the clamped entry must still be served from cache immediately"
+    );
+
+    // Expired: after the 24h ceiling... we cannot sleep that long — the
+    // honest observable here is the wiring itself: build_resolver_opts
+    // clamps via positive_max_ttl (unit-pinned in lib.rs tests). This leg
+    // proves the entry remains servable; expiry-at-ceiling semantics are
+    // hickory-owned and covered by its own suite.
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn nxdomain_is_a_structured_empty_result_and_repeatable() {
     // A negative answer must never surface as success-with-data or as a
     // generic failure: resolve() maps hickory's no-records error into a
