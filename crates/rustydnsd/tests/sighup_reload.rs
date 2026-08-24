@@ -664,15 +664,29 @@ fn doq_config_body(dns: u16, metrics: u16, doh: u16, doq: u16, cert: &Path, key:
     )
 }
 
-/// True if the DoQ listener on `port` answers a `probe.mesh` query. Drives a
-/// real quinn QUIC client with the `doq` ALPN and the RFC 9250 framing
-/// (2-byte length prefix, DNS message id 0, one query per bidirectional stream).
-fn doq_responds(port: u16) -> bool {
+/// Quinn client endpoint with an accept-any verifier and the given ALPN list.
+fn quinn_client_endpoint(alpn_protocols: Vec<Vec<u8>>) -> Option<quinn::Endpoint> {
     use std::sync::Arc;
 
     let _ = tokio_rustls::rustls::crypto::CryptoProvider::install_default(
         tokio_rustls::rustls::crypto::ring::default_provider(),
     );
+    let mut crypto = tokio_rustls::rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_no_client_auth();
+    crypto.alpn_protocols = alpn_protocols;
+    let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).ok()?;
+    let mut endpoint =
+        quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into()).ok()?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(qcc)));
+    Some(endpoint)
+}
+
+/// True if the DoQ listener on `port` answers a `probe.mesh` query. Drives a
+/// real quinn QUIC client with the `doq` ALPN and the RFC 9250 framing
+/// (2-byte length prefix, DNS message id 0, one query per bidirectional stream).
+fn doq_responds(port: u16) -> bool {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -680,19 +694,9 @@ fn doq_responds(port: u16) -> bool {
         return false;
     };
     rt.block_on(async move {
-        let mut crypto = tokio_rustls::rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-            .with_no_client_auth();
-        crypto.alpn_protocols = vec![b"doq".to_vec()];
-        let Ok(qcc) = quinn::crypto::rustls::QuicClientConfig::try_from(crypto) else {
+        let Some(mut endpoint) = quinn_client_endpoint(vec![b"doq".to_vec()]) else {
             return false;
         };
-        let Ok(mut endpoint) = quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into())
-        else {
-            return false;
-        };
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(qcc)));
 
         let Ok(connecting) =
             endpoint.connect((std::net::Ipv4Addr::LOCALHOST, port).into(), DOT_SNI)
@@ -738,6 +742,38 @@ fn doq_responds(port: u16) -> bool {
     })
 }
 
+/// True iff a QUIC client offering a FOREIGN ALPN (`h3`) correctly FAILS to
+/// handshake with the DoQ listener on `port` (alert or timeout — either way
+/// no connection is ever established). Returns false if the handshake
+/// unexpectedly SUCCEEDS, which is exactly the cross-protocol confusion the
+/// listener must not allow.
+fn doq_rejects_foreign_alpn(port: u16) -> bool {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    rt.block_on(async move {
+        let Some(mut endpoint) = quinn_client_endpoint(vec![b"h3".to_vec()]) else {
+            return false;
+        };
+        let Ok(connecting) =
+            endpoint.connect((std::net::Ipv4Addr::LOCALHOST, port).into(), DOT_SNI)
+        else {
+            return false;
+        };
+        // Rejection is the requirement: rustls answers a non-matching offer
+        // with the no_application_protocol alert; quinn surfaces it as a
+        // connect error. A silent drop (timeout) equally means "no
+        // connection", which satisfies the contract.
+        matches!(
+            tokio::time::timeout(Duration::from_millis(2500), connecting).await,
+            Err(_) | Ok(Err(_))
+        )
+    })
+}
+
 #[test]
 fn daemon_serves_doq_queries() {
     let dir = tempfile::tempdir().unwrap();
@@ -762,6 +798,50 @@ fn daemon_serves_doq_queries() {
             (spawn_daemon(&config, &log), (dns, metrics, doh, doq))
         },
         |&(_dns, _metrics, _doh, doq)| doq_responds(doq),
+    );
+    drop(guard);
+}
+
+#[test]
+fn doq_listener_rejects_foreign_alpn_clients() {
+    // Cross-protocol confusion pin (ALPACA-class). RFC 9250 §4.3 requires
+    // DoQ's QUIC transport to negotiate the "doq" ALPN; our DoT config
+    // deliberately advertises none. Both listeners share ONE certificate,
+    // so the ALPN offer is what keeps a client of one protocol from
+    // completing a handshake meant for another. A client offering a foreign
+    // protocol name ("h3") must fail the handshake on the DoQ port — it can
+    // never establish a session that could be mistaken for another service
+    // on this certificate.
+    //
+    // Control leg: the correct-ALPN exchange works, proving the listener is
+    // up and the rejection below is caused by the ALPN mismatch alone.
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let log = dir.path().join("daemon.log");
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, DOT_CERT_A).unwrap();
+    std::fs::write(&key, DOT_KEY_A).unwrap();
+
+    let (guard, _ports) = spawn_with_retry(
+        || {
+            let (dns, metrics, doh, doq) = (free_port(), free_port(), free_port(), free_port());
+            std::fs::write(
+                &config,
+                doq_config_body(dns, metrics, doh, doq, &cert, &key),
+            )
+            .unwrap();
+            set_mode_600(&config);
+            (spawn_daemon(&config, &log), (dns, metrics, doh, doq))
+        },
+        |&(_dns, _metrics, _doh, doq)| doq_responds(doq),
+    );
+    let doq = _ports.3;
+
+    assert!(doq_responds(doq), "control: doq-ALPN client must work");
+    assert!(
+        doq_rejects_foreign_alpn(doq),
+        "a foreign-ALPN client must never complete a handshake against the DoQ listener"
     );
     drop(guard);
 }
