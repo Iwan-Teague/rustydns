@@ -115,7 +115,12 @@ impl BlocklistState {
         // Regex rules last (the exact/wildcard sets are O(1) and far more
         // common; the allowlist above already short-circuited an allowed name,
         // so the allowlist still wins over a regex match).
-        self.regex_rules.is_match(domain)
+        //
+        // Production qnames carry their trailing dot (canonical_qname keeps
+        // it); strip exactly one so $-anchored operator patterns behave as
+        // written instead of silently never matching.
+        let domain_no_dot = domain.strip_suffix('.').unwrap_or(domain);
+        self.regex_rules.is_match(domain_no_dot)
     }
 }
 
@@ -583,6 +588,25 @@ mod tests {
         assert!(e.is_blocked("ads3.example.com"));
         assert!(e.is_blocked("ad.example.net"));
         assert!(!e.is_blocked("safe.example.com"));
+    }
+
+    #[test]
+    fn regex_anchored_rule_matches_trailing_dot_production_qname() {
+        // Production feeds qnames WITH their trailing dot (canonical_qname
+        // keeps it). A $-anchored pattern must still match — before the
+        // engine stripped the dot, every end-anchored operator rule was a
+        // silent dead rule that unit tests missed by feeding dot-less names.
+        let cfg = BlocklistConfig {
+            regex_rules: vec![r"^ads\d*\.example\.com$".to_string()],
+            ..BlocklistConfig::default()
+        };
+        let e = BlocklistEngine::new(cfg);
+        assert!(
+            e.is_blocked("ads.example.com."),
+            "trailing-dot qname must match"
+        );
+        assert!(e.is_blocked("ads2.example.com."));
+        assert!(!e.is_blocked("safe.example.com."));
     }
 
     #[test]
