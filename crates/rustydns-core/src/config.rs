@@ -1852,17 +1852,11 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         )));
     }
 
-    // authority.poll_interval_secs must be non-zero: it feeds
-    // tokio::time::interval in the mesh-reload loop, which PANICS on a zero
-    // period — under the release profile's panic=abort that aborts the whole
-    // daemon at startup. Same class as the upstream timeout_ms == 0 ban.
-    if cfg.authority.poll_interval_secs == 0 {
-        return Err(crate::RustyDnsError::Config(
-            "authority.poll_interval_secs = 0 is invalid — the mesh bundle poll period must \
-             be at least 1 second"
-                .to_string(),
-        ));
-    }
+    // authority.poll_interval_secs == 0 is VALID and means "no periodic
+    // polling" — the mesh reload loop is simply not spawned and SIGHUP
+    // remains the reload path (documented in rustydns.example.toml). The
+    // daemon must never construct tokio::time::interval with a zero period,
+    // which is why main.rs gates the loop spawn on this value instead.
 
     // Listener roles must not share an address. build_dns_server binds each
     // role as its own SO_REUSEPORT socket, so an overlap (e.g. the same
@@ -2605,13 +2599,21 @@ mod tests {
     }
 
     #[test]
-    fn authority_poll_interval_zero_rejected() {
-        // poll_interval_secs feeds tokio::time::interval, which panics on a
-        // zero period — under release panic=abort that aborts the whole
-        // daemon at startup. Same class as the upstream timeout_ms == 0 ban.
+    fn authority_poll_interval_zero_is_valid_sighup_only_mode() {
+        // poll_interval_secs = 0 is the documented SIGHUP-only mode (see
+        // rustydns.example.toml): the mesh reload loop is not spawned, so
+        // the zero-period tokio interval panic is unreachable. Validation
+        // must ACCEPT it; the gating lives in main.rs.
         let mut cfg = baseline();
         cfg.authority.poll_interval_secs = 0;
-        assert_config_err(validate_config(&cfg), "poll_interval_secs = 0");
+        validate_config(&cfg).expect("0 is the documented polling-disabled value");
+    }
+
+    #[test]
+    fn authority_poll_interval_nonzero_accepted() {
+        let mut cfg = baseline();
+        cfg.authority.poll_interval_secs = 30;
+        validate_config(&cfg).expect("non-zero poll interval must pass");
     }
 
     #[test]
