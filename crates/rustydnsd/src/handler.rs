@@ -1074,6 +1074,7 @@ mod tests {
     use std::time::Duration;
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::DNSClass as TestDNSClass;
     use hickory_proto::rr::{Name as ProtoName, RecordType as ProtoRecordType};
     use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
     use hickory_server::Server;
@@ -2994,13 +2995,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn udp_axfr_against_authoritative_zone_leaks_nothing() {
-        // Classic recon probe: AXFR (qtype 252) against a name inside our
-        // AUTHORITY zone. We are not a master server — RFC 5936 transfers
-        // are never served, so an attacker mapping the mesh/static zone
-        // gets nothing. Pinned observable: the response carries ZERO answer
-        // records (NODATA-shaped; NOTIMP/REFUSED would equally satisfy the
-        // no-leak property), regardless of the queried name being
-        // authoritative. Liveness leg keeps the daemon honest afterwards.
+        // Classic recon probes: AXFR (252) and IXFR (251) against a name
+        // inside our AUTHORITY zone. We are not a master server — RFC 5936
+        // transfers are never served, so an attacker mapping the mesh/static
+        // zone gets nothing. Pinned observable: the response carries ZERO
+        // answer records (NODATA-shaped; NOTIMP/REFUSED would equally
+        // satisfy the no-leak property), regardless of the queried name
+        // being authoritative. Liveness leg keeps the daemon honest
+        // afterwards.
         let harness = build_harness(
             vec![static_a("router.mesh", "100.64.0.5")],
             "",
@@ -3010,12 +3012,68 @@ mod tests {
         .await;
         let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
 
-        let mut msg = Message::new(0x4242, MessageType::Query, OpCode::Query);
-        msg.metadata.recursion_desired = true;
+        for qtype in [ProtoRecordType::AXFR, ProtoRecordType::IXFR] {
+            let mut msg = Message::new(0x4242, MessageType::Query, OpCode::Query);
+            msg.metadata.recursion_desired = true;
+            msg.add_query({
+                let mut q = Query::new();
+                q.set_name(ProtoName::from_ascii("router.mesh.").unwrap());
+                q.set_query_type(qtype);
+                q
+            });
+            let wire = msg.to_bytes().expect("encode");
+            client
+                .send_to(&wire, format!("127.0.0.1:{}", harness.port))
+                .await
+                .expect("send");
+
+            let mut buf = [0u8; 512];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+                .await
+                .expect("response within budget")
+                .expect("recv");
+            let reply = Message::from_bytes(&buf[..n]).expect("decode");
+            assert!(
+                matches!(
+                    reply.metadata.response_code,
+                    ResponseCode::NoError | ResponseCode::NotImp | ResponseCode::Refused
+                ),
+                "unexpected rcode for {qtype} probe: {:?}",
+                reply.metadata.response_code
+            );
+            assert!(
+                reply.answers.is_empty() && reply.authorities.is_empty(),
+                "a {qtype} probe must never return zone data: {:?}",
+                reply.answers
+            );
+        }
+
+        // Liveness: normal service continues afterwards.
+        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_chaos_version_bind_probe_leaks_nothing() {
+        // The other classic recon probe: `version.bind CHAOS TXT`. Only the
+        // IN class is served (gate_class → NOTIMP), so the daemon must
+        // neither disclose its software/version nor answer with any TXT
+        // payload. Pinned: NOTIMP, zero answers, then liveness.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+        let mut msg = Message::new(0x4243, MessageType::Query, OpCode::Query);
         msg.add_query({
             let mut q = Query::new();
-            q.set_name(ProtoName::from_ascii("router.mesh.").unwrap());
-            q.set_query_type(ProtoRecordType::AXFR);
+            q.set_name(ProtoName::from_ascii("version.bind.").unwrap());
+            q.set_query_type(ProtoRecordType::TXT);
+            q.set_query_class(TestDNSClass::CH);
             q
         });
         let wire = msg.to_bytes().expect("encode");
@@ -3030,23 +3088,16 @@ mod tests {
             .expect("response within budget")
             .expect("recv");
         let reply = Message::from_bytes(&buf[..n]).expect("decode");
-        assert!(
-            matches!(
-                reply.metadata.response_code,
-                ResponseCode::NoError | ResponseCode::NotImp | ResponseCode::Refused
-            ),
-            "unexpected rcode for AXFR probe: {:?}",
-            reply.metadata.response_code
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NotImp,
+            "CHAOS-class probes must be NOTIMP"
         );
         assert!(
-            reply.answers.is_empty() && reply.authorities.is_empty(),
-            "an AXFR probe must never return zone data: {:?}",
+            reply.answers.is_empty(),
+            "a CHAOS probe must never return version text: {:?}",
             reply.answers
         );
-
-        // Liveness: normal service continues afterwards.
-        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
-        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
     }
 
     #[tokio::test(flavor = "current_thread")]
