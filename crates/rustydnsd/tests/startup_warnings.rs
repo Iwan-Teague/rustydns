@@ -47,6 +47,11 @@ upstream_padding = true
 /// Run `rustydnsd --validate-config` against the given TOML body and return
 /// everything it logged (stdout + stderr).
 fn validate_config_logs(config_content: &str) -> String {
+    validate_config_full(config_content).0
+}
+
+/// Same, but also returns the process exit status.
+fn validate_config_full(config_content: &str) -> (String, Option<i32>) {
     let cargo_bin = env!("CARGO_BIN_EXE_rustydnsd");
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -64,7 +69,7 @@ fn validate_config_logs(config_content: &str) -> String {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    format!("{}\n{}", stdout, stderr)
+    (format!("{}\n{}", stdout, stderr), output.status.code())
 }
 
 #[test]
@@ -113,4 +118,42 @@ query_log_disk_path = "/tmp/rustydns-test-queries.ndjson"
         all_logs.contains("query_log_to_disk = true") && all_logs.contains("written to disk"),
         "disk-log opt-in must produce the durable-record startup warning. Output was:\n{all_logs}"
     );
+}
+
+#[test]
+fn invalid_config_fails_validation_with_nonzero_exit() {
+    // Operational contract: install/rustydns.service runs `--validate-config`
+    // as ExecStartPre so an invalid config can never crash-loop the daemon —
+    // that only works if validation FAILS LOUDLY: nonzero exit plus an error
+    // naming the offending field. Pins both halves on a hard-violation
+    // config (plain-HTTP blocklist source, an AGENTS.md-mandated rejection).
+    let (all_logs, code) = validate_config_full(
+        r#"
+[blocklist]
+sources = ["http://insecure.example/list"]
+"#,
+    );
+
+    assert_ne!(
+        code,
+        Some(0),
+        "an invalid config must exit NONZERO via --validate-config; logs:\n{all_logs}"
+    );
+    assert!(
+        all_logs.contains("insecure.example"),
+        "rejection must name the offending source. Output was:\n{all_logs}"
+    );
+}
+
+#[test]
+fn valid_config_succeeds_validation_with_zero_exit() {
+    // The positive half of the ExecStartPre contract: a clean config exits 0
+    // (the install script and CI treat any nonzero as "config broken").
+    let (_logs, code) = validate_config_full(
+        r#"
+[upstream]
+resolvers = ["https://dns.example/dns-query"]
+"#,
+    );
+    assert_eq!(code, Some(0), "a valid config must exit 0");
 }
