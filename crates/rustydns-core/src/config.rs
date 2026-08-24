@@ -1861,22 +1861,21 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         )));
     }
 
-    // The two declarations must agree. AuthorityConfig::mesh_zone documents
-    // itself as mirroring ServerConfig::mesh_zone; a divergence is virtually
-    // always a typo, and it is uniquely confusing because the STARTUP LOG
-    // prints the server value while the AUTHORITY value governs which names
-    // are answered — an operator would debug against the wrong zone. Fail
-    // loudly instead.
+    // The two declarations may INTENTIONALLY diverge (split-horizon: see the
+    // example config) — the AUTHORITY value always governs mesh answering,
+    // while the server value is informational. Surface the divergence loudly
+    // (it is virtually always a typo) without forbidding the deliberate case.
     if !cfg
         .server
         .mesh_zone
         .eq_ignore_ascii_case(&cfg.authority.mesh_zone)
     {
-        return Err(crate::RustyDnsError::Config(format!(
-            "server.mesh_zone `{}` and authority.mesh_zone `{}` disagree — the authority \
-             value governs mesh answering. Set both to the same zone.",
-            cfg.server.mesh_zone, cfg.authority.mesh_zone
-        )));
+        tracing::warn!(
+            server_mesh_zone = %cfg.server.mesh_zone,
+            authority_mesh_zone = %cfg.authority.mesh_zone,
+            "server.mesh_zone and authority.mesh_zone disagree — the AUTHORITY value \
+             governs mesh answering; the server value is informational only"
+        );
     }
 
     // authority.poll_interval_secs == 0 is VALID and means "no periodic
@@ -2681,22 +2680,20 @@ mod tests {
     }
 
     #[test]
-    fn diverged_mesh_zone_fields_rejected() {
-        // server.mesh_zone feeds the startup log; authority.mesh_zone
-        // governs which names are answered. A divergence is virtually always
-        // a typo and is uniquely confusing to debug (the operator sees the
-        // server value logged while the authority value rules). Both must
-        // agree, case-insensitively.
+    fn diverged_mesh_zone_fields_warn_but_are_allowed() {
+        // Split-horizon is a documented capability: the example config notes
+        // the two fields need not auto-sync. A divergence therefore must not
+        // be rejected — validation only requires each field individually
+        // well-formed (trailing dot); the runtime emits a warn naming both.
         let mut cfg = baseline();
         cfg.authority.mesh_zone = "lan.home.".to_string();
-        assert_config_err(validate_config(&cfg), "disagree");
+        validate_config(&cfg).expect("split-horizon divergence must be allowed");
 
         let mut cfg = baseline();
         cfg.server.mesh_zone = "corp.example.".to_string();
-        assert_config_err(validate_config(&cfg), "disagree");
+        validate_config(&cfg).expect("server-side split value must be allowed");
 
-        // Case-only differences are tolerated (names are lowercased for
-        // matching anyway).
+        // Case-only differences likewise pass.
         let mut cfg = baseline();
         cfg.server.mesh_zone = "MESH.".to_string();
         validate_config(&cfg).expect("case-only difference must pass");
