@@ -235,7 +235,7 @@ impl Writer {
                 self.io_error_streak += 1;
                 // Flood-safety: first failure warns loudly; sustained
                 // failure reminds every 1000th. The metric always counts.
-                if self.io_error_streak == 1 || self.io_error_streak % 1000 == 0 {
+                if self.io_error_streak == 1 || self.io_error_streak.is_multiple_of(1000) {
                     warn!(
                         streak = self.io_error_streak,
                         error = %e,
