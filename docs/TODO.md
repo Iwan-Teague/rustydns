@@ -378,6 +378,27 @@ blocklist groups shipped — `[[blocklist.groups]]` named sets + a
   (`plain_upstream_0x20_rejection_is_caused_by_case_mismatch_alone`), knob
   wiring (`case_randomization_enabled_only_for_plain_udp`), and per-query case
   variation (`plain_upstream_0x20_case_pattern_varies_across_queries`).
+- **Continuation rounds (post-ad32fb3) — shipped:** wire-bounds family
+  completed at the upstream seam (truncated label length + RDLENGTH overrun
+  probes alongside the pointer cycle/overlap traps); release-profile test
+  parity enforced in CI (`cargo test --workspace --release`, panic=abort +
+  overflow-checks-off); listener-role overlap validation generalized to ALL
+  TCP roles (DoH, metrics) and the UDP pair; DoH deadline derived from
+  upstream.timeout_ms instead of a fixed 5 s (removes an HTTP-vs-UDP race),
+  threaded through SIGHUP rebinds; RUST_LOG privacy clamp keyed on exact
+  crate targets rather than substrings; qname-log hashing properly keyed
+  (256-bit per-instance keys, not a prefix salt); credential redaction
+  extended (URL fragments, presign/OAuth param names, upstream-error log
+  arm); SIGHUP fetch-round minimum spacing (CDN hammering); authority field
+  changes flagged restart-required; CLI contract pinned.
+- **Corrected on the record:** 935536a's "anchored regex rules silently
+  dead" claim was FALSE — is_blocked strips the trailing dot at entry for
+  every matcher; the strip added there was redundant and has been removed,
+  while the regression test remains as a pin on that trim. See 66b3c29.
+- **Verified-clean this pass:** install.sh idempotency and modes; compose
+  YAML validity; doc-tests negligible (no coverage lost via --all-targets);
+  README quick-start commands coherent; sinkhole family-mismatch arms;
+  rate-limiter refusals refresh last_used (no GC bypass).
 - **Re-verified the upstream-blocked items (1.1/1.2/2.1) against hickory
   0.26.1:** query minimisation is still absent, and `DnsRequestOptions` still
   carries a literal `// TODO: add EDNS options here?` with no padding field and
