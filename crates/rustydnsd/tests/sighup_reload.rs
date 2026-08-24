@@ -677,8 +677,7 @@ fn quinn_client_endpoint(alpn_protocols: Vec<Vec<u8>>) -> Option<quinn::Endpoint
         .with_no_client_auth();
     crypto.alpn_protocols = alpn_protocols;
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).ok()?;
-    let mut endpoint =
-        quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into()).ok()?;
+    let mut endpoint = quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into()).ok()?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(qcc)));
     Some(endpoint)
 }
@@ -694,7 +693,7 @@ fn doq_responds(port: u16) -> bool {
         return false;
     };
     rt.block_on(async move {
-        let Some(mut endpoint) = quinn_client_endpoint(vec![b"doq".to_vec()]) else {
+        let Some(endpoint) = quinn_client_endpoint(vec![b"doq".to_vec()]) else {
             return false;
         };
 
@@ -755,7 +754,7 @@ fn doq_rejects_foreign_alpn(port: u16) -> bool {
         return false;
     };
     rt.block_on(async move {
-        let Some(mut endpoint) = quinn_client_endpoint(vec![b"h3".to_vec()]) else {
+        let Some(endpoint) = quinn_client_endpoint(vec![b"h3".to_vec()]) else {
             return false;
         };
         let Ok(connecting) =

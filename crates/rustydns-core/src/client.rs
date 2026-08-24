@@ -280,7 +280,10 @@ mod tests {
         // ::ffff:0:0/96 range maps back to v4).
         let real_v6 = ClientId::from_ip("2001:db8::ffff".parse().unwrap());
         assert!(
-            real_v6.anonymized().to_string().contains("2001:db8::/64/anon"),
+            real_v6
+                .anonymized()
+                .to_string()
+                .contains("2001:db8::/64/anon"),
             "non-mapped v6 must keep /64 handling"
         );
     }
