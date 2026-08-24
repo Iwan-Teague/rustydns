@@ -382,12 +382,24 @@ impl DnsHandler {
             };
             if measure(&answers, false, metadata).is_none_or(|n| n > cap) {
                 metadata.truncation = true;
+                let original = answers.len();
+                let mut shed = 0usize;
                 while !answers.is_empty()
                     && measure(&answers, true, metadata).is_none_or(|n| n > cap)
                 {
                     answers.pop();
-                    warn!("udp response exceeded its cap; truncated to fit (TC set)");
+                    shed += 1;
                 }
+                // ONE summary line: a per-record warn here turned any large
+                // (but legitimate) upstream answer into journal flooding,
+                // repeatable per query.
+                warn!(
+                    shed,
+                    kept = answers.len(),
+                    original,
+                    cap,
+                    "udp response exceeded its cap; truncated to fit (TC set)"
+                );
             }
         }
 
