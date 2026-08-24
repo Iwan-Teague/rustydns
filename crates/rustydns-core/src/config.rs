@@ -1368,18 +1368,22 @@ fn is_secret_param_key(key: &str) -> bool {
 
 /// Redact credential components from a URL string for safe display.
 ///
-/// Two rules, applied textually (no full URL parser — the inputs are
+/// Three rules, applied textually (no full URL parser — the inputs are
 /// operator-written strings that already passed validation):
 ///
 /// 1. **Userinfo**: anything between `scheme://` and the last `@` before the
-///    first `/` or `?` becomes `<redacted>` (`https://user:pass@host/p` →
-///    `https://<redacted>@host/p`). Using the *last* `@` keeps passwords
+///    first `/`, `?` or `#` becomes `<redacted>` (`https://user:pass@host/p`
+///    → `https://<redacted>@host/p`). Using the *last* `@` keeps passwords
 ///    containing literal `@` working; percent-encoded characters are never
 ///    decoded. A password containing a raw unencoded `/` is malformed input
 ///    and not handled.
 /// 2. **Query parameters** whose key is a common credential name (token,
 ///    apikey, key, secret, password, … — case-insensitive) get their value
 ///    replaced (`…/list?token=t0p` → `…/list?token=<redacted>`).
+/// 3. **Fragment**: everything after `#` is treated as another
+///    parameter-shaped section and scrubbed by rule 2 (`…/#token=t0p` →
+///    `…/#token=<redacted>`) — fragments never reach the server, but they
+///    WOULD still print in a dump or log line.
 ///
 /// Strings without a `scheme://` prefix (file paths, bare hosts) are returned
 /// untouched. Hosts, ports, paths and non-credential query parameters are
@@ -1391,11 +1395,13 @@ pub fn redact_url_credentials(url: &str) -> String {
         return url.to_string();
     };
     let after_scheme = &url[scheme_end + 3..];
-    let authority_end = after_scheme.find(['/', '?']).unwrap_or(after_scheme.len());
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..authority_end];
     let rest = &after_scheme[authority_end..];
 
-    let mut out = String::with_capacity(url.len() + "<redacted>".len());
+    let mut out = String::with_capacity(url.len() + "<redacted>".len() * 2);
     out.push_str(&url[..scheme_end + 3]);
     match authority.rfind('@') {
         Some(at) => {
@@ -1404,27 +1410,43 @@ pub fn redact_url_credentials(url: &str) -> String {
         }
         None => out.push_str(authority),
     }
-    out.push_str(rest);
 
-    // Redact credential-bearing query parameters, preserving order and all
-    // other pairs.
-    if let Some(q) = out.find('?') {
-        let head = out[..=q].to_string();
-        let redacted = out[q + 1..]
-            .split('&')
-            .map(|pair| {
-                let mut kv = pair.splitn(2, '=');
-                let key = kv.next().unwrap_or("");
-                match (key, kv.next()) {
-                    (_, Some(_)) if is_secret_param_key(key) => format!("{key}=<redacted>"),
-                    _ => pair.to_string(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        out = head + &redacted;
+    // Remainder = [path][?query][#fragment]. Scrub credential-named pairs in
+    // the query section and in the fragment section; preserve order and all
+    // other content.
+    let (path_and_query, fragment) = match rest.find('#') {
+        Some(h) => (&rest[..h], Some(&rest[h + 1..])),
+        None => (rest, None),
+    };
+    match path_and_query.find('?') {
+        Some(q) => {
+            out.push_str(&path_and_query[..=q]);
+            out.push_str(&scrub_param_pairs(&path_and_query[q + 1..]));
+        }
+        None => out.push_str(path_and_query),
+    }
+    if let Some(frag) = fragment {
+        out.push('#');
+        out.push_str(&scrub_param_pairs(frag));
     }
     out
+}
+
+/// Replace the values of credential-named `key=value` pairs (delimited by
+/// `&`) with `<redacted>`, preserving order and all other pairs.
+fn scrub_param_pairs(pairs: &str) -> String {
+    pairs
+        .split('&')
+        .map(|pair| {
+            let mut kv = pair.splitn(2, '=');
+            let key = kv.next().unwrap_or("");
+            match (key, kv.next()) {
+                (_, Some(_)) if is_secret_param_key(key) => format!("{key}=<redacted>"),
+                _ => pair.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 #[cfg(test)]
@@ -1528,6 +1550,26 @@ mod display_redaction_tests {
         assert_eq!(
             redact_url_credentials("https://alice:hunter2@dns.example/dns-query?token=t0p"),
             "https://<redacted>@dns.example/dns-query?token=<redacted>"
+        );
+    }
+
+    #[test]
+    fn fragment_tokens_are_redacted_too() {
+        // Fragments never reach the server but WOULD print in a dump/log —
+        // scrub credential-named pairs there exactly like query parameters.
+        assert_eq!(
+            redact_url_credentials("https://lists.example/list#token=abc"),
+            "https://lists.example/list#token=<redacted>"
+        );
+        // Query and fragment scrubbed independently in one pass.
+        assert_eq!(
+            redact_url_credentials("https://h/p?token=a&format=x#key=b&tab=y"),
+            "https://h/p?token=<redacted>&format=x#key=<redacted>&tab=y"
+        );
+        // Non-credential fragments survive untouched.
+        assert_eq!(
+            redact_url_credentials("https://h/p#section"),
+            "https://h/p#section"
         );
     }
 
