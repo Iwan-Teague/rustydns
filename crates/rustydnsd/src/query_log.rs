@@ -24,7 +24,9 @@
 //! the last N queries?" by hashing the candidate domain and grepping —
 //! the same workflow as `/etc/hosts` style debugging — without ever
 //! storing a recoverable plaintext list. The hash is keyed with a
-//! per-process random salt, so a leaked buffer cannot be cross-referenced
+//! per-instance randomly-keyed hash (OS-entropy keys seeding ahash's full
+//! 128-bit key slot), so a leaked buffer cannot be cross-referenced against
+//! candidate domains without brute-forcing the keys
 //! to another deployment.
 //!
 //! # Capacity
@@ -33,7 +35,7 @@
 //! (`VecDeque::pop_front`). All operations are O(1).
 
 use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,7 +79,7 @@ impl ServedBy {
 /// One entry in the query log ring buffer.
 ///
 /// Crucially, this struct does NOT carry the raw query name. The
-/// `qname_hash` field is a u64 hash keyed with a per-process salt;
+/// `qname_hash` field is a u64 hash keyed with per-instance random keys;
 /// reversing it to a domain is computationally infeasible.
 ///
 /// Some fields are read only by the (planned) inspection endpoint —
@@ -188,7 +190,10 @@ fn json_escape(s: &str) -> String {
 #[derive(Debug)]
 pub struct QueryLog {
     capacity: usize,
-    salt: u64,
+    /// Per-instance random key material for the qname hasher. Four words
+    /// seed ahash's 128-bit internal key; generated once from OS entropy so
+    /// hashes are stable within this process and unlinkable across restarts.
+    hash_keys: [u64; 4],
     inner: Mutex<VecDeque<QueryLogEntry>>,
     /// `Some` only when `privacy.query_log_to_disk = true` and the disk
     /// writer started successfully.
@@ -205,10 +210,10 @@ impl QueryLog {
     /// becomes a no-op, useful when an operator wants to disable the
     /// buffer entirely.
     pub fn new(capacity: usize) -> Self {
-        let salt: u64 = rand::random();
+        let hash_keys: [u64; 4] = rand::random();
         Self {
             capacity,
-            salt,
+            hash_keys,
             inner: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
             disk_tx: None,
             disk_dropped: None,
@@ -230,14 +235,17 @@ impl QueryLog {
         log
     }
 
-    /// Hash a (lowercased) qname using the per-process salt. Operators
-    /// who want to look up a domain in the buffer should call this with
-    /// the same lowercased FQDN form.
+    /// Hash a (lowercased) qname under this log's random per-instance keys.
+    /// Operators who want to look up a domain in the buffer should call this
+    /// with the same lowercased FQDN form.
+    ///
+    /// The keys come from OS entropy at construction and seed ahash's full
+    /// 128-bit key slot (never `AHasher::default()`, whose keys are fixed
+    /// zeroes): without them, dumped hashes cannot be evaluated against a
+    /// candidate-domain dictionary.
     pub fn hash_qname(&self, qname_lower: &str) -> u64 {
-        let mut hasher = ahash::AHasher::default();
-        self.salt.hash(&mut hasher);
-        qname_lower.hash(&mut hasher);
-        hasher.finish()
+        let keys = self.hash_keys;
+        ahash::RandomState::with_seeds(keys[0], keys[1], keys[2], keys[3]).hash_one(qname_lower)
     }
 
     /// Record a query. Fans out to the on-disk writer (if enabled) and
@@ -417,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_differs_across_logs_due_to_random_salt() {
+    fn hash_differs_across_logs_due_to_random_keys() {
         // The two logs were seeded from independent thread_rng draws; with
         // overwhelming probability they produce different hashes for the
         // same input.
@@ -425,7 +433,7 @@ mod tests {
         let log2 = QueryLog::new(4);
         let a = log1.hash_qname("example.com.");
         let b = log2.hash_qname("example.com.");
-        assert_ne!(a, b, "salts collided — improbable, regenerate to confirm");
+        assert_ne!(a, b, "keys collided — improbable, regenerate to confirm");
     }
 
     #[test]
