@@ -174,6 +174,21 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Security
 
+- **`--print-config` no longer prints URL credentials.** The `Secret`
+  wrapper existed but was wired to no config field, so the resolved-config
+  dump rendered upstream DoH URLs with embedded `user:pass@` userinfo and
+  token-gated blocklist source URLs (`?token=…`) in plaintext — straight
+  to stdout (terminals, CI logs, shell history). All URL-bearing fields
+  (upstream resolvers, ODoH proxies, conditional-forwarding routes,
+  blocklist sources, trusted RPZ sources) now pass through
+  `redact_url_credentials`: userinfo becomes `<redacted>@host`, credential
+  query values become `key=<redacted>`; hosts, ports, paths and other
+  parameters stay legible. Pinned by a new integration suite
+  (`tests/print_config.rs`) driving the real binary.
+- **Upstream URLs are credential-redacted in logs too**: the resolver's
+  bootstrap-failure path logged the full configured URL at `warn` level
+  (production journald); it and the debug-level "default upstream loaded"
+  line now emit redacted forms.
 - **Transitive RUSTSEC fixes re-verified against the advisory database
   (2026-08-24).** The lockfile-only bumps in 27a0493/3e47043 were checked
   against each advisory's published patched range on rustsec.org:

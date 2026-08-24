@@ -67,7 +67,9 @@ use hickory_resolver::net::NetError;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
 use rustydns_core::RustyDnsError;
-use rustydns_core::config::{DnsConfig, TlsVersion, UpstreamProtocol};
+use rustydns_core::config::{
+    DnsConfig, TlsVersion, UpstreamProtocol, redact_url_credentials,
+};
 use rustydns_core::record::{DnsRecord, RecordData};
 
 mod odoh;
@@ -325,7 +327,12 @@ impl Resolver {
             "resolver initialised"
         );
         for url in &config.upstream.resolvers {
-            tracing::debug!(upstream = %url, "default upstream loaded");
+            // PRIVACY: URLs may embed credentials (userinfo, token params).
+            // Even at debug level the host/path stay useful; secrets don't.
+            tracing::debug!(
+                upstream = %redact_url_credentials(url),
+                "default upstream loaded"
+            );
         }
         for r in &routes {
             tracing::debug!(
@@ -599,9 +606,11 @@ async fn build_resolver_arm(
                 configured_any = true;
             }
             Err(e) => {
+                // warn-level: this surfaces in production logs (journald), so
+                // the URL must be credential-redacted.
                 tracing::warn!(
                     arm = %label,
-                    upstream = %url,
+                    upstream = %redact_url_credentials(url),
                     error = %e,
                     "upstream bootstrap failed; skipping this resolver"
                 );
