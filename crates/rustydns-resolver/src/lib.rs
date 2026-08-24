@@ -1313,6 +1313,50 @@ mod tests {
     }
 
     #[test]
+    fn bailiwick_survives_case_variant_chain_and_drops_substring_outsiders() {
+        // Two classic cache-poisoning shapes in one hostile answer:
+        //
+        // 1. CASE GAMES across the chain: the CNAME target is written in
+        //    mixed case (WwW.Victim...) and the terminal A record's owner
+        //    arrives fully uppercase. The bailiwick set is canonicalised,
+        //    so chain membership must survive arbitrary per-hop casing.
+        // 2. MID-LABEL SUBSTRING outsider: EVILVICTIM.example.org contains
+        //    "victim.example.org" as a substring but shares NO label with
+        //    it — a naive contains()-based matcher would keep it. It must be
+        //    dropped exactly like a wholly unrelated name.
+        let mut records = vec![
+            DnsRecord::new(
+                "victim.example.org.",
+                RecordData::Cname("WwW.Victim.EXAMPLE.ORG.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "WWW.VICTIM.EXAMPLE.ORG.",
+                RecordData::A(Ipv4Addr::new(203, 0, 113, 9)),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "EVILVICTIM.EXAMPLE.ORG.",
+                RecordData::A(Ipv4Addr::new(6, 6, 6, 6)),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "unrelated.example.net.",
+                RecordData::A(Ipv4Addr::new(6, 6, 6, 7)),
+                Duration::from_secs(300),
+            ),
+        ];
+        let dropped = filter_out_of_bailiwick(&mut records, "victim.example.org.");
+        assert_eq!(dropped, 2, "both outsiders must be dropped: {records:?}");
+        assert!(
+            records
+                .iter()
+                .all(|r| r.name.to_ascii_lowercase().ends_with("victim.example.org.")),
+            "only chain members may survive: {records:?}"
+        );
+    }
+
+    #[test]
     fn zone_no_match_for_unrelated() {
         assert!(!zone_matches("example.com.", "lan."));
         assert!(!zone_matches("notlan.", "lan."));
