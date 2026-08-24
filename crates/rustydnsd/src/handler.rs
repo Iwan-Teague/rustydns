@@ -529,7 +529,11 @@ impl DnsHandler {
     fn gate_rate_limit(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
         if self.rate_limiter.load().check(ctx.src_ip) == LimitDecision::Refuse {
             self.metrics.inc_policy_rate_limited();
-            warn!(
+            // PRIVACY + flood-safety: refusals are counted by
+            // rustydns_policy_rate_limited_total; a per-query warn here would
+            // flood the journal at exactly the moment we are being flooded.
+            // Opt in via RUST_LOG for per-event detail.
+            debug!(
                 client = %ctx.client.anonymized(),
                 "policy denied: per-source-IP rate limit exceeded"
             );
@@ -596,7 +600,8 @@ impl DnsHandler {
     fn gate_schedule(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
         if ctx.policy.schedule_blocked {
             self.metrics.inc_policy_schedule_blocked();
-            warn!(
+            // Same flood-safety rationale as the rate-limit refusal above.
+            debug!(
                 client = %ctx.client.anonymized(),
                 "policy denied: client is within a scheduled block window"
             );
@@ -614,7 +619,13 @@ impl DnsHandler {
             && !name_in_any_zone(ctx.qname_canon, &ctx.policy.zones_allowed)
         {
             self.metrics.inc_policy_zone_denied();
-            warn!(client = %ctx.client.anonymized(), "policy denied: name outside zones_allowed");
+            // PRIVACY + flood-safety: counted by the REFUSED rcode series;
+            // per-query warns would flood the journal during sustained
+            // out-of-zone probing.
+            debug!(
+                client = %ctx.client.anonymized(),
+                "policy denied: name outside zones_allowed"
+            );
             Some(Reply::reject(ResponseCode::Refused))
         } else {
             None
