@@ -44,6 +44,11 @@ enum MockMode {
     RelayError,
     /// Return undecryptable garbage (→ fail closed, never surfaced).
     Garbage,
+    /// Return a correctly encrypted envelope whose decrypted DNS plaintext
+    /// carries a self-referential compression pointer as the answer owner
+    /// name — decompression can never terminate, so the arm must fail
+    /// closed in bounded work.
+    PointerLoopAnswer,
     /// Rotate the HPKE key on the FIRST request and reject the (now stale-key)
     /// query with HTTP 400 (RFC 9230's rotation signal), like a real target at
     /// key rotation; answer with this A on the retry after the client refetches
@@ -220,6 +225,31 @@ fn build_mock_response(mode: MockMode, query: &Message) -> Result<Vec<u8>, OdohE
         }
         MockMode::Nxdomain => resp.metadata.response_code = ResponseCode::NXDomain,
         MockMode::ServFail => resp.metadata.response_code = ResponseCode::ServFail,
+        MockMode::PointerLoopAnswer => {
+            // Handcrafted plaintext wire: header + question + one answer
+            // whose owner NAME is a compression pointer pointing at
+            // ITSELF. hickory's decoder forbids non-prior pointers on the
+            // first hop (`PointerNotPriorToLabel`), so this can never
+            // decompress — exactly the hostile-upstream shape the arm
+            // must reject in bounded work.
+            const QNAME: &[u8] = b"\x07example\x03com\x00";
+            let mut raw: Vec<u8> = Vec::new();
+            raw.extend_from_slice(&query.metadata.id.to_be_bytes());
+            raw.extend_from_slice(&[0x81, 0x80]); // QR=1, RA=1
+            raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QD=1 AN=1
+            raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            raw.extend_from_slice(QNAME);
+            raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+            let self_offset = (12 + QNAME.len() + 4) as u16;
+            raw.extend_from_slice(&[
+                0xC0 | (self_offset >> 8) as u8,
+                self_offset as u8,
+            ]);
+            raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+            raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
+            raw.extend_from_slice(&[0x00, 0x04, 203, 0, 113, 7]);
+            return Ok(raw);
+        }
         MockMode::RelayError | MockMode::Garbage | MockMode::AlwaysReject(_) => {
             unreachable!("handled before crypto")
         }
@@ -424,6 +454,28 @@ async fn odoh_garbage_response_is_an_error() {
         matches!(err.kind_label(), "response_parse" | "decrypt"),
         "unexpected error kind: {}",
         err.kind_label()
+    );
+}
+
+#[tokio::test]
+async fn odoh_compression_pointer_loop_fails_closed_in_bounded_work() {
+    // Name-decompression safety: a hostile target answers with a correctly
+    // encrypted envelope whose plaintext DNS message contains a
+    // self-referential compression pointer as the answer owner name
+    // (offset N pointing back to N). Decompression of such a name can
+    // never terminate; hickory's strictly-prior pointer rule rejects it on
+    // the first hop. The arm must surface that as a parse failure — never
+    // serve, never hang, never allocate unboundedly — and do so promptly.
+    let arm = arm_with_mock(MockMode::PointerLoopAnswer);
+    let started = std::time::Instant::now();
+    let err = arm
+        .resolve("example.com.", RecordType::A, false)
+        .await
+        .expect_err("a decompression loop must fail closed");
+    assert_eq!(err.kind_label(), "dns_parse", "the plaintext must fail DNS parsing, not transport or crypto");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "pointer-loop rejection exceeded the bounded-work budget"
     );
 }
 
