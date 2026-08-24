@@ -1826,6 +1826,36 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         )));
     }
 
+    // Listener roles must not share an address. build_dns_server binds each
+    // role as its own SO_REUSEPORT socket, so an overlap (e.g. the same
+    // host:port listed in `listen` and set as `dot_listen`) makes the kernel
+    // deal every incoming connection to a random role — plain-DNS bytes
+    // landing in the TLS accept loop and vice versa, intermittently. DoT
+    // (TCP) and DoQ (UDP) on one address are different transports and
+    // legitimately coexist.
+    let parse_addr =
+        |s: &String| -> Option<std::net::SocketAddr> { s.parse::<std::net::SocketAddr>().ok() };
+    let plain_listens: Vec<std::net::SocketAddr> =
+        cfg.server.listen.iter().filter_map(parse_addr).collect();
+    if let Some(dot) = cfg.server.dot_listen.as_ref().and_then(parse_addr)
+        && plain_listens.contains(&dot)
+    {
+        return Err(crate::RustyDnsError::Config(format!(
+            "server.dot_listen `{dot}` overlaps a server.listen address — plain DNS and \
+             DNS-over-TLS cannot share one port (connections would randomly land on either \
+             protocol); give DoT its own address"
+        )));
+    }
+    if let Some(doq) = cfg.server.doq_listen.as_ref().and_then(parse_addr)
+        && plain_listens.contains(&doq)
+    {
+        return Err(crate::RustyDnsError::Config(format!(
+            "server.doq_listen `{doq}` overlaps a server.listen address — plain DNS and \
+             DNS-over-QUIC cannot share one UDP port (datagrams would randomly land on \
+             either protocol); give DoQ its own address"
+        )));
+    }
+
     // DoT requires cert + key
     if (cfg.server.dot_listen.is_some() || cfg.server.doq_listen.is_some())
         && (cfg.server.tls_cert_path.is_none() || cfg.server.tls_key_path.is_none())
@@ -2570,6 +2600,37 @@ mod tests {
         let mut cfg = baseline();
         cfg.server.doq_listen = Some("0.0.0.0:853".to_string());
         assert_config_err(validate_config(&cfg), "tls_cert_path");
+    }
+
+    #[test]
+    fn dot_listen_overlapping_plain_listen_rejected() {
+        // Both roles would bind SO_REUSEPORT TCP sockets on one port; the
+        // kernel would hand each connection to plain DNS or TLS at random.
+        let mut cfg = baseline();
+        cfg.server.listen = vec!["127.0.0.1:853".to_string()];
+        cfg.server.dot_listen = Some("127.0.0.1:853".to_string());
+        assert_config_err(validate_config(&cfg), "overlaps a server.listen address");
+    }
+
+    #[test]
+    fn doq_listen_overlapping_plain_listen_rejected() {
+        let mut cfg = baseline();
+        cfg.server.doq_listen = Some("0.0.0.0:53".to_string());
+        // listen defaults already include a :53 entry? Be explicit:
+        cfg.server.listen = vec!["0.0.0.0:53".to_string()];
+        assert_config_err(validate_config(&cfg), "overlaps a server.listen address");
+    }
+
+    #[test]
+    fn dot_and_doq_on_same_address_allowed() {
+        // Different transports (TCP vs UDP) — legitimate coexistence, the
+        // common :853 deployment shape.
+        let mut cfg = baseline();
+        cfg.server.dot_listen = Some("0.0.0.0:853".to_string());
+        cfg.server.doq_listen = Some("0.0.0.0:853".to_string());
+        cfg.server.tls_cert_path = Some("cert.pem".into());
+        cfg.server.tls_key_path = Some("key.pem".into());
+        validate_config(&cfg).expect("DoT + DoQ sharing :853 must be allowed");
     }
 
     // --- upstream ---------------------------------------------------
