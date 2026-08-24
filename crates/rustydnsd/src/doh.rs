@@ -46,6 +46,17 @@ const DOH_TIMEOUT_FLOOR: Duration = Duration::from_secs(5);
 const DOH_TIMEOUT_SLACK: Duration = Duration::from_millis(500);
 const DOH_PATH: &str = "/dns-query";
 
+/// Derive the DoH response deadline from the configured upstream timeout:
+/// `max(5 s floor, 2 x upstream_timeout + slack)`. hickory may retry once
+/// inside its budget, and the HTTP layer must never win a race against a
+/// DNS answer UDP/TCP would deliver.
+///
+/// Saturating arithmetic: an operator-supplied `timeout_ms` near `u64::MAX`
+/// must clamp here instead of overflowing a multiply into an abort.
+pub(crate) fn doh_deadline(upstream_timeout: Duration) -> Duration {
+    (upstream_timeout.saturating_mul(2) + DOH_TIMEOUT_SLACK).max(DOH_TIMEOUT_FLOOR)
+}
+
 /// Start the DoH listener (HTTP, no TLS) on a pre-bound listener until
 /// shutdown.
 ///
@@ -61,7 +72,7 @@ pub async fn serve(
     // Deadline formula: floor of 5 s, else 2x the upstream timeout plus
     // slack — hickory may retry once inside its budget, and the HTTP layer
     // must never win a race against a DNS answer UDP/TCP would deliver.
-    let doh_timeout = (upstream_timeout * 2 + DOH_TIMEOUT_SLACK).max(DOH_TIMEOUT_FLOOR);
+    let doh_timeout = doh_deadline(upstream_timeout);
     let state = DohState {
         handler,
         doh_timeout,
@@ -378,7 +389,46 @@ mod tests {
         )
     }
 
-    /// Boot a DoH listener on a random port. Returns `(base_url, shutdown_token)`.
+    #[test]
+    fn doh_deadline_floor_applies_to_small_timeouts() {
+        assert_eq!(
+            doh_deadline(Duration::from_millis(1000)),
+            Duration::from_secs(5),
+            "small upstream timeouts must clamp to the 5 s floor"
+        );
+    }
+
+    #[test]
+    fn doh_deadline_tracks_large_upstream_timeouts() {
+        // 5 s upstream (the example/default) -> 2x + slack, ABOVE the floor:
+        // this leg is what discriminates the formula from a fixed constant.
+        assert_eq!(
+            doh_deadline(Duration::from_millis(5000)),
+            Duration::from_millis(10_500)
+        );
+        assert_eq!(
+            doh_deadline(Duration::from_millis(20_000)),
+            Duration::from_millis(40_500)
+        );
+    }
+
+    #[test]
+    fn doh_deadline_saturates_instead_of_panicking_on_huge_values() {
+        // timeout_ms has no upper validation bound. The pre-fix expression
+        // (`upstream_timeout * 2`) PANICS on u64-scale inputs — under
+        // release panic=abort that aborts the daemon at startup. Saturating
+        // arithmetic must instead yield a finite deadline >= the floor.
+        let big = doh_deadline(Duration::from_millis(u64::MAX));
+        assert!(big >= DOH_TIMEOUT_FLOOR);
+        // Monotonic: a larger upstream timeout never yields a smaller
+        // deadline.
+        assert!(
+            doh_deadline(Duration::from_millis(u64::MAX))
+                >= doh_deadline(Duration::from_millis(20_000))
+        );
+    }
+
+    /// Boot a DoH listener on a random port. Returns `(base_url, shutdown_token)`.    /// Boot a DoH listener on a random port. Returns `(base_url, shutdown_token)`.
     /// Drop the token (or call .cancel()) to stop the listener.
     async fn spawn_doh(handler: Arc<DnsHandler>) -> (String, CancellationToken) {
         let listener = crate::listeners::bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
