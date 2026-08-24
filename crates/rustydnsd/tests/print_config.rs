@@ -35,6 +35,28 @@ fn print_config_stdout(config_content: &str) -> String {
 }
 
 #[test]
+fn print_config_redacts_group_source_tokens() {
+    // Per-client blocklist groups are the most likely home for token-gated
+    // feeds; their sources must be redacted in dumps exactly like the
+    // global ones.
+    let out = print_config_stdout(
+        r#"
+[[blocklist.groups]]
+name = "kids"
+sources = ["https://kids.example/feed?token=k1dsfeed"]
+"#,
+    );
+    assert!(
+        !out.contains("k1dsfeed"),
+        "group source token leaked via --print-config:\n{out}"
+    );
+    assert!(
+        out.contains("token=<redacted>"),
+        "redaction placeholder missing:\n{out}"
+    );
+}
+
+#[test]
 fn print_config_never_leaks_url_credentials() {
     let out = print_config_stdout(
         r#"

@@ -172,6 +172,10 @@ impl DnsConfig {
         }
         cfg.blocklist.sources = redact_list(&cfg.blocklist.sources);
         cfg.blocklist.trusted_rpz_sources = redact_list(&cfg.blocklist.trusted_rpz_sources);
+        for group in &mut cfg.blocklist.groups {
+            group.sources = redact_list(&group.sources);
+            group.trusted_rpz_sources = redact_list(&group.trusted_rpz_sources);
+        }
         cfg
     }
 }
@@ -1775,6 +1779,11 @@ resolvers = ["quic://r:secret-pw@192.168.0.2:853"]
 [blocklist]
 sources = ["https://lists.example/a?token=t0ps3cret"]
 trusted_rpz_sources = ["https://rpz.example/rpz?key=k3y"]
+
+[[blocklist.groups]]
+name = "kids"
+sources = ["https://kids.example/feed?token=k1ds"]
+trusted_rpz_sources = ["https://rpz-kids.example/rpz?token=rpzk3y"]
 "#;
         let cfg: DnsConfig = toml::from_str(toml_body).expect("parse");
         let shown = cfg.redacted_for_display();
@@ -1788,6 +1797,17 @@ trusted_rpz_sources = ["https://rpz.example/rpz?key=k3y"]
         assert!(shown.upstream.routes[0].resolvers[0].contains("<redacted>@"));
         assert!(shown.blocklist.sources[0].contains("token=<redacted>"));
         assert!(shown.blocklist.trusted_rpz_sources[0].contains("key=<redacted>"));
+        assert!(
+            shown.blocklist.groups[0].sources[0].contains("token=<redacted>")
+                && !shown.blocklist.groups[0].sources[0].contains("k1ds"),
+            "group sources must be redacted: {:?}",
+            shown.blocklist.groups[0].sources
+        );
+        assert!(
+            shown.blocklist.groups[0].trusted_rpz_sources[0].contains("token=<redacted>"),
+            "group trusted-rpz sources must be redacted: {:?}",
+            shown.blocklist.groups[0].trusted_rpz_sources
+        );
 
         // The ORIGINAL config keeps its secrets — only the display clone is
         // scrubbed (a running daemon must still authenticate).
