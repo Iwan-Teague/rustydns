@@ -160,20 +160,30 @@ impl BlocklistLoader {
                 }
             }
         }
+        // Concurrent fetches: startup and SIGHUP block on this round, so
+        // serial awaiting would multiply one slow/dead source's timeout by
+        // the source count — minutes of no-DNS on the network's resolver.
+        // Parallel bounds the whole round by the single-source timeout.
+        let mut futs = Vec::with_capacity(remote.len());
         for url in remote {
             let trust = if trusted_rpz.iter().any(|t| t == url) {
                 BlocklistSource::Trusted
             } else {
                 BlocklistSource::Untrusted
             };
-            match self.fetch_remote(url).await {
+            futs.push(async move { (url.clone(), trust, self.fetch_remote(url).await) });
+        }
+        let results = futures_util::future::join_all(futs).await;
+
+        for (url, trust, res) in results {
+            match res {
                 Ok(content) => sources.push((content, trust)),
                 Err(e) => {
                     failed += 1;
                     // PRIVACY: source URLs may embed tokens; the error text
                     // already carries a redacted form of the URL.
                     warn!(
-                        url = %redact_url_credentials(url),
+                        url = %redact_url_credentials(&url),
                         error = %e,
                         "failed to fetch blocklist source"
                     );
