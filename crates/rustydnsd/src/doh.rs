@@ -463,6 +463,106 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn doh_compression_pointer_cycles_are_rejected_in_bounded_work() {
+        // Name-decompression safety (docs/security.md): a client-supplied
+        // DNS message whose question name is built from compression
+        // pointers that can never terminate must be rejected by the parser
+        // in bounded work — never a hang, never unbounded allocation.
+        //
+        // hickory-proto's decoder structurally forbids non-prior pointers:
+        // every pointer target must precede the start of the name being
+        // decoded (`PointerNotPriorToLabel`), so a self-loop at offset N
+        // (N → N) and every possible pointer cycle dies on its FIRST hop,
+        // and recursive follows strictly decrease position, bounding total
+        // decompression work by the message length. This pins that
+        // contract at our attacker-facing seam: hostile bytes must come
+        // back as HTTP 400 quickly, and the listener must keep serving
+        // well-formed traffic afterwards (no wedged parser state).
+        let handler = build_handler(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+        let client = reqwest::Client::builder().build().unwrap();
+
+        // Minimal query header: QDCOUNT=1, question name starts at offset 12.
+        let header: &[u8] = &[0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        let tail: &[u8] = &[0x00, 0x01, 0x00, 0x01]; // QTYPE=A QCLASS=IN
+        let hostile = |name_bytes: &[u8]| {
+            let mut w = header.to_vec();
+            w.extend_from_slice(name_bytes);
+            w.extend_from_slice(tail);
+            w
+        };
+
+        // Leg 1: self-pointer — offset N pointing back to N itself.
+        let self_loop = hostile(&[0xC0, 0x0C]);
+        // Leg 2: two-node cycle attempt (12→14→12): the first hop's target
+        // (14) is not prior to the name start (12), so it is rejected
+        // before the second pointer is ever read.
+        let two_cycle = hostile(&[0xC0, 0x0E, 0xC0, 0x0C]);
+        // Leg 3: forward pointer to offset 255, far past the question it
+        // appears in (and beyond this short packet entirely).
+        let forward = hostile(&[0xC0, 0xFF]);
+
+        for (label, wire) in [
+            ("self-loop", self_loop),
+            ("two-node cycle", two_cycle),
+            ("forward pointer", forward),
+        ] {
+            let started = std::time::Instant::now();
+            let resp = tokio::time::timeout(
+                Duration::from_secs(5),
+                client
+                    .post(format!("{base}/dns-query"))
+                    .header("content-type", "application/dns-message")
+                    .body(wire)
+                    .send(),
+            )
+            .await
+            .expect(label /* must not hang */);
+            let resp = resp.expect("POST completes");
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{label} must be rejected as a malformed message"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{label} rejection exceeded the bounded-work budget"
+            );
+        }
+
+        // GET parity: the same self-loop via ?dns= is also 400.
+        let dns_param = URL_SAFE_NO_PAD.encode(hostile(&[0xC0, 0x0C]));
+        let resp = client
+            .get(format!("{base}/dns-query?dns={dns_param}"))
+            .send()
+            .await
+            .expect("GET completes");
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Liveness: after hostile input the listener still serves a valid
+        // query end-to-end — proof the rejection was bounded, not a wedge.
+        let resp = client
+            .post(format!("{base}/dns-query"))
+            .header("content-type", "application/dns-message")
+            .body(build_query("router.mesh.", ProtoRecordType::A))
+            .send()
+            .await
+            .expect("valid query after hostile input");
+        assert_eq!(resp.status(), 200);
+        let dns = Message::from_bytes(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!(dns.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(dns.answers.len(), 1);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn doh_rejects_unsupported_methods() {
         // Input hardening: the router registers ONLY GET and POST on
         // /dns-query. PUT/DELETE are rejected by the framework with 405

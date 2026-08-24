@@ -2846,6 +2846,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn udp_compression_pointer_loop_query_is_bounded_and_daemon_stays_live() {
+        // Name-decompression safety at the UDP front door: a datagram whose
+        // question name is a compression pointer pointing AT ITSELF
+        // (offset N → N) can never decompress. hickory's decoder rejects
+        // any non-prior pointer on its first hop (`PointerNotPriorToLabel`)
+        // and bounds recursive follows by strictly decreasing position, so
+        // this must be dropped or error-rcoded in bounded work — never a
+        // hang — and afterwards the daemon must still answer valid queries
+        // promptly (no wedged listener, no unbounded allocation).
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+        let mut loop_q = vec![0x51, 0x11, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        loop_q.extend_from_slice(&[0xC0, 0x0C]); // question name: ptr to offset 12 — itself
+        loop_q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+
+        client
+            .send_to(&loop_q, format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+
+        let mut buf = [0u8; 512];
+        match tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await {
+            // Silently dropped: nothing to process (the expected shape).
+            Err(_) => {}
+            Ok(Ok((n, _))) => {
+                if let Ok(msg) = Message::from_bytes(&buf[..n]) {
+                    assert!(
+                        !(msg.metadata.response_code == ResponseCode::NoError
+                            && !msg.answers.is_empty()
+                            && msg.metadata.authoritative),
+                        "pointer-loop query produced a served answer"
+                    );
+                }
+            }
+            Ok(Err(e)) => panic!("socket error on pointer-loop query: {e}"),
+        }
+
+        // Bounded-work proof: the same socket reaches a healthy daemon.
+        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn blocked_domain_returns_nxdomain() {
         let harness = build_harness(
             vec![],

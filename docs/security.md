@@ -644,6 +644,41 @@ a parsing vulnerability in `hickory-server` or `hyper`. Mitigations:
   65 535 bytes with `413` for both verbs. Unsupported HTTP methods are rejected
   before DNS processing (`405`; `HEAD` via the GET route's missing-parameter `400`).
 
+### Name Decompression Is Structurally Bounded
+
+DNS message compression (RFC 1035 §4.1.4) lets any byte pair with the top bits
+`11` redirect name parsing to a 14-bit offset in the same message. A naive
+parser that follows pointers without checking them can be driven into an
+infinite loop or unbounded allocation by a pointer that points at itself —
+this has been a real resolver-amplifying bug class historically.
+
+rustydns performs **no wire-format parsing of its own**: every decode of
+untrusted DNS bytes is delegated to `hickory-proto` 0.26.x, whose decoder
+makes decompression structurally bounded rather than merely "usually fast":
+
+- Every compression pointer must target an offset strictly *before* the start
+  of the name currently being decoded; a self-pointer at offset N (N → N), a
+  forward pointer, and therefore every possible pointer cycle are rejected on
+  their first hop with `PointerNotPriorToLabel`.
+- Recursive pointer follows inherit that rule, so each follow's target
+  strictly decreases: total pointer hops are bounded by the message length
+  (≤ 65 535, and in practice by the offset of the first compressed name),
+  each hop costing O(1). There is no path to unbounded work.
+- Accumulated label data is capped at a 255-byte name, so even chains that
+  terminate cannot allocate beyond one maximum-size `Name`.
+
+This is pinned by adversarial regression tests at each rustydns-owned decode
+boundary: inbound DoH POST/GET (`doh_compression_pointer_cycles_are_rejected_in_bounded_work`),
+the ODoH decrypted-response seam
+(`odoh_compression_pointer_loop_fails_closed_in_bounded_work`), plain-upstream
+replies (`compression_pointer_loop_fails_closed` in the resolver e2e suite),
+and the daemon's UDP front door
+(`udp_compression_pointer_loop_query_is_bounded_and_daemon_stays_live`). Each
+asserts rejection within an explicit wall-clock budget plus post-hostile-input
+liveness. We deliberately do **not** re-implement a second pointer validator
+in front of hickory's: duplicating the check would add false-positive risk on
+conformant traffic while guarding against nothing hickory already forbids.
+
 ### Listener Hardening (Amplification Defence)
 
 - **ANY (qtype 255) queries are REFUSED** before the pipeline (RFC 8482
