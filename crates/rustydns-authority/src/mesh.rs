@@ -430,23 +430,18 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Before this instant the system clock is considered UNRELIABLE (dead RTC,
-/// fresh board defaulting to the epoch). Evaluating bundle freshness against
-/// such a clock would pass every expiry check (now = 0 < any expires_at),
-/// letting old signed bundles replay indefinitely — so we fail closed.
-const MIN_TRUSTED_UNIX_SECS: u64 = 1_577_836_800; // 2020-01-01 UTC
-
 fn enforce_freshness_at(
     bundle: &LoadedBundle,
     max_age_secs: u64,
     now: u64,
 ) -> Result<(), MeshBundleError> {
-    if now < MIN_TRUSTED_UNIX_SECS {
+    if now < rustydns_core::schedule::MIN_TRUSTED_UNIX_SECS {
         return Err(MeshBundleError::Stale {
             reason: format!(
                 "system clock reads unix={now}, before the plausibility floor \
-                 ({MIN_TRUSTED_UNIX_SECS}); refusing to evaluate bundle freshness with an \
-                 untrusted clock. Fix the system time and reload."
+                 ({floor}); refusing to evaluate bundle freshness with an \
+                 untrusted clock. Fix the system time and reload.",
+                floor = rustydns_core::schedule::MIN_TRUSTED_UNIX_SECS
             ),
         });
     }
