@@ -503,6 +503,13 @@ fn check_config_permissions(_path: &PathBuf) -> Result<()> {
 
 /// Initialise the tracing subscriber.
 ///
+/// True when the operator's RUST_LOG explicitly targeted THIS hickory crate
+/// by name (exact target match — never a substring), meaning our privacy
+/// clamp must stand down for it alone.
+fn hickory_clamp_overridden(targets: &[String], crate_name: &str) -> bool {
+    targets.iter().any(|t| t == crate_name)
+}
+
 /// Reads `RUST_LOG` for the log filter (default: `info`).
 /// Uses JSON format in release builds (machine-readable for log aggregation)
 /// and pretty format in debug builds.
@@ -525,16 +532,24 @@ fn init_tracing() {
     // pin the hickory crates to `warn` if the user hasn't overridden them.
     let user_filter = std::env::var("RUST_LOG").unwrap_or_default();
     let mut filter = EnvFilter::new("info");
+    // Extract each directive's TARGET (text before any '=') so the clamp
+    // below can check per-crate override by exact name. Substring matching
+    // was a privacy bug: `hickory_resolver=off` silenced one crate but its
+    // substring skipped the clamp for all three, re-enabling info-level
+    // logs that can carry qnames.
+    let targets: Vec<String> = user_filter
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|d| d.split('=').next().unwrap_or("").trim().to_string())
+        .collect();
     for directive in user_filter.split(',').filter(|s| !s.trim().is_empty()) {
         if let Ok(d) = directive.parse() {
             filter = filter.add_directive(d);
         }
     }
     for crate_name in ["hickory_server", "hickory_proto", "hickory_resolver"] {
-        if !user_filter.contains(crate_name)
-            && let Ok(d) = format!("{crate_name}=warn").parse()
-        {
-            filter = filter.add_directive(d);
+        if !hickory_clamp_overridden(&targets, crate_name) {
+            filter = filter.add_directive(format!("{crate_name}=warn").parse().unwrap());
         }
     }
 
@@ -1815,6 +1830,28 @@ mod tests {
         let err = load_tls_config(&server_with_paths(Some(cert), Some(key))).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("contains no certificates"), "msg = {msg}");
+    }
+
+    #[test]
+    fn hickory_clamp_override_requires_exact_target_match() {
+        use super::hickory_clamp_overridden;
+        // Exact per-crate override works.
+        assert!(hickory_clamp_overridden(
+            &["hickory_resolver".to_string()],
+            "hickory_resolver"
+        ));
+        // Substring containment must NOT count: `my_hickory_server=debug`
+        // is an unrelated target, and a bare substring check would silently
+        // disable the qname clamp for ALL three crates.
+        assert!(!hickory_clamp_overridden(
+            &["my_hickory_server".to_string()],
+            "hickory_server"
+        ));
+        // A different crate's override does not stand down the others.
+        assert!(!hickory_clamp_overridden(
+            &["hickory_proto".to_string()],
+            "hickory_server"
+        ));
     }
 
     #[test]
