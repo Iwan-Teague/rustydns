@@ -19,9 +19,16 @@ BINARY_PATH="${1:-target/release/rustydnsd}"
 INSTALL_PREFIX="${2:-/usr/local}"
 CONFIG_DIR="/etc/rustydns"
 STATE_DIR="/var/lib/rustydns"
-EXAMPLE_CONFIG="rustydns.example.toml"
+
+# Repo assets are resolved relative to THIS SCRIPT, so the installer works
+# when invoked by absolute path from any working directory
+# (e.g. `sudo bash /opt/src/rustydns/scripts/install.sh`). BINARY_PATH stays
+# CWD-relative: it points at your build tree, not at a repo asset.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+EXAMPLE_CONFIG="$REPO_ROOT/rustydns.example.toml"
 INSTALLED_CONFIG="$CONFIG_DIR/rustydns.toml"
-SYSTEMD_UNIT="install/rustydns.service"
+SYSTEMD_UNIT="$REPO_ROOT/install/rustydns.service"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
