@@ -151,6 +151,29 @@ pub struct DnsConfig {
     pub safesearch: SafeSearchConfig,
 }
 
+impl MetricsConfig {
+    /// The address this metrics configuration will ACTUALLY bind: parsed,
+    /// then forced to loopback when the operator pointed it somewhere public
+    /// (mirrors `metrics_listen_addr` in the daemon). Validation and overlap
+    /// checks must reason about this effective address, not the raw string.
+    pub fn effective_listen(&self) -> Result<std::net::SocketAddr, crate::RustyDnsError> {
+        let addr: std::net::SocketAddr = self.listen.parse().map_err(|_| {
+            crate::RustyDnsError::Config(format!(
+                "metrics.listen `{}` is not a valid socket address",
+                self.listen
+            ))
+        })?;
+        if addr.ip().is_loopback() {
+            return Ok(addr);
+        }
+        let loopback_ip = match addr.ip() {
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        };
+        Ok(std::net::SocketAddr::new(loopback_ip, addr.port()))
+    }
+}
+
 impl DnsConfig {
     /// A clone of this config that is safe to print or dump: every
     /// URL-bearing field (upstream resolvers, ODoH proxies, conditional
@@ -1960,7 +1983,10 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     if let Some(d) = cfg.server.doh_listen.as_ref().and_then(parse_addr) {
         tcp_addrs.push((d, "DNS-over-HTTPS"));
     }
-    if let Ok(m) = cfg.metrics.listen.parse::<std::net::SocketAddr>() {
+    // Use the EFFECTIVE (loopback-forced) address: a wildcard metrics
+    // listen is forced to loopback at runtime and must not be treated as
+    // competing with LAN-bound DNS on the same port.
+    if let Ok(m) = cfg.metrics.effective_listen() {
         tcp_addrs.push((m, "metrics"));
     }
     for i in 0..tcp_addrs.len() {
@@ -2806,6 +2832,28 @@ mod tests {
         // listen defaults already include a :53 entry? Be explicit:
         cfg.server.listen = vec!["0.0.0.0:53".to_string()];
         assert_config_err(validate_config(&cfg), "cannot share one UDP port");
+    }
+
+    #[test]
+    fn wildcard_metrics_forced_to_loopback_does_not_collide_with_lan_dns() {
+        // Regression for a false positive: metrics.listen is FORCED to
+        // loopback at runtime when non-loopback, so a wildcard metrics
+        // address never competes with a LAN-bound plain DNS listener on the
+        // same port. Validation must compare EFFECTIVE addresses.
+        let mut cfg = baseline();
+        cfg.server.listen = vec!["192.168.1.1:9153".to_string()];
+        cfg.metrics.listen = "0.0.0.0:9153".parse().unwrap();
+        validate_config(&cfg).expect("wildcard metrics vs LAN DNS must be allowed");
+    }
+
+    #[test]
+    fn forced_metrics_loopback_still_collides_with_dns_on_same_addr() {
+        // Inverse true-positive: forcing lands BOTH on loopback :53 — a real
+        // conflict that must be rejected.
+        let mut cfg = baseline();
+        cfg.server.listen = vec!["127.0.0.1:53".to_string()];
+        cfg.metrics.listen = "0.0.0.0:53".parse().unwrap();
+        assert_config_err(validate_config(&cfg), "cannot share one TCP port");
     }
 
     #[test]
