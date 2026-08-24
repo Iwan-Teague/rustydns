@@ -82,7 +82,7 @@ impl Allowlist {
     /// be fast. It is allocation-free for ASCII names (the overwhelming common
     /// case): it lowercases into a stack-local `String` **only** when the input
     /// actually contains an uppercase ASCII byte, mirroring
-    /// [`crate::engine`]'s `is_blocked` fast path. Since the engine already
+    /// `engine`'s `is_blocked` fast path. Since the engine already
     /// lowercases before calling this, the common path never allocates at all.
     #[inline]
     pub fn is_allowed(&self, domain: &str) -> bool {

@@ -13,7 +13,7 @@
 //! |---------|-----|---------|------------|--------|
 //! | DNS-over-HTTPS upstream | RFC 8484 | ✓ | `upstream.protocol = "doh"` | implemented |
 //! | DNS-over-QUIC upstream | RFC 9250 | opt-in | `upstream.protocol = "doq"` | implemented (via hickory `quic-ring` feature → `NameServerConfig::quic`) |
-//! | Oblivious DoH upstream | RFC 9230 | opt-in | `upstream.protocol = "odoh"` | implemented — HPKE via `odoh-rs`, relayed through one of `upstream.odoh_proxies` (random per query); fail-closed; optional client-side DNSSEC (chains over the oblivious arm). See the [`odoh`] module. |
+//! | Oblivious DoH upstream | RFC 9230 | opt-in | `upstream.protocol = "odoh"` | implemented — HPKE via `odoh-rs`, relayed through one of `upstream.odoh_proxies` (random per query); fail-closed; optional client-side DNSSEC (chains over the oblivious arm). See the `odoh` module. |
 //! | TLS 1.3 minimum | RFC 8446 | ✓ | `upstream.min_tls_version = "1.3"` | implemented |
 //! | DNSSEC validation | RFC 4033-4035 | ✓ | `upstream.dnssec_validation = true` | implemented (passes through `ResolverOpts.validate`) |
 //! | Fail-closed on upstream failure | — | ✓ | `upstream.fail_closed = true` | implemented |
@@ -115,7 +115,7 @@ struct ResolverArm {
 }
 
 /// A conditional-forwarding route: a normalised DNS zone bound to one
-/// [`ResolverArm`].
+/// `ResolverArm`.
 #[derive(Debug)]
 struct RouteArm {
     /// Zone in its fully-normalised form: lowercase, trailing dot, no
@@ -520,12 +520,12 @@ impl Resolver {
 
 /// Bootstrap-resolve every URL in `resolvers`, build the hickory
 /// resolver options from the shared `config`, and return a ready-to-
-/// query [`ResolverArm`].
+/// query `ResolverArm`.
 ///
 /// `label` is used only in log/error messages so operators can tell
 /// which arm failed to bootstrap (e.g. `"default"`, `"lan."`).
 /// Build the hickory `ResolverOpts` for one arm from the shared config.
-/// Extracted from [`build_resolver_arm`] so the security-relevant knobs are
+/// Extracted from `build_resolver_arm` so the security-relevant knobs are
 /// unit-testable without bootstrapping a network resolver.
 pub const MIN_POSITIVE_CACHE_TTL_SECS: u64 = 2;
 /// Mirror of the cache floor: an upstream cannot wedge an entry in the
