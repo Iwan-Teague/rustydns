@@ -1100,7 +1100,7 @@ async fn run_signal_loop(
         // here, a flapping config-management system or logrotate script
         // re-fetching per signal hammers every source. The first SIGHUP is
         // always allowed.
-        let mut last_fetch_round = tokio::time::Instant::now() - MIN_SIGHUP_FETCH_SPACING;
+        let mut last_fetch_round: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -1158,7 +1158,7 @@ async fn handle_sighup(
     authority: &Arc<Authority>,
     metrics: &Arc<Metrics>,
     config_path: &std::path::Path,
-    last_fetch_round: &mut tokio::time::Instant,
+    last_fetch_round: &mut Option<tokio::time::Instant>,
 ) {
     info!("SIGHUP received — reloading blocklists, mesh-zone bundle, and config");
 
@@ -1168,14 +1168,19 @@ async fn handle_sighup(
     // spaced; mesh verification, config parsing, and listener reconciliation
     // below still run every time.
     let now = tokio::time::Instant::now();
-    if now.duration_since(*last_fetch_round) < MIN_SIGHUP_FETCH_SPACING {
+    // Option, not `now - spacing`: a fresh-boot start would underflow the
+    // monotonic clock. None means no round yet and is always allowed.
+    if !fetch_spacing_ok(
+        last_fetch_round.map(|t| now.duration_since(t)),
+        MIN_SIGHUP_FETCH_SPACING,
+    ) {
         info!(
             "SIGHUP: skipping blocklist fetch round (minimum spacing not elapsed); sources \
              unchanged since the last fetch"
         );
         metrics.mark_blocklist_reload_skipped();
     } else {
-        *last_fetch_round = now;
+        *last_fetch_round = Some(now);
         match loader.reload(engine).await {
             Ok(summary) => {
                 if summary.loaded_sources == 0 {
@@ -1519,6 +1524,15 @@ const RESERVED_METRICS_PATHS: [&str; 2] = ["/health", "/queries"];
 /// must not re-fetch every source per signal.
 const MIN_SIGHUP_FETCH_SPACING: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
+/// Pure core of the SIGHUP spacing guard: `None` elapsed means no round has
+/// run yet (always allowed); otherwise the round must be at least `min` old.
+fn fetch_spacing_ok(last_elapsed: Option<Duration>, min: Duration) -> bool {
+    match last_elapsed {
+        None => true,
+        Some(d) => d >= min,
+    }
+}
+
 /// Normalise `metrics.path` (trim, ensure a leading slash, default
 /// `/metrics`) and reject paths that collide with the reserved `/health` and
 /// `/queries` endpoints. Both call sites — startup (fatal) and SIGHUP reload
@@ -1809,6 +1823,23 @@ mod tests {
         assert_eq!(normalize_metrics_path("foo").unwrap(), "/foo");
         assert_eq!(normalize_metrics_path("/foo").unwrap(), "/foo");
         assert_eq!(normalize_metrics_path("  /foo  ").unwrap(), "/foo");
+    }
+
+    #[test]
+    fn fetch_spacing_ok_none_means_always_allowed() {
+        use super::fetch_spacing_ok;
+        // None = no round has run yet (fresh boot or first SIGHUP): allowed.
+        assert!(fetch_spacing_ok(None, Duration::from_secs(60)));
+        // Recent round: refused.
+        assert!(!fetch_spacing_ok(
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(60)
+        ));
+        // Old-enough round: allowed.
+        assert!(fetch_spacing_ok(
+            Some(Duration::from_secs(61)),
+            Duration::from_secs(60)
+        ));
     }
 
     #[test]
