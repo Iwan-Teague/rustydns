@@ -2117,4 +2117,36 @@ mod tests {
             .expect("default parse");
         assert!(default_addr.ip().is_loopback());
     }
+
+    #[test]
+    fn metrics_listen_bind_safety_rejects_ipv4_mapped_v6_endruns() {
+        // IPv4-mapped IPv6 literals are the classic bind-safety confusion
+        // vector: `is_loopback()` on `::ffff:a.b.c.d` is false even for the
+        // mapped loopback (`::ffff:127.0.0.1`), so BOTH forms must fall into
+        // the forcing path and land on `::1`. Pins that no mapped form can
+        // smuggle a non-loopback metrics bind past the V6 parser.
+        let mapped_loopback = rustydns_core::config::MetricsConfig {
+            listen: "[::ffff:127.0.0.1]:9153".to_string(),
+            ..Default::default()
+        };
+        let forced = metrics_listen_addr(&mapped_loopback).expect("mapped loopback parse");
+        assert_eq!(
+            forced.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            "even the mapped loopback must be normalised onto ::1"
+        );
+        assert_eq!(forced.port(), 9153, "port preserved when forcing");
+
+        let mapped_public = rustydns_core::config::MetricsConfig {
+            listen: "[::ffff:203.0.113.7]:9153".to_string(),
+            ..Default::default()
+        };
+        let forced_pub = metrics_listen_addr(&mapped_public).expect("mapped public parse");
+        assert_eq!(
+            forced_pub.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            "a v4-mapped public address must never survive unforced"
+        );
+        assert!(forced_pub.ip().is_loopback());
+    }
 }
