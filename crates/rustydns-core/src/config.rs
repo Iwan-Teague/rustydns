@@ -1508,6 +1508,16 @@ mod display_redaction_tests {
     }
 
     #[test]
+    fn userinfo_and_token_params_redact_together() {
+        // A single URL can carry credentials in BOTH positions; each must be
+        // scrubbed independently.
+        assert_eq!(
+            redact_url_credentials("https://alice:hunter2@dns.example/dns-query?token=t0p"),
+            "https://<redacted>@dns.example/dns-query?token=<redacted>"
+        );
+    }
+
+    #[test]
     fn reqwest_error_display_strings_are_redacted() {
         // odoh.rs wraps transport errors as
         // OdohError::Http(redact_url_credentials(&e.to_string())). reqwest's
