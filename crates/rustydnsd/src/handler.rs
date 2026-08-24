@@ -330,18 +330,17 @@ impl DnsHandler {
         // larger than what we will actually put on the wire. Hoisted so the
         // borrow outlives the builder's use below.
         const MAX_EDNS_PAYLOAD: u16 = 4096;
-        let clamped_edns = request
-            .edns
-            .as_ref()
-            .filter(|e| e.max_payload() > MAX_EDNS_PAYLOAD)
-            .map(|e| {
-                let mut c = e.clone();
+        let normalized_edns = request.edns.as_ref().map(|e| {
+            let mut c = e.clone();
+            if c.max_payload() > MAX_EDNS_PAYLOAD {
                 c.set_max_payload(MAX_EDNS_PAYLOAD);
-                c
-            });
-        if let Some(clamped) = clamped_edns.as_ref() {
-            builder.edns(clamped);
-        } else if let Some(edns) = request.edns.as_ref() {
+            }
+            // RFC 6891 §6.1.1: a response OPT advertises OUR version — 0 —
+            // never an echoed request version we do not implement.
+            c.set_version(0);
+            c
+        });
+        if let Some(edns) = normalized_edns.as_ref() {
             builder.edns(edns);
         }
 
@@ -544,6 +543,22 @@ impl DnsHandler {
     fn gate_class(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
         if ctx.qclass != DNSClass::IN {
             Some(Reply::reject(ResponseCode::NotImp))
+        } else {
+            None
+        }
+    }
+
+    /// RFC 6891 §6.1.3: a request advertising an EDNS version greater than
+    /// the one we support (0) must be answered with BADVERS — never silently
+    /// accepted (we cannot be trusted to honour newer semantics) and never a
+    /// bare SERVFAIL (which tells the client nothing actionable). The
+    /// response carries an OPT RR advertising OUR version, which `respond`
+    /// normalises to 0 for every reply.
+    fn gate_edns_version(&self, request: &Request) -> Option<Reply> {
+        let edns = request.edns.as_ref()?;
+        if edns.version() > 0 {
+            // Rcode is counted once, in `respond` (single choke point).
+            Some(Reply::reject(ResponseCode::BADVERS))
         } else {
             None
         }
@@ -921,6 +936,7 @@ impl RequestHandler for DnsHandler {
         if let Some(reply) = self
             .gate_rate_limit(&ctx)
             .or_else(|| self.gate_opcode(request, &ctx))
+            .or_else(|| self.gate_edns_version(request))
             .or_else(|| self.gate_any_qtype(&ctx))
             .or_else(|| self.gate_class(&ctx))
         {
@@ -2966,6 +2982,77 @@ mod tests {
         }
 
         // Liveness: normal service continues afterwards.
+        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_edns_version_mismatch_answers_badvers() {
+        // RFC 6891 §6.1.3: a query advertising an EDNS0 version the server
+        // does not support must be answered with BADVERS (rcode 16) — not
+        // silently accepted, not FORMERR'd, not ignored. hickory-server's
+        // catalog enforces this before our handler runs; this pin proves the
+        // guarantee survives through OUR listener stack, so a future
+        // transport/upgrade cannot silently start accepting (and
+        // mis-handling) newer EDNS versions.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+        let mut wire = vec![0x62, 0x64, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 1]; // ARCOUNT=1
+        wire.extend_from_slice(b"\x06victim\x07example\x03org\x00"); // qname
+        wire.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+        // OPT pseudo-record: root name, type 41, class = payload (4096),
+        // ttl = ext-rcode(0) | version(1) | flags(0) → version 1.
+        wire.extend_from_slice(&[0x00]); // root name
+        wire.extend_from_slice(&[0x00, 0x29]); // OPT
+        wire.extend_from_slice(&[0x10, 0x00]); // payload 4096
+        wire.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // version = 1
+        wire.extend_from_slice(&[0x00, 0x00]); // rdlen 0
+
+        client
+            .send_to(&wire, format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("BADVERS response must arrive within budget")
+            .expect("recv");
+        let msg = Message::from_bytes(&buf[..n]).expect("response must decode");
+        // Wire truth: extended rcode 16 == BADVERS. On decode hickory labels
+        // 16 as BADSIG (RFC 6891 and RFC 4034 share the value; the resolver
+        // disambiguates by context we don't have here), so accept either
+        // name for the same wire bytes.
+        assert!(
+            matches!(
+                msg.metadata.response_code,
+                ResponseCode::BADVERS | ResponseCode::BADSIG
+            ),
+            "EDNS version > 0 must be answered with extended rcode 16 (BADVERS), got {:?}",
+            msg.metadata.response_code
+        );
+        assert!(
+            msg.answers.is_empty(),
+            "BADVERS is an error response — no records may be served"
+        );
+        // The response OPT must advertise OUR version (0), never an echoed
+        // request version, and keep the clamped payload advertisement.
+        let resp_edns = msg.edns.as_ref().expect("BADVERS must carry an OPT RR");
+        assert_eq!(resp_edns.version(), 0, "response EDNS version must be 0");
+        assert_eq!(
+            resp_edns.max_payload(),
+            4096,
+            "payload advertisement must survive the clamp path"
+        );
+
+        // Liveness: normal EDNS-less service continues afterwards.
         let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
     }
