@@ -185,9 +185,12 @@ See `docs/operator-endpoints.md` for the full reference.
   each connection to a random role (plain DNS vs TLS/QUIC) on SO_REUSEPORT
   sockets. `validate_config` now rejects the overlap while DoT + DoQ
   sharing :853 stays allowed (different transports).
-- **`authority.poll_interval_secs = 0` rejected.** It fed
-  `tokio::time::interval`, which panics on a zero period — aborting the
-  daemon at startup under release panic=abort.
+- **`authority.poll_interval_secs = 0` honored as SIGHUP-only mode.** It
+  fed `tokio::time::interval`, which panics on a zero period — aborting
+  the daemon at startup under release panic=abort. The reload loop is now
+  simply not spawned in that case (SIGHUP remains the reload path), so the
+  documented polling-disabled value works instead of crashing; non-zero
+  values poll as before.
 - **UDP truncation logs one summary line, not one per shed record.** A
   large upstream answer over the datagram cap previously flooded the
   journal per query; shed/kept/original counts and the cap are in a single
