@@ -1536,6 +1536,143 @@ mod display_redaction_tests {
     }
 
     #[test]
+    fn redact_property_no_panic_and_invariants_hold() {
+        // Property/fuzz over the display redactor, mirroring the blocklist
+        // parser property test (deterministic LCG, reproducible). The
+        // redactor guards four log/dump surfaces (--print-config, resolver
+        // log lines, ODoH transport errors, blocklist fetch errors), so a
+        // future edit that panics on adversarial input or silently stops
+        // scrubbing must fail here.
+        const SCHEMES: [&str; 2] = ["https://", "http://"];
+        const USERS: [&str; 3] = ["alice", "svc-dns", "u"];
+        const PASSES: [&str; 3] = ["hunter2", "t0ps3cret", "pW123"];
+        const HOSTS: [&str; 4] = ["dns.example", "127.0.0.1", "[2001:db8::1]", "relay.example"];
+        const PATHS: [&str; 3] = ["", "/dns-query", "/a/list"];
+        const SECRET_KEYS: [&str; 6] = ["token", "TOKEN", "api_key", "key", "secret", "password"];
+        const PLAIN_KEYS: [&str; 3] = ["format", "q", "cache"];
+        const PLAIN_VALS: [&str; 3] = ["hosts", "1", "abc"];
+
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n
+        };
+
+        // --- Leg 1: structured URLs, ground-truth assertions ---------------
+        for _ in 0..4000 {
+            let mut url = String::from(SCHEMES[next(SCHEMES.len())]);
+            let with_userinfo = next(2) == 0;
+            let user = USERS[next(USERS.len())];
+            let pass = PASSES[next(PASSES.len())];
+            match with_userinfo {
+                true => url.push_str(&format!("{user}:{pass}@")),
+                false => url.push_str(&format!("{user}@")),
+            }
+            url.push_str(HOSTS[next(HOSTS.len())]);
+            url.push_str(PATHS[next(PATHS.len())]);
+
+            // 0..=3 query params, mixing credential and plain keys.
+            let mut expect_secret_absent: Vec<(String, &str)> = Vec::new();
+            let mut expect_plain_present: Vec<String> = Vec::new();
+            let n_params = next(4);
+            if n_params > 0 {
+                url.push('?');
+                for i in 0..n_params {
+                    if i > 0 {
+                        url.push('&');
+                    }
+                    if next(2) == 0 {
+                        let k = SECRET_KEYS[next(SECRET_KEYS.len())];
+                        let v = PASSES[next(PASSES.len())];
+                        expect_secret_absent.push((k.to_ascii_lowercase(), v));
+                        url.push_str(&format!("{k}={v}"));
+                    } else {
+                        let k = PLAIN_KEYS[next(PLAIN_KEYS.len())];
+                        let v = PLAIN_VALS[next(PLAIN_VALS.len())];
+                        expect_plain_present.push(format!("{k}={v}"));
+                        url.push_str(&format!("{k}={v}"));
+                    }
+                }
+            }
+
+            let out = redact_url_credentials(&url);
+
+            // Credentials never survive…
+            if with_userinfo {
+                assert!(
+                    !out.contains(&format!(":{pass}@")),
+                    "password leaked: {url} -> {out}"
+                );
+            }
+            for (k, v) in &expect_secret_absent {
+                assert!(
+                    !out.contains(&format!("{k}={v}")),
+                    "credential param leaked ({k}): {url} -> {out}"
+                );
+            }
+            // …and everything else stays legible.
+            assert!(
+                out.contains("<redacted>@"),
+                "userinfo must be scrubbed to <redacted>: {url} -> {out}"
+            );
+            for plain in &expect_plain_present {
+                assert!(
+                    out.contains(plain),
+                    "plain param must survive: {url} -> {out}"
+                );
+            }
+            for host in HOSTS {
+                if url.contains(host) {
+                    assert!(out.contains(host), "host must survive: {url} -> {out}");
+                }
+            }
+            // Idempotence: re-redacting changes nothing.
+            assert_eq!(
+                redact_url_credentials(&out),
+                out,
+                "redaction must be idempotent: {url} -> {out}"
+            );
+        }
+
+        // --- Leg 2: garbage soup — no panic, idempotent ---------------------
+        let long_z = "z".repeat(300);
+        let soup: Vec<&str> = vec![
+            "://",
+            "@",
+            "?",
+            "&",
+            "=",
+            "#",
+            ".",
+            "/",
+            ":",
+            "%2F",
+            "ü",
+            "\u{0000}",
+            "🎉",
+            "https://",
+            "http://",
+            "token",
+            "password",
+            "<redacted>",
+            "a",
+            long_z.as_str(),
+        ];
+        for _ in 0..4000 {
+            let n = 1 + next(12);
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(soup[next(soup.len())]);
+            }
+            let once = redact_url_credentials(&s);
+            let twice = redact_url_credentials(&once);
+            assert_eq!(once, twice, "redaction must be idempotent on: {s:?}");
+        }
+    }
+
+    #[test]
     fn config_display_clone_redacts_every_url_field() {
         let toml_body = r#"
 [upstream]
