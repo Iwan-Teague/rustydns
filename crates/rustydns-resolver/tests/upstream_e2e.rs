@@ -817,6 +817,65 @@ async fn compression_pointer_loop_fails_closed() {
 }
 
 #[tokio::test]
+async fn truncated_label_length_fails_closed_bounded() {
+    // Label-length bounds check: a length byte claiming MORE bytes than
+    // remain in the packet (0x3F = 63, with only a handful before EOF) must
+    // be rejected as malformed — never satisfied by reading out of range,
+    // panicking, or synthesising records from whatever bytes happen to be
+    // there. hickory's BinDecoder returns InsufficientBytes; our seam must
+    // fail closed (AllUpstreamsFailed) within a bounded budget and keep
+    // serving afterwards.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().expect("local_addr");
+    let shutdown = CancellationToken::new();
+    let sh = shutdown.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            tokio::select! {
+                _ = sh.cancelled() => break,
+                res = socket.recv_from(&mut buf) => {
+                    let Ok((_, src)) = res else { continue };
+
+                    let mut raw: Vec<u8> = Vec::new();
+                    raw.extend_from_slice(&[0x12, 0x34, 0x80, 0x00]); // id, QR
+                    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QD=1 AN=1
+                    raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                    // Question: victim.example.org. A IN
+                    raw.extend_from_slice(b"\x06victim\x07example\x03org\x00");
+                    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // @29..33
+                    // Answer owner: length byte claims 63 bytes but only
+                    // four ("abcd") exist before the packet ends.
+                    let s = raw.len(); // = 33
+                    debug_assert_eq!(s, 33);
+                    raw.push(0x3F); // claims 63 data bytes...
+                    raw.extend_from_slice(b"abcd"); // ...only 4 exist
+                    let _ = socket.send_to(&raw, src).await;
+                }
+            }
+        }
+    });
+
+    let resolver = Resolver::new(plain_config(&addr.to_string()))
+        .await
+        .expect("resolver init");
+    let started = std::time::Instant::now();
+    let err = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect_err("a truncated label must fail closed");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "truncated-label reply must fail closed, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "rejection exceeded the bounded-work budget"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn compression_pointer_overlap_trap_fails_closed_bounded() {
     // Exercises the RECURSIVE pointer-follow path with only PRIOR pointers —
     // every other hostile-pointer test in this suite dies on hop 1, so the
