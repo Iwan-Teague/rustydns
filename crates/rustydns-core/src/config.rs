@@ -1527,8 +1527,9 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     if cfg.upstream.protocol == UpstreamProtocol::Plain {
         tracing::warn!(
             "upstream.protocol = \"plain\" — DNS queries will be sent UNENCRYPTED over UDP/TCP \
-             port 53. Every resolved domain name is visible to any observer on the network path. \
-             This is not safe for any deployment where privacy matters. Use \"doh\" or \"doq\"."
+             port 53, which leaks every resolved domain name to any observer on the network \
+             path. This is not safe for any deployment where privacy matters. Use \"doh\" or \
+             \"doq\"."
         );
     }
 
@@ -2046,6 +2047,17 @@ mod tests {
             }
             Err(other) => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn query_log_defaults_to_memory_only() {
+        // AGENTS.md privacy invariant: "No query history on disk by default."
+        // The default must keep the query ring buffer in memory only — disk
+        // persistence is strictly opt-in (and warns at startup when enabled).
+        assert!(
+            !PrivacyConfig::default().query_log_to_disk,
+            "query_log_to_disk must default to false"
+        );
     }
 
     #[test]
