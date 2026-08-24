@@ -121,6 +121,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
 
+      # Release-profile parity: the shipped binary runs with
+      # panic = "abort" and overflow checks off. A test that only passes in
+      # dev (unwind-dependent, debug-assert-sensitive) would otherwise reach
+      # production unseen — run the full suite against the release profile.
+      - name: Test (release profile)
+        run: cargo test --workspace --release
+
   docker:
     name: Docker image smoke build
     runs-on: ubuntu-latest
