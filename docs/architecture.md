@@ -24,6 +24,9 @@ Security, privacy, and anonymity are first-class design constraints — not feat
   ┌─────────────┐
   │   Opcode /  │  — non-Query opcode or non-IN class → NOTIMP
   │   Class     │    (early rejection before pipeline work)
+  ├─────────────┤
+  │  EDNS ver / │  — OPT version > 0 → BADVERS (RFC 6891);
+  │   ANY qtype │    ANY (255) → REFUSED with counter (RFC 8482)
   └──────┬──────┘
          │ Query/IN
          ▼
@@ -57,7 +60,7 @@ Security, privacy, and anonymity are first-class design constraints — not feat
   └─────────────┘    (there is no stale-answer fallback mode)
 ```
 
-**Pipeline order is an invariant.** The full gate sequence is: rate-limit → opcode/class → schedule/zones → authority → rewrite → blocklist → resolver. This order must never change. The rate limiter runs first so a flood from one source IP costs only a hash lookup + token-bucket update. The opcode/class gates reject malformed requests immediately. The policy gates (schedule block windows, zones_allowed) run before the authority so quarantined clients never even probe the resolver. Rewrites sit after the authority (so the daemon's own zones always win) and before the blocklist/resolver (so an operator pin/blackhole takes precedence). Each gate is a named method on `DnsHandler` returning `Option<Reply>`; the first to fire wins.
+**Pipeline order is an invariant.** The full gate sequence is: rate-limit → opcode → EDNS-version (BADVERS) → ANY-refusal → class → schedule/zones → authority → rewrite → blocklist → resolver. This order must never change. The rate limiter runs first so a flood from one source IP costs only a hash lookup + token-bucket update. The opcode/class gates reject malformed requests immediately. The policy gates (schedule block windows, zones_allowed) run before the authority so quarantined clients never even probe the resolver. Rewrites sit after the authority (so the daemon's own zones always win) and before the blocklist/resolver (so an operator pin/blackhole takes precedence). Each gate is a named method on `DnsHandler` returning `Option<Reply>`; the first to fire wins.
 
 ## Crate responsibilities
 
