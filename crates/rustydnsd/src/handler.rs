@@ -2987,6 +2987,63 @@ mod tests {
             Ok(Err(e)) => panic!("socket error on multi-question query: {e}"),
         }
 
+        // Liveness: normal EDNS-less service continues afterwards.
+        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_axfr_against_authoritative_zone_leaks_nothing() {
+        // Classic recon probe: AXFR (qtype 252) against a name inside our
+        // AUTHORITY zone. We are not a master server — RFC 5936 transfers
+        // are never served, so an attacker mapping the mesh/static zone
+        // gets nothing. Pinned observable: the response carries ZERO answer
+        // records (NODATA-shaped; NOTIMP/REFUSED would equally satisfy the
+        // no-leak property), regardless of the queried name being
+        // authoritative. Liveness leg keeps the daemon honest afterwards.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+        let mut msg = Message::new(0x4242, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query({
+            let mut q = Query::new();
+            q.set_name(ProtoName::from_ascii("router.mesh.").unwrap());
+            q.set_query_type(ProtoRecordType::AXFR);
+            q
+        });
+        let wire = msg.to_bytes().expect("encode");
+        client
+            .send_to(&wire, format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("response within budget")
+            .expect("recv");
+        let reply = Message::from_bytes(&buf[..n]).expect("decode");
+        assert!(
+            matches!(
+                reply.metadata.response_code,
+                ResponseCode::NoError | ResponseCode::NotImp | ResponseCode::Refused
+            ),
+            "unexpected rcode for AXFR probe: {:?}",
+            reply.metadata.response_code
+        );
+        assert!(
+            reply.answers.is_empty() && reply.authorities.is_empty(),
+            "an AXFR probe must never return zone data: {:?}",
+            reply.answers
+        );
+
         // Liveness: normal service continues afterwards.
         let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
@@ -2996,10 +3053,12 @@ mod tests {
     async fn udp_edns_version_mismatch_answers_badvers() {
         // RFC 6891 §6.1.3: a query advertising an EDNS0 version the server
         // does not support must be answered with BADVERS (rcode 16) — not
-        // silently accepted, not FORMERR'd, not ignored. hickory-server's
-        // catalog enforces this before our handler runs; this pin proves the
-        // guarantee survives through OUR listener stack, so a future
-        // transport/upgrade cannot silently start accepting (and
+        // silently accepted, not FORMERR'd, not ignored. NOTE: hickory
+        // 0.26's Catalog implements this, but our listener stack registers
+        // DnsHandler directly and bypasses the Catalog — the enforcement is
+        // OURS, via `gate_edns_version`. This pin proves the guarantee
+        // survives through OUR listener stack, so a future transport or
+        // framework change cannot silently start accepting (and
         // mis-handling) newer EDNS versions.
         let harness = build_harness(
             vec![static_a("router.mesh", "100.64.0.5")],
