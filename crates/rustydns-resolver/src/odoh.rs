@@ -64,7 +64,7 @@ use odoh_rs::{
 };
 use rustls_pki_types::CertificateDer;
 
-use rustydns_core::config::{DnsConfig, TlsVersion};
+use rustydns_core::config::{DnsConfig, TlsVersion, redact_url_credentials};
 
 use crate::{ResolveOutcome, filter_private_rdata, lookup_to_dns_records};
 
@@ -238,7 +238,10 @@ impl OdohHttp {
         let mut body = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| OdohError::Http(e.to_string()))?;
+            // PRIVACY: reqwest error text can embed the full request URL,
+            // credentials included — redact before it reaches logs.
+            let chunk =
+                chunk.map_err(|e| OdohError::Http(redact_url_credentials(&e.to_string())))?;
             if (body.len() as u64).saturating_add(chunk.len() as u64) > cap {
                 return Err(OdohError::Http(format!(
                     "{what} response exceeds {cap}-byte cap"
@@ -257,7 +260,7 @@ impl OdohHttp {
                     .get(configs_url)
                     .send()
                     .await
-                    .map_err(|e| OdohError::Http(e.to_string()))?;
+                    .map_err(|e| OdohError::Http(redact_url_credentials(&e.to_string())))?;
                 if !resp.status().is_success() {
                     return Err(OdohError::ConfigStatus(resp.status().as_u16()));
                 }
@@ -289,7 +292,7 @@ impl OdohHttp {
                     .body(body)
                     .send()
                     .await
-                    .map_err(|e| OdohError::Http(e.to_string()))?;
+                    .map_err(|e| OdohError::Http(redact_url_credentials(&e.to_string())))?;
                 if !resp.status().is_success() {
                     return Err(OdohError::RelayStatus(resp.status().as_u16()));
                 }
