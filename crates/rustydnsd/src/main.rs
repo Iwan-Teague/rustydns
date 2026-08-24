@@ -423,12 +423,19 @@ async fn main() -> Result<()> {
         config.blocklist.reload_interval_secs,
         shutdown.clone(),
     );
-    spawn_mesh_reload_loop(
-        authority.clone(),
-        metrics.clone(),
-        config.authority.poll_interval_secs,
-        shutdown.clone(),
-    );
+    // poll_interval_secs == 0 is the documented "SIGHUP-only" mode: no
+    // periodic polling, and never a zero-period tokio interval (which would
+    // panic).
+    if mesh_polling_enabled(config.authority.poll_interval_secs) {
+        spawn_mesh_reload_loop(
+            authority.clone(),
+            metrics.clone(),
+            config.authority.poll_interval_secs,
+            shutdown.clone(),
+        );
+    } else {
+        info!("authority.poll_interval_secs = 0 — bundle polling disabled; reload via SIGHUP");
+    }
 
     // Unified signal loop: SIGHUP reloads (blocklist + mesh + config hot
     // swaps + listener handover); SIGTERM/SIGINT ends the loop.
@@ -647,6 +654,13 @@ ENVIRONMENT:
                           Setting this opts in to deeper diagnostics —
                           qnames may appear at `debug` level."
     );
+}
+
+/// Whether the periodic mesh-bundle poll loop should run: `0` disables it
+/// (documented SIGHUP-only mode). Any non-zero value is the period in
+/// seconds.
+fn mesh_polling_enabled(poll_interval_secs: u64) -> bool {
+    poll_interval_secs > 0
 }
 
 fn spawn_blocklist_reload_loop(
