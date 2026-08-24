@@ -1876,24 +1876,61 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         |s: &String| -> Option<std::net::SocketAddr> { s.parse::<std::net::SocketAddr>().ok() };
     let plain_listens: Vec<std::net::SocketAddr> =
         cfg.server.listen.iter().filter_map(parse_addr).collect();
-    if let Some(dot) = cfg.server.dot_listen.as_ref().and_then(parse_addr)
-        && plain_listens.contains(&dot)
-    {
-        return Err(crate::RustyDnsError::Config(format!(
-            "server.dot_listen `{dot}` overlaps a server.listen address — plain DNS and \
-             DNS-over-TLS cannot share one port (connections would randomly land on either \
-             protocol); give DoT its own address"
-        )));
+
+    // TCP-family listeners must be mutually unique: plain DNS (per listen
+    // entry), DoT, DoH, and the metrics/health/queries HTTP server all bind
+    // SO_REUSEPORT TCP sockets, so an overlap makes the kernel deal every
+    // connection to a random role.
+    let mut tcp_addrs: Vec<(std::net::SocketAddr, &'static str)> =
+        plain_listens.iter().map(|a| (*a, "plain DNS")).collect();
+    if let Some(d) = cfg.server.dot_listen.as_ref().and_then(parse_addr) {
+        tcp_addrs.push((d, "DNS-over-TLS"));
     }
-    if let Some(doq) = cfg.server.doq_listen.as_ref().and_then(parse_addr)
-        && plain_listens.contains(&doq)
-    {
-        return Err(crate::RustyDnsError::Config(format!(
-            "server.doq_listen `{doq}` overlaps a server.listen address — plain DNS and \
-             DNS-over-QUIC cannot share one UDP port (datagrams would randomly land on \
-             either protocol); give DoQ its own address"
-        )));
+    if let Some(d) = cfg.server.doh_listen.as_ref().and_then(parse_addr) {
+        tcp_addrs.push((d, "DNS-over-HTTPS"));
     }
+    if let Ok(m) = cfg.metrics.listen.parse::<std::net::SocketAddr>() {
+        tcp_addrs.push((m, "metrics"));
+    }
+    for i in 0..tcp_addrs.len() {
+        for j in (i + 1)..tcp_addrs.len() {
+            let (a_addr, a_role) = &tcp_addrs[i];
+            let (b_addr, b_role) = &tcp_addrs[j];
+            if a_addr == b_addr {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "{a_role} and {b_role} are both configured on {a_addr} — distinct roles                      cannot share one TCP port (SO_REUSEPORT would hand each connection to a                      random protocol); give each role its own address/port"
+                )));
+            }
+        }
+    }
+
+    // UDP family: plain DNS vs DoQ must not share an address either.
+    let udp_addrs: Vec<(std::net::SocketAddr, &'static str)> = plain_listens
+        .iter()
+        .map(|a| (*a, "plain DNS"))
+        .chain(
+            cfg.server
+                .doq_listen
+                .as_ref()
+                .and_then(parse_addr)
+                .map(|a| (a, "DNS-over-QUIC")),
+        )
+        .collect();
+    for i in 0..udp_addrs.len() {
+        for j in (i + 1)..udp_addrs.len() {
+            let (a_addr, a_role) = &udp_addrs[i];
+            let (b_addr, b_role) = &udp_addrs[j];
+            if a_addr == b_addr {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "{a_role} and {b_role} are both configured on {a_addr} — distinct roles \
+                     cannot share one UDP port; give each role its own address/port"
+                )));
+            }
+        }
+    }
+
+    // DoT (TCP) and DoQ (UDP) on the same address remain explicitly ALLOWED:
+    // different transports, legitimate common :853 deployment shape.
 
     // DoT requires cert + key
     if (cfg.server.dot_listen.is_some() || cfg.server.doq_listen.is_some())
@@ -2666,7 +2703,7 @@ mod tests {
         let mut cfg = baseline();
         cfg.server.listen = vec!["127.0.0.1:853".to_string()];
         cfg.server.dot_listen = Some("127.0.0.1:853".to_string());
-        assert_config_err(validate_config(&cfg), "overlaps a server.listen address");
+        assert_config_err(validate_config(&cfg), "cannot share one TCP port");
     }
 
     #[test]
@@ -2675,7 +2712,23 @@ mod tests {
         cfg.server.doq_listen = Some("0.0.0.0:53".to_string());
         // listen defaults already include a :53 entry? Be explicit:
         cfg.server.listen = vec!["0.0.0.0:53".to_string()];
-        assert_config_err(validate_config(&cfg), "overlaps a server.listen address");
+        assert_config_err(validate_config(&cfg), "cannot share one UDP port");
+    }
+
+    #[test]
+    fn doh_and_metrics_overlaps_rejected() {
+        // HTTP-family collisions: DoH vs plain DNS on one TCP port, and the
+        // metrics/health/queries server vs plain DNS — either overlap hands
+        // connections to a random role under SO_REUSEPORT.
+        let mut cfg = baseline();
+        cfg.server.doh_listen = Some("127.0.0.1:53".to_string());
+        cfg.server.listen = vec!["127.0.0.1:53".to_string()];
+        assert_config_err(validate_config(&cfg), "cannot share one TCP port");
+
+        let mut cfg = baseline();
+        cfg.metrics.listen = "127.0.0.1:53".parse().unwrap();
+        cfg.server.listen = vec!["127.0.0.1:53".to_string()];
+        assert_config_err(validate_config(&cfg), "cannot share one TCP port");
     }
 
     #[test]
