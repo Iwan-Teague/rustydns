@@ -218,6 +218,13 @@ pub struct RewriteRule {
     /// Name to rewrite. Exact match, or a `*.example.com` / `.example.com`
     /// wildcard suffix that matches all subdomains but not the apex.
     /// Normalised (lowercased, trailing dot handled) at load time.
+    ///
+    /// Precedence: the AUTHORITY stage runs first, so a rewrite on a name
+    /// that carries an authoritative answer (mesh bundle or static record)
+    /// never fires — and a rewrite on an in-zone name that is NOT yet
+    /// registered stops applying the moment a bundle adds it. Keep rewrites
+    /// outside your authoritative zones unless you specifically want this
+    /// fallback shape.
     pub name: String,
 
     /// Replacement IPv4/IPv6 address — synthesises an A (or AAAA) answer for
