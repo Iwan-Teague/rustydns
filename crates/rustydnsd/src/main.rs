@@ -2210,4 +2210,49 @@ mod tests {
         );
         assert!(forced_pub.ip().is_loopback());
     }
+
+    #[test]
+    fn dot_and_doq_tls_configs_advertise_distinct_alpn() {
+        // The DoT and DoQ listeners share ONE certificate pair; the ALPN
+        // advertisement is what keeps their protocol identities distinct.
+        // RFC 9250 §4.3 requires DoQ to offer exactly "doq"; RFC 7858
+        // requires nothing for DoT, and pinning a name there would break
+        // compliant clients — so the DoT config must stay ALPN-unrestricted
+        // (empty list). A copy-paste of the doq config into the DoT path
+        // (or a dedup into one shared TlsServerConfig) would silently
+        // change which clients can handshake on each port, so pin BOTH
+        // builders' exact contracts here. The wire-level enforcement —
+        // that a foreign-ALPN client fails the handshake against the live
+        // DoQ listener — is pinned e2e in
+        // tests/sighup_reload.rs::doq_listener_rejects_foreign_alpn_clients.
+        use crate::test_pem::{TEST_LEAF_CERT_PEM, TEST_LEAF_KEY_PEM};
+        let _ = tokio_rustls::rustls::crypto::CryptoProvider::install_default(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("leaf.pem");
+        let key_path = dir.path().join("leaf-key.pem");
+        std::fs::write(&cert_path, TEST_LEAF_CERT_PEM).expect("write cert pem");
+        std::fs::write(&key_path, TEST_LEAF_KEY_PEM).expect("write key pem");
+
+        let cfg = ServerConfig {
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
+            ..Default::default()
+        };
+
+        let dot = load_tls_config(&cfg).expect("DoT TLS config builds");
+        assert!(
+            dot.alpn_protocols.is_empty(),
+            "DoT must stay ALPN-unrestricted (RFC 7858), got {:?}",
+            dot.alpn_protocols
+        );
+
+        let doq = load_doq_tls_config(&cfg).expect("DoQ TLS config builds");
+        assert_eq!(
+            doq.alpn_protocols,
+            vec![b"doq".to_vec()],
+            "DoQ must advertise exactly RFC 9250's doq"
+        );
+    }
 }
