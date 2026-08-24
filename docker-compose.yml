@@ -12,7 +12,9 @@
 # Usage:
 #   1. Copy rustydns.example.toml to ./rustydns.toml and edit it.
 #   2. If you use the Rustynet mesh feature, drop the signed
-#      `mesh-zone.bin` and `mesh-zone.pub` into ./mesh/.
+#      `dns-zone.bundle` and its hex-encoded ed25519 verifier key
+#      `dns-zone-verifier.key` into ./mesh/ — these are the artifact names
+#      rustynetd writes and the paths the example config expects.
 #   3. `docker compose up -d`
 #
 # To upgrade later: `docker compose pull && docker compose up -d`.
@@ -59,12 +61,14 @@ services:
       - no-new-privileges:true
 
     # Mounts. Config is read-only; the mesh bundle directory is read-only
-    # because rustydnsd never writes to it (the publisher does, out of
-    # band). /var/lib/rustydns is a tiny tmpfs in case the daemon ever
-    # needs a writable working dir — currently unused.
+    # because rustydns never writes to it (rustynetd publishes out of band).
+    # Mounted at /var/lib/rustynet — the same paths the example config's
+    # mesh_zone_bundle_path / mesh_zone_verifier_key_path point to.
+    # /var/lib/rustydns is a tiny tmpfs in case the daemon ever needs a
+    # writable working dir — currently unused.
     volumes:
       - ./rustydns.toml:/etc/rustydns/rustydns.toml:ro
-      - ./mesh:/var/lib/rustydns/mesh:ro
+      - ./mesh:/var/lib/rustynet:ro
 
     # Compose-level healthcheck mirrors the one baked into the image so
     # `docker compose ps` shows accurate state. Override here if you've
