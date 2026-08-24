@@ -1913,6 +1913,36 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     // landing in the TLS accept loop and vice versa, intermittently. DoT
     // (TCP) and DoQ (UDP) on one address are different transports and
     // legitimately coexist.
+    /// Normalise an IP for overlap comparison: IPv4-mapped IPv6 collapses
+    /// onto its native v4 form.
+    fn norm_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+        match ip {
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => std::net::IpAddr::V4(v4),
+                None => std::net::IpAddr::V6(v6),
+            },
+            other => other,
+        }
+    }
+
+    /// True when two addresses on the SAME port have their traffic
+    /// arbitrarily interleaved by SO_REUSEPORT: identical addresses, or any
+    /// wildcard address against anything else in its reachable family. A
+    /// v6-unspecified socket binds dual-stack, so it competes for v4
+    /// destinations too; two SPECIFIC addresses in different families never
+    /// interact.
+    fn addrs_compete(a: std::net::IpAddr, b: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        let na = norm_ip(a);
+        let nb = norm_ip(b);
+        match (na, nb) {
+            (IpAddr::V4(x), IpAddr::V4(y)) => x == y || x.is_unspecified() || y.is_unspecified(),
+            (IpAddr::V6(x), IpAddr::V6(y)) => x == y || x.is_unspecified() || y.is_unspecified(),
+            (IpAddr::V6(x), IpAddr::V4(_)) => x.is_unspecified(),
+            (IpAddr::V4(_), IpAddr::V6(y)) => y.is_unspecified(),
+        }
+    }
+
     let parse_addr =
         |s: &String| -> Option<std::net::SocketAddr> { s.parse::<std::net::SocketAddr>().ok() };
     let plain_listens: Vec<std::net::SocketAddr> =
@@ -1937,9 +1967,15 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         for j in (i + 1)..tcp_addrs.len() {
             let (a_addr, a_role) = &tcp_addrs[i];
             let (b_addr, b_role) = &tcp_addrs[j];
-            if a_addr == b_addr {
+            if a_role == b_role {
+                continue; // same-role wildcard+specific pairs are deliberate
+            }
+            if a_addr.port() == b_addr.port() && addrs_compete(a_addr.ip(), b_addr.ip()) {
                 return Err(crate::RustyDnsError::Config(format!(
-                    "{a_role} and {b_role} are both configured on {a_addr} — distinct roles                      cannot share one TCP port (SO_REUSEPORT would hand each connection to a                      random protocol); give each role its own address/port"
+                    "{a_role} ({a_addr}) and {b_role} ({b_addr}) overlap on port {} — distinct \
+                     roles cannot share one TCP port (SO_REUSEPORT would hand each connection \
+                     to a random protocol); give each role its own address/port",
+                    a_addr.port()
                 )));
             }
         }
@@ -1961,10 +1997,14 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         for j in (i + 1)..udp_addrs.len() {
             let (a_addr, a_role) = &udp_addrs[i];
             let (b_addr, b_role) = &udp_addrs[j];
-            if a_addr == b_addr {
+            if a_role == b_role {
+                continue;
+            }
+            if a_addr.port() == b_addr.port() && addrs_compete(a_addr.ip(), b_addr.ip()) {
                 return Err(crate::RustyDnsError::Config(format!(
-                    "{a_role} and {b_role} are both configured on {a_addr} — distinct roles \
-                     cannot share one UDP port; give each role its own address/port"
+                    "{a_role} ({a_addr}) and {b_role} ({b_addr}) overlap on port {} — distinct \
+                     roles cannot share one UDP port; give each role its own address/port",
+                    a_addr.port()
                 )));
             }
         }
@@ -2782,6 +2822,45 @@ mod tests {
         cfg.metrics.listen = "127.0.0.1:53".parse().unwrap();
         cfg.server.listen = vec!["127.0.0.1:53".to_string()];
         assert_config_err(validate_config(&cfg), "cannot share one TCP port");
+    }
+
+    #[test]
+    fn wildcard_listen_vs_specific_doh_rejected() {
+        // THE review case: a wildcard plain-DNS bind and a loopback-specific
+        // DoH bind on the same port. Exact-address comparison misses it, but
+        // under SO_REUSEPORT the kernel deals each connection to a random
+        // socket — HTTP bytes into the DNS parser and vice versa.
+        let mut cfg = baseline();
+        cfg.server.listen = vec!["0.0.0.0:53".to_string()];
+        cfg.server.doh_listen = Some("127.0.0.1:53".to_string());
+        assert_config_err(validate_config(&cfg), "overlap on port 53");
+    }
+
+    #[test]
+    fn wildcard_metrics_vs_loopback_specific_rejected() {
+        let mut cfg = baseline();
+        cfg.metrics.listen = "127.0.0.1:53".parse().unwrap();
+        cfg.server.listen = vec!["0.0.0.0:53".to_string()];
+        assert_config_err(validate_config(&cfg), "overlap on port 53");
+    }
+
+    #[test]
+    fn ipv4_mapped_doh_vs_wildcard_v4_listen_rejected() {
+        // IPv4-mapped forms compete for the same traffic as their native v4.
+        let mut cfg = baseline();
+        cfg.server.listen = vec!["0.0.0.0:53".to_string()];
+        cfg.server.doh_listen = Some("[::ffff:127.0.0.1]:53".to_string());
+        assert_config_err(validate_config(&cfg), "overlap on port 53");
+    }
+
+    #[test]
+    fn same_role_wildcard_and_specific_plain_still_allowed() {
+        // Regression guard: two PLAIN DNS sockets on one port (wildcard +
+        // specific) are same-role — hickory serves DNS on both, so this
+        // dual-stack listing style must keep validating cleanly.
+        let mut cfg = baseline();
+        cfg.server.listen = vec!["0.0.0.0:53".to_string(), "127.0.0.1:53".to_string()];
+        validate_config(&cfg).expect("same-role plain entries must be allowed");
     }
 
     #[test]
