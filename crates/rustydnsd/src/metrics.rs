@@ -33,6 +33,7 @@ pub struct Metrics {
     resolver_failures_total: IntCounter,
     blocklist_reload_success_total: IntCounter,
     blocklist_reload_failure_total: IntCounter,
+    blocklist_reload_skipped_total: IntCounter,
     blocklist_entries: IntGauge,
     blocklist_heap_bytes: IntGauge,
     blocklist_last_reload: IntGauge,
@@ -122,6 +123,11 @@ impl Metrics {
             &registry,
             "rustydns_blocklist_reload_failure_total",
             "Failed blocklist reloads",
+        )?;
+        let blocklist_reload_skipped_total = register_counter(
+            &registry,
+            "rustydns_blocklist_reload_skipped_total",
+            "Blocklist fetch rounds skipped by the SIGHUP minimum-spacing guard",
         )?;
 
         let blocklist_entries = register_gauge(
@@ -234,6 +240,7 @@ impl Metrics {
             resolver_failures_total,
             blocklist_reload_success_total,
             blocklist_reload_failure_total,
+            blocklist_reload_skipped_total,
             blocklist_entries,
             blocklist_heap_bytes,
             blocklist_last_reload,
@@ -349,6 +356,12 @@ impl Metrics {
     pub fn mark_blocklist_reload_failure(&self) {
         self.blocklist_reload_failure_total.inc();
         self.set_blocklist_last_reload();
+    }
+
+    /// A SIGHUP fetch round skipped by the minimum-spacing guard. Deliberately
+    /// does NOT touch `blocklist_last_reload` — nothing was fetched.
+    pub fn mark_blocklist_reload_skipped(&self) {
+        self.blocklist_reload_skipped_total.inc();
     }
 
     /// Update gauges for blocklist state.
@@ -793,6 +806,29 @@ mod tests {
             "ANY-refusal metric missing or wrong value: {}",
             body.lines()
                 .filter(|l| l.contains("refused_any"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
+
+    #[tokio::test]
+    async fn blocklist_reload_skipped_metric_increments_and_renders() {
+        // The SIGHUP minimum-spacing guard must be observable: a skipped
+        // fetch round increments its own series (and deliberately does NOT
+        // touch blocklist_last_reload, since nothing was fetched).
+        let m = Arc::new(Metrics::new().unwrap());
+        m.mark_blocklist_reload_skipped();
+        m.mark_blocklist_reload_skipped();
+        let resp = metrics_handler(m.clone()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = std::str::from_utf8(&body).expect("utf-8 body");
+        assert!(
+            body.contains("rustydns_blocklist_reload_skipped_total 2"),
+            "skipped metric missing or wrong value: {}",
+            body.lines()
+                .filter(|l| l.contains("reload_skipped"))
                 .collect::<Vec<_>>()
                 .join(" | ")
         );

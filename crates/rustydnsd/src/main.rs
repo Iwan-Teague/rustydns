@@ -1095,10 +1095,28 @@ async fn run_signal_loop(
         };
         let mut term = signal(SignalKind::terminate()).ok();
 
+        // CDN-hammering guard for the SIGHUP path: the periodic blocklist
+        // reload enforces >= 300s between fetch rounds; without a floor
+        // here, a flapping config-management system or logrotate script
+        // re-fetching per signal hammers every source. The first SIGHUP is
+        // always allowed.
+        let mut last_fetch_round = tokio::time::Instant::now() - MIN_SIGHUP_FETCH_SPACING;
+
         loop {
             tokio::select! {
                 _ = hup.recv() => {
-                    handle_sighup(active, handler, startup_config, loader, engine, authority, metrics, config_path).await;
+                    handle_sighup(
+                        active,
+                        handler,
+                        startup_config,
+                        loader,
+                        engine,
+                        authority,
+                        metrics,
+                        config_path,
+                        &mut last_fetch_round,
+                    )
+                    .await;
                 }
                 _ = tokio::signal::ctrl_c() => break,
                 _ = async {
@@ -1140,21 +1158,37 @@ async fn handle_sighup(
     authority: &Arc<Authority>,
     metrics: &Arc<Metrics>,
     config_path: &std::path::Path,
+    last_fetch_round: &mut tokio::time::Instant,
 ) {
     info!("SIGHUP received — reloading blocklists, mesh-zone bundle, and config");
 
-    match loader.reload(engine).await {
-        Ok(summary) => {
-            if summary.loaded_sources == 0 {
-                metrics.mark_blocklist_reload_failure();
-            } else {
-                metrics.mark_blocklist_reload_success();
+    // CDN-hammering guard (AGENTS.md applies the same rationale to the
+    // periodic path's >= 300s floor): a rapid SIGHUP stream must not turn
+    // into one full source re-fetch per signal. Only the FETCH round is
+    // spaced; mesh verification, config parsing, and listener reconciliation
+    // below still run every time.
+    let now = tokio::time::Instant::now();
+    if now.duration_since(*last_fetch_round) < MIN_SIGHUP_FETCH_SPACING {
+        info!(
+            "SIGHUP: skipping blocklist fetch round (minimum spacing not elapsed); sources \
+             unchanged since the last fetch"
+        );
+        metrics.mark_blocklist_reload_skipped();
+    } else {
+        *last_fetch_round = now;
+        match loader.reload(engine).await {
+            Ok(summary) => {
+                if summary.loaded_sources == 0 {
+                    metrics.mark_blocklist_reload_failure();
+                } else {
+                    metrics.mark_blocklist_reload_success();
+                }
+                metrics.set_blocklist_state(engine.entry_count(), engine.heap_bytes());
             }
-            metrics.set_blocklist_state(engine.entry_count(), engine.heap_bytes());
-        }
-        Err(e) => {
-            metrics.mark_blocklist_reload_failure();
-            warn!(error = %e, "blocklist reload failed");
+            Err(e) => {
+                metrics.mark_blocklist_reload_failure();
+                warn!(error = %e, "blocklist reload failed");
+            }
         }
     }
     match authority.reload_mesh() {
@@ -1478,6 +1512,12 @@ fn metrics_listen_addr(metrics: &MetricsConfig) -> Result<SocketAddr> {
 /// which panics at serve time ("Overlapping method route") — fatal under the
 /// release profile's `panic = "abort"`.
 const RESERVED_METRICS_PATHS: [&str; 2] = ["/health", "/queries"];
+
+/// Minimum spacing between SIGHUP-triggered blocklist fetch rounds. The
+/// periodic reload path enforces >= 300s (reload_interval_secs floor) for the
+/// same reason; SIGHUP is a force-refresh, but a flapping automation loop
+/// must not re-fetch every source per signal.
+const MIN_SIGHUP_FETCH_SPACING: tokio::time::Duration = tokio::time::Duration::from_secs(60);
 
 /// Normalise `metrics.path` (trim, ensure a leading slash, default
 /// `/metrics`) and reject paths that collide with the reserved `/health` and
