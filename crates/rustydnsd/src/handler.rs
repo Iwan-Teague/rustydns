@@ -1088,7 +1088,7 @@ mod tests {
         UpstreamConfig,
     };
 
-    use super::{name_in_any_zone, rcode_metric_label};
+    use super::{build_policy_map, name_in_any_zone, rcode_metric_label};
     use rustydns_resolver::Resolver;
 
     use crate::handler::DnsHandler;
@@ -4849,6 +4849,42 @@ mod tests {
         // exercise that path through this helper but the predicate
         // returns false for "matches nothing".
         assert!(!name_in_any_zone("anything", &[]));
+    }
+
+    #[test]
+    fn policy_v6_matching_is_exact_no_prefix_fallback() {
+        // Documents the deliberate IPv6 semantics (see the NodePolicy::
+        // client_ip doc in rustydns-core): entries match the EXACT /128
+        // source address only. A host rotating its SLAAC interface
+        // identifier intentionally falls back to the unrestricted default
+        // policy rather than inheriting its old entry's restrictions — and,
+        // critically, a PERMISSIVE field like blocklist_bypass must never
+        // leak to the rest of its /64 via prefix matching (that direction
+        // would be privilege escalation). The rotation trade-off is spelled
+        // out in the config docs and tracked for the NodeId path.
+        let policies = vec![NodePolicy {
+            node_id: None,
+            client_ip: Some("2001:db8:1:2::10".to_string()),
+            blocklist_bypass: true,
+            zones_allowed: vec!["internal.lan.".to_string()],
+            log_all_queries: false,
+            block_windows: Vec::new(),
+            blocklist_group: None,
+        }];
+        let map = build_policy_map(&policies);
+
+        let exact: std::net::IpAddr = "2001:db8:1:2::10".parse().unwrap();
+        let entry = map.get(&exact).expect("exact /128 entry must match itself");
+        assert!(!entry.zones_allowed.is_empty());
+        assert!(entry.blocklist_bypass);
+
+        // Rotated interface identifier → different /128 → deliberately NO
+        // policy (no prefix fallback in either direction).
+        let rotated: std::net::IpAddr = "2001:db8:1:2::dead".parse().unwrap();
+        assert!(
+            !map.contains_key(&rotated),
+            "prefix fallback would over-apply blocklist_bypass to the whole link"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
