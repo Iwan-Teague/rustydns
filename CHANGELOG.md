@@ -174,6 +174,14 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Security
 
+- **EDNS version mismatch now answered with BADVERS (RFC 6891 §6.1.3).**
+  A query advertising EDNS0 version > 0 previously got a bare SERVFAIL:
+  hickory-server's BADVERS handling lives in its zone-handler `Catalog`,
+  which rustydns's listener stack does not use. A new pipeline gate answers
+  extended rcode 16 (BADVERS) on every transport, and all outgoing response
+  OPT records now advertise our version (0) instead of echoing a request
+  version we do not implement (payload clamp unchanged). Pinned end-to-end
+  per transport front door with liveness assertions.
 - **Adversarial self-review pins (Aug 2026).** Mutation-tested hardening
   added across the attack surface:
   - Name decompression: hostile pointer cycles pinned at every decode seam
