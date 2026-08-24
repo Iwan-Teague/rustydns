@@ -103,7 +103,12 @@ The most widely used format. Lines starting with `#` are comments. The first fie
   names must be supplied in their punycode (`xn--…`) form, which is how real
   DNS queries arrive; a raw UTF-8 label could never match and is dead weight.
 - No empty labels (consecutive dots)
-- Entries failing validation are silently skipped
+- **Single-label / TLD-level entries are skipped** with a warning (e.g. a
+  hosts line containing bare `com`). A one-line TLD entry from a single
+  compromised source would otherwise block every domain under that TLD
+  fleet-wide — the same rationale as the allowlist guard below, opposite
+  direction. Entries failing the other validation rules are silently
+  skipped.
 
 **Community sources using this format:**
 - [StevenBlack/hosts](https://github.com/StevenBlack/hosts) — 100k+ entries
@@ -160,6 +165,8 @@ safe.example-ads.com  CNAME  rpz-passthru.
 `||domain^` in AdGuard blocks the apex AND all subdomains. rustydns models this as both an `Exact("domain")` and a `WildcardParent("domain")` entry.
 
 **URL path rules are skipped:** `||cdn.example.com/ads^` contains a path component and is skipped — rustydns works at the domain level, not the URL level.
+
+**Single-label / TLD-level wildcards are skipped:** `||com^` would block every domain under a TLD from one source line. Same >= 2-label guard as the allowlist and rewrite entries — the line warns and contributes nothing.
 
 **`@@||domain^` allowlist entries** are subject to the same trusted-source restriction as RPZ passthru entries.
 
