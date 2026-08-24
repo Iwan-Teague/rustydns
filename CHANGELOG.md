@@ -174,6 +174,24 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Security
 
+- **Adversarial self-review pins (Aug 2026).** Mutation-tested hardening
+  added across the attack surface:
+  - Name decompression: hostile pointer cycles pinned at every decode seam
+    (DoH POST/GET, ODoH plaintext, plain-upstream replies, daemon UDP) with
+    bounded-work budgets, plus a prior-pointer overlap trap proven to hit
+    hickory's `LabelOverlapsWithOther` at decoder level — exercising the
+    recursive-follow guards no hop-1 test reaches.
+  - DoQ/DoT protocol separation: a foreign-ALPN client fails its handshake
+    against the live DoQ port; both TLS config builders' exact ALPN contracts
+    pinned (`doq` exactly; DoT unrestricted).
+  - Multi-question UDP datagrams (QDCOUNT=2, differential authority-vs-
+    blocked questions): FORMERR'd by hickory 0.26, never answered from the
+    second question; daemon liveness asserted.
+  - SIGHUP metrics rebinding must route through the loopback-forcing choke
+    point (public/wildcard/v4-mapped listens land forced); `--validate-config`
+    nonzero-exit contract pinned for the systemd ExecStartPre gate.
+  - Duplicate `?dns=` parameters reject with 400 before DNS parsing
+    (axum 0.8 / serde_urlencoded behaviour, empirically confirmed).
 - **`--print-config` no longer prints URL credentials.** The `Secret`
   wrapper existed but was wired to no config field, so the resolved-config
   dump rendered upstream DoH URLs with embedded `user:pass@` userinfo and
