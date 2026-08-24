@@ -160,30 +160,50 @@ impl BlocklistLoader {
                 }
             }
         }
-        // Concurrent fetches: startup and SIGHUP block on this round, so
-        // serial awaiting would multiply one slow/dead source's timeout by
-        // the source count — minutes of no-DNS on the network's resolver.
-        // Parallel bounds the whole round by the single-source timeout.
-        let mut futs = Vec::with_capacity(remote.len());
-        for url in remote {
-            let trust = if trusted_rpz.iter().any(|t| t == url) {
-                BlocklistSource::Trusted
-            } else {
-                BlocklistSource::Untrusted
-            };
-            futs.push(async move { (url.clone(), trust, self.fetch_remote(url).await) });
-        }
-        let results = futures_util::future::join_all(futs).await;
+        // Concurrent fetches, BOUNDED. Startup and SIGHUP block on this
+        // round, so serial awaiting would multiply one slow/dead source's
+        // timeout by the source count — while fully unbounded concurrency
+        // (join_all) multiplies PEAK MEMORY instead: every in-flight body
+        // buffers up to max_fetch_bytes at once. A small window keeps
+        // typical multi-source reloads fast without meaningfully raising
+        // the resident footprint on Pi-class targets (512 MiB total, 30 MiB
+        // idle-RSS goal).
+        const MAX_CONCURRENT_FETCHES: usize = 4;
 
-        for (url, trust, res) in results {
+        let mut results: Vec<(
+            usize,
+            String,
+            BlocklistSource,
+            Result<String, RustyDnsError>,
+        )> = futures_util::stream::iter(remote.iter().cloned().enumerate())
+            .map(|(idx, url)| {
+                let trust = if trusted_rpz.iter().any(|t| t.as_str() == url.as_str()) {
+                    BlocklistSource::Trusted
+                } else {
+                    BlocklistSource::Untrusted
+                };
+                async move {
+                    let res = self.fetch_remote(&url).await;
+                    (idx, url, trust, res)
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENT_FETCHES)
+            .collect()
+            .await;
+
+        // Restore source-list order so summaries and engine unions stay
+        // deterministic run-to-run despite completion-order delivery.
+        results.sort_by_key(|(idx, _, _, _)| *idx);
+
+        for (_, url, trust, res) in &results {
             match res {
-                Ok(content) => sources.push((content, trust)),
+                Ok(content) => sources.push((content.clone(), *trust)),
                 Err(e) => {
                     failed += 1;
                     // PRIVACY: source URLs may embed tokens; the error text
                     // already carries a redacted form of the URL.
                     warn!(
-                        url = %redact_url_credentials(&url),
+                        url = %redact_url_credentials(url),
                         error = %e,
                         "failed to fetch blocklist source"
                     );
