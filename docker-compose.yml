@@ -68,13 +68,21 @@ services:
 
     # Compose-level healthcheck mirrors the one baked into the image so
     # `docker compose ps` shows accurate state. Override here if you've
-    # moved the metrics port in rustydns.toml.
+    # moved the metrics port in rustydns.toml. debian-slim ships no
+    # wget/curl, so the probe uses bash's built-in /dev/tcp (bash and grep
+    # are Essential packages present even in -slim).
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9153/health"]
+      test:
+        [
+          "CMD",
+          "bash",
+          "-c",
+          'exec 3<>/dev/tcp/127.0.0.1/9153; printf "GET /health HTTP/1.0\r\n\r\n" >&3; grep -q "200 OK" <&3',
+        ]
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 15s
 
     # Conservative logging cap. Without this, journald/json-file can
     # eat the disk if the daemon ever ends up in a tight log loop

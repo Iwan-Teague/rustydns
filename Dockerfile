@@ -84,5 +84,10 @@ CMD ["--config", "/etc/rustydns/rustydns.toml"]
 # scraping at a sidecar that connects to `localhost:9153`.
 EXPOSE 53/udp 53/tcp 853 8053
 
-HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-    CMD wget -q --spider http://127.0.0.1:9153/health || exit 1
+# debian:bookworm-slim deliberately ships no wget/curl, so the probe uses
+# bash's built-in /dev/tcp — bash and grep are Essential packages present
+# even in -slim. /health returns 503 until every configured listener is
+# bound, so this gates on real readiness rather than process liveness;
+# start-period keeps slow blocklist fetches from counting as failures.
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 --start-period=15s \
+    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/9153; printf "GET /health HTTP/1.0\r\n\r\n" >&3; grep -q "200 OK" <&3'
