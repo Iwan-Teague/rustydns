@@ -119,8 +119,7 @@ impl BlocklistState {
         // Production qnames carry their trailing dot (canonical_qname keeps
         // it); strip exactly one so $-anchored operator patterns behave as
         // written instead of silently never matching.
-        let domain_no_dot = domain.strip_suffix('.').unwrap_or(domain);
-        self.regex_rules.is_match(domain_no_dot)
+        self.regex_rules.is_match(domain)
     }
 }
 
