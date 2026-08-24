@@ -331,6 +331,31 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_window_day_attribution_is_by_local_calendar_day() {
+        // Subtle semantic worth pinning: a wrapping window (22:00-07:00)
+        // applies to each LOCAL CALENDAR DAY independently. The late-evening
+        // portion belongs to the day whose date it starts on, and the
+        // early-morning portion to the day it spills into.
+        //
+        // Consequence operators must understand: ["sat","sun"] blocks
+        // Saturday and Sunday mornings AND Saturday/Sunday evenings, but
+        // FRIDAY 23:00 is a Friday -> ALLOWED. There is an inherent gap on
+        // the night bridging into the first configured day.
+        let s = BlockSchedule::compile(&[win(&["sat", "sun"], Some("22:00"), Some("07:00"), 0)])
+            .unwrap();
+        // MON_NOON_UTC is Monday 12:00; offsets are in minutes from it.
+        // FRIDAY 23:00 = Mon +4d +11h: calendar Friday, evening portion of
+        // a non-configured day -> ALLOWED (the documented gap).
+        assert!(!s.is_blocked_at(at(MON_NOON_UTC, 4 * 24 * 60 + 11 * 60)));
+        // SATURDAY 01:00 = Mon +4d +13h: calendar Saturday, inside the
+        // wrapped early-hours portion -> blocked.
+        assert!(s.is_blocked_at(at(MON_NOON_UTC, 4 * 24 * 60 + 13 * 60)));
+        // SUNDAY 06:30 = Mon +5d +18h30m: calendar Sunday, still inside the
+        // wrapped portion -> blocked.
+        assert!(s.is_blocked_at(at(MON_NOON_UTC, 5 * 24 * 60 + 18 * 60 + 30)));
+    }
+
+    #[test]
     fn out_of_range_offset_rejected() {
         let err = BlockSchedule::compile(&[win(&[], None, None, 2000)]).unwrap_err();
         assert!(err.contains("out of range"), "{err}");
