@@ -208,9 +208,22 @@ does this) which works even without file caps.
 
 **`/health` returns 503**
 
-The mesh bundle is missing, malformed, or older than `max_age_secs`.
-Check `/var/lib/rustydns/mesh/` on the host and confirm the publisher
-is still running.
+503 means the readiness flag has not flipped yet: not every configured
+listener is bound. It is transient during startup — if it persists,
+`docker compose logs rustydnsd` shows the failing bind (port already in
+use, missing TLS material, invalid config value, …). Note that `/health`
+is liveness ONLY by design: mesh-bundle staleness deliberately does not
+flip it (see docs/operator-endpoints.md).
+
+**Mesh names don't resolve (daemon otherwise healthy)**
+
+A missing, stale, or signature-failed bundle drops the authority to
+static-only mode with a warn ("mesh bundle could not be loaded", later
+"mesh zone reload failed") — the last-good snapshot keeps serving until a
+good reload succeeds. The tell is `rustydns_mesh_zone_last_reload_seconds`
+going stale on /metrics plus `rustydns_mesh_zone_reload_failure_total`
+climbing. Check that ./mesh/ contains dns-zone.bundle +
+dns-zone-verifier.key matching the paths in your config.
 
 **`SERVFAIL` on every query**
 
