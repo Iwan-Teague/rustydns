@@ -699,6 +699,12 @@ fn build_http_client(
         .use_rustls_tls()
         .https_only(true)
         .min_tls_version(min)
+        // Every redirect hop hands the client IP *and* the oblivious
+        // ciphertext to another endpoint — the exposure set grows with each
+        // hop. reqwest's default of 10 is far beyond anything legitimate
+        // relay/target load-balancing needs; three matches the blocklist
+        // loader's cap.
+        .redirect(reqwest::redirect::Policy::limited(3))
         .timeout(timeout);
     for root in test_roots {
         let cert = reqwest::Certificate::from_der(root.as_ref())
