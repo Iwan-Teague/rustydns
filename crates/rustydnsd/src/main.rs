@@ -2003,6 +2003,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sighup_metrics_rebind_cannot_land_on_non_loopback() {
+        // Wiring pin for the bind-safety invariant: reload_metrics_group
+        // must derive its address THROUGH metrics_listen_addr (the forcing
+        // choke point), never by re-parsing cfg.metrics.listen directly.
+        // A hostile or misconfigured SIGHUP config pointing the
+        // unauthenticated metrics endpoint at a public, wildcard, or
+        // v4-mapped address must be applied FORCED — loopback IP with the
+        // operator's port preserved. If a refactor bypasses the choke
+        // point, these legs fail because live_metrics records exactly what
+        // was bound.
+        let mut al = reload_test_listeners().await;
+
+        // Leg 1: explicit public IPv4.
+        let mut cfg = base_config();
+        cfg.metrics.listen = "203.0.113.9:9207".to_string();
+        al.reload_metrics_group(&cfg);
+        assert_eq!(
+            al.live_metrics,
+            Some("127.0.0.1:9207".parse().unwrap()),
+            "public IPv4 metrics listen must be forced to loopback on SIGHUP reload"
+        );
+
+        // Leg 2: wildcard IPv6 (an attempt to bind all interfaces).
+        let mut cfg = base_config();
+        cfg.metrics.listen = "[::]:9208".to_string();
+        al.reload_metrics_group(&cfg);
+        assert_eq!(
+            al.live_metrics,
+            Some("[::1]:9208".parse().unwrap()),
+            "wildcard IPv6 metrics listen must be forced to ::1 on SIGHUP reload"
+        );
+
+        // Leg 3: v4-mapped public IPv6 (the endrun form from the startup
+        // pin) — is_loopback() is false for it, so it must hit the forcing
+        // branch here too.
+        let mut cfg = base_config();
+        cfg.metrics.listen = "[::ffff:203.0.113.9]:9209".to_string();
+        al.reload_metrics_group(&cfg);
+        assert_eq!(
+            al.live_metrics,
+            Some("[::1]:9209".parse().unwrap()),
+            "v4-mapped metrics listen must be forced to ::1 on SIGHUP reload"
+        );
+    }
+
+    #[tokio::test]
     async fn graceful_shutdown_honours_deadline_and_cancels_children() {
         use std::time::Instant;
         // Bounded shutdown contract, three legs:
@@ -2111,6 +2157,21 @@ mod tests {
         };
         let passthrough = metrics_listen_addr(&looped).expect("loopback parse");
         assert_eq!(passthrough.ip().to_string(), "127.0.0.1");
+
+        // Any 127.0.0.0/8 address is genuinely loopback and must pass
+        // through UNFORCED — over-forcing (e.g. tightening the check to an
+        // exact == 127.0.0.1 match) would silently rewrite valid operator
+        // configs onto a different loopback address.
+        let looped_other_octet = rustydns_core::config::MetricsConfig {
+            listen: "127.250.250.1:9153".to_string(),
+            ..Default::default()
+        };
+        let passthrough8 = metrics_listen_addr(&looped_other_octet).expect("/8 parse");
+        assert_eq!(
+            passthrough8.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 250, 250, 1)),
+            "the rest of 127.0.0.0/8 must pass through unforced"
+        );
 
         // The default posture is already safe.
         let default_addr = metrics_listen_addr(&rustydns_core::config::MetricsConfig::default())
