@@ -2921,16 +2921,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn udp_multi_question_query_never_answers_the_second_question() {
-        // Multi-question messages are a classic parser-confusion vector
-        // (RFC 1035 technically allows QDCOUNT>0; resolvers implement
-        // exactly-one-question semantics). Differential construction: Q1 =
-        // an AUTHORITY name (must answer NoError + A) and Q2 = a BLOCKED
-        // name (any pipeline stage that looked at Q2 would answer
-        // NXDOMAIN). The pinned contract: the daemon responds with at most
-        // one datagram, its rcode is NOT derived from the second question,
-        // any served answer references only the FIRST question — or the
-        // datagram is rejected/dropped outright — and the daemon stays
-        // live afterwards.
+        // Multi/absent-question datagrams are a classic parser-confusion
+        // vector: RFC 1035 technically allows QDCOUNT>0, resolvers implement
+        // exactly-one-question semantics, and QDCOUNT=0 must not index an
+        // empty query list. Differential construction makes second-question
+        // processing observable: Q1 is an AUTHORITY name (answerable), Q2 a
+        // BLOCKED name (NXDOMAIN if ever consulted).
         let harness = build_harness(
             vec![static_a("router.mesh", "100.64.0.5")],
             "0.0.0.0 ads.second.net\n",
@@ -2940,52 +2936,68 @@ mod tests {
         .await;
         let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
 
-        let mut wire = vec![0x77, 0x88, 0x01, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0]; // QDCOUNT=2
+        // Family legs: QDCOUNT=2 (differential questions) and QDCOUNT=0
+        // (empty question section) — both are shapes a naive parser mishandles
+        // (answering question two, or indexing an empty query list).
+        let mut loop_q = vec![0x51, 0x12, 0x01, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0];
         // Q1: router.mesh. A IN (authority zone — answerable).
-        wire.extend_from_slice(b"\x06router\x04mesh\x00");
-        wire.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        loop_q.extend_from_slice(b"\x06router\x04mesh\x00");
+        loop_q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
         // Q2: ads.second.net. A IN (blocked — NXDOMAIN if ever processed).
-        wire.extend_from_slice(b"\x03ads\x06second\x03net\x00");
-        wire.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        loop_q.extend_from_slice(b"\x03ads\x06second\x03net\x00");
+        loop_q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
 
-        client
-            .send_to(&wire, format!("127.0.0.1:{}", harness.port))
-            .await
-            .expect("send");
+        let empty_q = {
+            let mut w = vec![0x51, 0x13, 0x01, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0]; // QDCOUNT=0
+            w.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // orphan A IN
+            w
+        };
 
-        let mut buf = [0u8; 512];
-        match tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await {
-            // Silence satisfies the contract (drop).
-            Err(_) => {}
-            Ok(Ok((n, _))) => {
-                if let Ok(msg) = Message::from_bytes(&buf[..n]) {
-                    match msg.metadata.response_code {
-                        // Rejection path: hickory's request_info() treats a
-                        // multi-question message as malformed → FORMERR.
-                        ResponseCode::FormErr => {}
-                        // First-question path: only Q1 may drive the answer.
-                        ResponseCode::NoError => {
-                            for answer in &msg.answers {
-                                let owner = answer.name.to_string().to_ascii_lowercase();
-                                assert!(
-                                    owner.starts_with("router.mesh"),
-                                    "answers must belong to the FIRST question only, got owner {owner}"
-                                );
-                                assert!(
-                                    !owner.contains("ads.second"),
-                                    "second question leaked into the answer section"
-                                );
-                            }
+        for (label, wire) in [
+            ("QDCOUNT=2 differential", loop_q),
+            ("QDCOUNT=0 empty", empty_q),
+        ] {
+            client
+                .send_to(&wire, format!("127.0.0.1:{}", harness.port))
+                .await
+                .expect("send");
+
+            let mut buf = [0u8; 512];
+            match tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await {
+                // Silence satisfies the contract (drop).
+                Err(_) => {}
+                Ok(Ok((n, _))) => {
+                    let reply = Message::from_bytes(&buf[..n]);
+                    if let Ok(msg) = reply {
+                        if msg.metadata.response_code == ResponseCode::FormErr {
+                            continue; // rejected: never an outcome from Q1 or Q2
                         }
-                        other => panic!(
-                            "unexpected rcode {other:?}: a multi-question datagram must be \
-                             FORMERR'd or answered for its FIRST question only — never serve \
-                             an outcome derived from the SECOND question"
-                        ),
+                        assert_eq!(
+                            msg.metadata.response_code,
+                            ResponseCode::NoError,
+                            "{label}: only a first-question answer may follow NoError"
+                        );
+                        for answer in &msg.answers {
+                            let owner = answer.name.to_string().to_ascii_lowercase();
+                            assert!(
+                                owner.starts_with("router.mesh"),
+                                "{label}: answer must belong to the FIRST question, got {owner}"
+                            );
+                            assert!(
+                                !owner.contains("ads.second"),
+                                "{label}: second question leaked into the answers"
+                            );
+                        }
+                        assert!(
+                            !msg.answers.is_empty(),
+                            "{label}: a first-question NoError must carry its authority A"
+                        );
+                    } else if let Err(e) = reply {
+                        panic!("{label}: undecodable reply is neither silence nor an answer: {e}");
                     }
                 }
+                Ok(Err(e)) => panic!("{label}: socket error {e}"),
             }
-            Ok(Err(e)) => panic!("socket error on multi-question query: {e}"),
         }
 
         // Liveness: normal EDNS-less service continues afterwards.
