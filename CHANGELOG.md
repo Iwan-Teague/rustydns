@@ -174,6 +174,12 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Security
 
+- **TLD guard extended to BLOCK entries.** The allowlist has always refused
+  bare-TLD entries; the block side did not. A single `||com^` line from one
+  compromised or buggy blocklist source blackholed every .com domain
+  fleet-wide via the wildcard-parent matcher. All four block-entry parse
+  sites now route through a >= 2-label guard; skipped entries warn naming
+  the domain.
 - **EDNS version mismatch now answered with BADVERS (RFC 6891 §6.1.3).**
   A query advertising EDNS0 version > 0 previously got a bare SERVFAIL:
   hickory-server's BADVERS handling lives in its zone-handler `Catalog`,
