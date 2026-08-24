@@ -2897,6 +2897,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn udp_multi_question_query_never_answers_the_second_question() {
+        // Multi-question messages are a classic parser-confusion vector
+        // (RFC 1035 technically allows QDCOUNT>0; resolvers implement
+        // exactly-one-question semantics). Differential construction: Q1 =
+        // an AUTHORITY name (must answer NoError + A) and Q2 = a BLOCKED
+        // name (any pipeline stage that looked at Q2 would answer
+        // NXDOMAIN). The pinned contract: the daemon responds with at most
+        // one datagram, its rcode is NOT derived from the second question,
+        // any served answer references only the FIRST question — or the
+        // datagram is rejected/dropped outright — and the daemon stays
+        // live afterwards.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "0.0.0.0 ads.second.net\n",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+        let mut wire = vec![0x77, 0x88, 0x01, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0]; // QDCOUNT=2
+        // Q1: router.mesh. A IN (authority zone — answerable).
+        wire.extend_from_slice(b"\x06router\x04mesh\x00");
+        wire.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        // Q2: ads.second.net. A IN (blocked — NXDOMAIN if ever processed).
+        wire.extend_from_slice(b"\x03ads\x06second\x03net\x00");
+        wire.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+        client
+            .send_to(&wire, format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+
+        let mut buf = [0u8; 512];
+        match tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await {
+            // Silence satisfies the contract (drop).
+            Err(_) => {}
+            Ok(Ok((n, _))) => {
+                if let Ok(msg) = Message::from_bytes(&buf[..n]) {
+                    match msg.metadata.response_code {
+                        // Rejection path: hickory's request_info() treats a
+                        // multi-question message as malformed → FORMERR.
+                        ResponseCode::FormErr => {}
+                        // First-question path: only Q1 may drive the answer.
+                        ResponseCode::NoError => {
+                            for answer in &msg.answers {
+                                let owner = answer.name.to_string().to_ascii_lowercase();
+                                assert!(
+                                    owner.starts_with("router.mesh"),
+                                    "answers must belong to the FIRST question only, got owner {owner}"
+                                );
+                                assert!(
+                                    !owner.contains("ads.second"),
+                                    "second question leaked into the answer section"
+                                );
+                            }
+                        }
+                        other => panic!(
+                            "unexpected rcode {other:?}: a multi-question datagram must be \
+                             FORMERR'd or answered for its FIRST question only — never serve \
+                             an outcome derived from the SECOND question"
+                        ),
+                    }
+                }
+            }
+            Ok(Err(e)) => panic!("socket error on multi-question query: {e}"),
+        }
+
+        // Liveness: normal service continues afterwards.
+        let resp = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn blocked_domain_returns_nxdomain() {
         let harness = build_harness(
             vec![],
