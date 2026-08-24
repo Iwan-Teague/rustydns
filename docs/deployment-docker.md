@@ -135,7 +135,7 @@ docker compose ps
 #    container; reach it through docker exec or a sidecar in the
 #    same netns — see "Port exposure" above).
 docker compose exec rustydnsd bash -c 'exec 3<>/dev/tcp/127.0.0.1/9153; printf "GET /health HTTP/1.0\r\n\r\n" >&3; cat <&3'
-#   {"status":"ok","mesh_zone":{...}}
+#   {"status":"ok"}
 
 # 3. A normal name resolves through the daemon (host-side test).
 dig @127.0.0.1 example.com +short
