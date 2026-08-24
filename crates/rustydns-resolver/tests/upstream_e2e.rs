@@ -1989,6 +1989,46 @@ async fn cache_size_cap_evicts_oldest_under_unique_qname_pressure() {
 }
 
 #[tokio::test]
+async fn upstream_failover_when_primary_dies_mid_session() {
+    // High-availability contract: when TWO upstream resolvers are configured
+    // and the primary dies mid-session (socket closed, process killed),
+    // subsequent queries must transparently fail over to the secondary.
+    // This pins the core value proposition of configuring multiple upstreams.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // --- Phase 1: both alive, round-robin distribution ---
+    let mock_a =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 10), 300)])
+            .await;
+    let mock_b =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 11), 300)])
+            .await;
+
+    let mut pcfg = plain_config(&mock_a.addr_string());
+    pcfg.upstream.resolvers.push(mock_b.addr_string());
+    let cfg = pcfg;
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    // Warm up with a few queries through both upstreams.
+    let _ = resolver.resolve("warmup.example.org.", "A").await;
+    let _ = resolver.resolve("warmup.example.org.", "A").await;
+
+    // --- Phase 2: kill primary, verify failover to secondary ---
+    drop(mock_a); // kill the socket — packets to it are lost
+
+    // Give the kernel a moment to release the port.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Queries must still succeed via the surviving secondary.
+    let out = resolver.resolve("failover.example.org.", "A").await;
+    assert!(
+        out.is_ok(),
+        "query must succeed via secondary after primary death"
+    );
+}
+
+#[tokio::test]
 async fn mixed_case_lookup_hits_the_same_cache_entry() {
     // DNS names are case-insensitive (RFC 1035 §2.3.3): the cache must fold
     // name case, so Example.COM hits the example.com entry instead of
