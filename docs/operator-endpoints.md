@@ -196,15 +196,14 @@ Operators needing full fidelity use the opt-in on-disk NDJSON log.
 
 ### Looking up a specific domain
 
-The hash uses `ahash` keyed with the per-process salt. To check
-whether `ads.example.com` hit the resolver in the last N queries,
-you need to either:
+The hash uses `ahash` seeded with per-instance random keys (256 bits of
+OS entropy at startup). To check whether `ads.example.com` hit the
+resolver in the last N queries, you need to either:
 
 1. Run a small Rust helper on the same host that imports
-   `rustydnsd::query_log::QueryLog::hash_qname` and uses the daemon's
-   process-id-stable salt (only works while the daemon is running
-   and you can read its memory — usually not what an operator can
-   do casually).
+   `rustydnsd::query_log::QueryLog::hash_qname` against the running
+   daemon's key material (only possible while the daemon runs and you can
+   read its memory — usually not what an operator can do casually).
 2. Cross-reference `rcode` + `served_by` patterns instead. For most
    operational questions ("is the blocklist firing?" / "is anyone
    getting NXDOMAINs for mesh names?") the counts on `/metrics` are
