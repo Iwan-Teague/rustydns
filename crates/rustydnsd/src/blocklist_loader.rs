@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use rustydns_blocklist::{BlocklistEngine, BlocklistSource};
 use rustydns_core::RustyDnsError;
-use rustydns_core::config::BlocklistConfig;
+use rustydns_core::config::{BlocklistConfig, redact_url_credentials};
 
 /// Summary of a blocklist reload attempt.
 #[derive(Debug, Clone, Copy)]
@@ -166,7 +166,13 @@ impl BlocklistLoader {
                 Ok(content) => sources.push((content, trust)),
                 Err(e) => {
                     failed += 1;
-                    warn!(url = %url, error = %e, "failed to fetch blocklist source");
+                    // PRIVACY: source URLs may embed tokens; the error text
+                    // already carries a redacted form of the URL.
+                    warn!(
+                        url = %redact_url_credentials(url),
+                        error = %e,
+                        "failed to fetch blocklist source"
+                    );
                 }
             }
         }
@@ -197,21 +203,23 @@ impl BlocklistLoader {
     }
 
     async fn fetch_remote(&self, url: &str) -> Result<String, RustyDnsError> {
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| RustyDnsError::Blocklist(format!("fetch failed for {url}: {e}")))?;
+        // PRIVACY: source URLs may embed credential query parameters. Every
+        // error message below embeds the URL, and errors surface at warn
+        // level — emit only the redacted form.
+        let url_disp = redact_url_credentials(url);
+        let response =
+            self.client.get(url).send().await.map_err(|e| {
+                RustyDnsError::Blocklist(format!("fetch failed for {url_disp}: {e}"))
+            })?;
 
         if !response.status().is_success() {
             return Err(RustyDnsError::Blocklist(format!(
-                "fetch failed for {url}: HTTP {}",
+                "fetch failed for {url_disp}: HTTP {}",
                 response.status()
             )));
         }
 
-        read_body_capped(url, response, self.config.max_fetch_bytes).await
+        read_body_capped(&url_disp, response, self.config.max_fetch_bytes).await
     }
 }
 
@@ -223,7 +231,7 @@ impl BlocklistLoader {
 /// so it can be driven directly against a plain-HTTP loopback server in tests
 /// (the production client is `https_only` and refuses such URLs).
 async fn read_body_capped(
-    url: &str,
+    url_disp: &str,
     response: reqwest::Response,
     cap: u64,
 ) -> Result<String, RustyDnsError> {
@@ -231,18 +239,18 @@ async fn read_body_capped(
         && len > cap
     {
         return Err(RustyDnsError::Blocklist(format!(
-            "fetch failed for {url}: content-length {len} exceeds max_fetch_bytes {cap}"
+            "fetch failed for {url_disp}: content-length {len} exceeds max_fetch_bytes {cap}"
         )));
     }
 
     let mut body: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| RustyDnsError::Blocklist(format!("fetch failed for {url}: {e}")))?;
+        let chunk = chunk
+            .map_err(|e| RustyDnsError::Blocklist(format!("fetch failed for {url_disp}: {e}")))?;
         if (body.len() + chunk.len()) as u64 > cap {
             return Err(RustyDnsError::Blocklist(format!(
-                "fetch failed for {url}: response exceeds max_fetch_bytes {cap}"
+                "fetch failed for {url_disp}: response exceeds max_fetch_bytes {cap}"
             )));
         }
         body.extend_from_slice(&chunk);
