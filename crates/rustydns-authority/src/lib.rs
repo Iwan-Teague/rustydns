@@ -1305,6 +1305,45 @@ mod tests {
     }
 
     #[test]
+    fn rollback_with_inflated_nonce_still_rejected() {
+        // Tuple-ordering edge: generated_at DOMINATES the nonce. A bundle
+        // whose generated_at regresses (now-60) but whose nonce is inflated
+        // far past the current watermark's nonce must still be rejected —
+        // otherwise a confused or hostile publisher could launder a
+        // time-regressed bundle by bumping the counter.
+        let now = now_secs();
+        let (bundle_path, key_path) =
+            make_bundle_at(&[("router", "100.64.0.9")], "mesh", now, now + 600, 5);
+        let auth = auth_from(bundle_path.clone(), key_path);
+        assert_eq!(router_ip(&auth), "100.64.0.9");
+
+        // Candidate: generated_at regressed to now-60, nonce inflated to 999
+        // (watermark currently holds nonce=5). Signature and freshness are
+        // both valid; ONLY the watermark stops it.
+        let (older_high_nonce, _) = make_bundle_at(
+            &[("router", "100.64.0.1")],
+            "mesh",
+            now - 60,
+            now + 600,
+            999,
+        );
+        std::fs::copy(&older_high_nonce, &bundle_path).unwrap();
+
+        match auth.reload_mesh() {
+            Err(MeshBundleError::Rollback {
+                candidate_generated_at,
+                current_generated_at,
+                ..
+            }) => {
+                assert_eq!(candidate_generated_at, now - 60);
+                assert_eq!(current_generated_at, now);
+            }
+            other => panic!("expected Rollback rejection, got {other:?}"),
+        }
+        assert_eq!(router_ip(&auth), "100.64.0.9", "snapshot must be unchanged");
+    }
+
+    #[test]
     fn reload_mesh_allows_identical_bundle_reapply() {
         // The periodic poller re-reads the same file every interval. An
         // identical (generated_at, nonce) must NOT be treated as a rollback —
