@@ -23,7 +23,7 @@ use rustydns_blocklist::BlocklistEngine;
 use rustydns_core::BlockSchedule;
 use rustydns_core::RustyDnsError;
 use rustydns_core::client::ClientId;
-use rustydns_core::config::{BlockResponse, NodePolicy, RewriteRule};
+use rustydns_core::config::{BlockResponse, NodePolicy, RewriteRule, redact_url_credentials};
 use rustydns_core::record::{DnsRecord, RecordData};
 use rustydns_resolver::Resolver;
 
@@ -775,7 +775,13 @@ impl DnsHandler {
                         warn!(client = %ctx.client.anonymized(), "DNSSEC validation failed");
                     }
                     RustyDnsError::Upstream { upstream, .. } => {
-                        warn!(client = %ctx.client.anonymized(), upstream = %upstream, "upstream error");
+                        // PRIVACY: the stored URL may embed credentials; same
+                        // redaction as every other URL-bearing log surface.
+                        warn!(
+                            client = %ctx.client.anonymized(),
+                            upstream = %redact_url_credentials(&upstream),
+                            "upstream error"
+                        );
                     }
                     _ => {
                         warn!(client = %ctx.client.anonymized(), "resolver error");
