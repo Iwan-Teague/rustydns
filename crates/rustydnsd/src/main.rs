@@ -152,9 +152,13 @@ async fn main() -> Result<()> {
 
     // `--print-config`: emit the resolved config and exit. Implies
     // --validate-config (load_config has already run validate_config).
-    // Sensitive fields render as <redacted> via the Secret Debug impl.
+    // PRIVACY: URL-bearing fields (upstream resolvers, ODoH proxies,
+    // routes, blocklist sources) may embed credentials — `user:pass@host`
+    // userinfo or `?token=…` query parameters. The dump goes through
+    // DnsConfig::redacted_for_display so those components render as
+    // `<redacted>` and never reach terminals, CI logs or shell history.
     if args.print_config {
-        let rendered = toml::to_string_pretty(&config)
+        let rendered = toml::to_string_pretty(&config.redacted_for_display())
             .context("failed to serialise resolved config as TOML")?;
         print!("{rendered}");
         return Ok(());
