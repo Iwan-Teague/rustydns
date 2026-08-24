@@ -1426,6 +1426,26 @@ fn restart_required_changes(
     if old.blocklist.groups != new.blocklist.groups {
         changed.push("blocklist.groups");
     }
+    // Authority fields are baked into the Authority instance at startup:
+    // SIGHUP re-reads the BUNDLE (content) but cannot rebuild static
+    // records, rename the served zone, or move the poll loop. Flag them
+    // rather than letting a reload appear to succeed while nothing changed.
+    // StaticRecord does not derive PartialEq; a stable Debug dump gives the
+    // same change-detection without widening its derived traits.
+    if format!("{:?}", old.authority.static_records)
+        != format!("{:?}", new.authority.static_records)
+    {
+        changed.push("authority.static_records");
+    }
+    if old.authority.mesh_zone != new.authority.mesh_zone {
+        changed.push("authority.mesh_zone");
+    }
+    if old.authority.mesh_zone_max_age_secs != new.authority.mesh_zone_max_age_secs {
+        changed.push("authority.mesh_zone_max_age_secs");
+    }
+    if old.authority.poll_interval_secs != new.authority.poll_interval_secs {
+        changed.push("authority.poll_interval_secs");
+    }
     if old.privacy.query_log_to_disk != new.privacy.query_log_to_disk
         || old.privacy.query_log_disk_path != new.privacy.query_log_disk_path
     {
@@ -2048,6 +2068,41 @@ mod tests {
         let a = base_config();
         let b = base_config();
         assert!(restart_required_changes(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn restart_required_flags_authority_field_changes() {
+        // Authority state is baked into the Authority instance at startup;
+        // SIGHUP only re-reads the bundle CONTENT. Any change to these
+        // fields must be surfaced as restart-required instead of silently
+        // doing nothing.
+        let old = base_config();
+        let mut new = base_config();
+        new.authority.static_records = vec![rustydns_core::config::StaticRecord {
+            name: "new.mesh".to_string(),
+            record_type: "A".to_string(),
+            address: Some("10.0.0.9".to_string()),
+            target: None,
+            ttl: 300,
+            client_filter: None,
+        }];
+        // Keep server/authority zones CONSISTENT (both renamed) — the
+        // startup divergence check would otherwise reject this pair before
+        // restart-required logic ever runs.
+        new.authority.mesh_zone = "mesh2.".to_string();
+        new.server.mesh_zone = "mesh2.".to_string();
+        new.authority.mesh_zone_max_age_secs = 900;
+        new.authority.poll_interval_secs = 60;
+
+        let changed = restart_required_changes(&old, &new);
+        for label in [
+            "authority.static_records",
+            "authority.mesh_zone",
+            "authority.mesh_zone_max_age_secs",
+            "authority.poll_interval_secs",
+        ] {
+            assert!(changed.contains(&label), "missing {label}: {changed:?}");
+        }
     }
 
     #[test]
