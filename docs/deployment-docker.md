@@ -80,7 +80,7 @@ Bind mounts are read-only:
 | Container path | Source | Purpose |
 |----------------|--------|---------|
 | `/etc/rustydns/rustydns.toml` | `./rustydns.toml` | Main config (mode 0640) |
-| `/var/lib/rustydns/mesh` | `./mesh` | Signed dns-zone bundle directory (Rustynet integration) |
+| `/var/lib/rustynet` | `./mesh` | Signed dns-zone bundle + verifier key (Rustynet integration); matches the example config's paths |
 
 > **Note**: the daemon enforces a strict permission check on the
 > config file at startup — it refuses to load a world-readable config.
