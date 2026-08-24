@@ -766,7 +766,7 @@ impl ActiveListeners {
     /// Spawn the metrics server (always present). Startup variant.
     fn start_metrics(&mut self, cfg: &rustydns_core::config::DnsConfig) -> Result<()> {
         let addr = metrics_listen_addr(&cfg.metrics)?;
-        let path = normalize_metrics_path(&cfg.metrics.path);
+        let path = normalize_metrics_path(&cfg.metrics.path)?;
         self.install_metrics(addr, path)
     }
 
@@ -1002,7 +1002,16 @@ impl ActiveListeners {
                 return;
             }
         };
-        let new_path = normalize_metrics_path(&cfg.metrics.path);
+        let new_path = match normalize_metrics_path(&cfg.metrics.path) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "SIGHUP: metrics.path invalid; metrics listener unchanged"
+                );
+                return;
+            }
+        };
         if Some(new_addr) == self.live_metrics && new_path == self.live_metrics_path {
             return;
         }
@@ -1464,16 +1473,33 @@ fn metrics_listen_addr(metrics: &MetricsConfig) -> Result<SocketAddr> {
     Ok(SocketAddr::new(loopback_ip, addr.port()))
 }
 
-fn normalize_metrics_path(path: &str) -> String {
+/// Paths owned by fixed endpoints on the metrics listener. A configured
+/// `metrics.path` colliding with either would insert a duplicate axum route,
+/// which panics at serve time ("Overlapping method route") — fatal under the
+/// release profile's `panic = "abort"`.
+const RESERVED_METRICS_PATHS: [&str; 2] = ["/health", "/queries"];
+
+/// Normalise `metrics.path` (trim, ensure a leading slash, default
+/// `/metrics`) and reject paths that collide with the reserved `/health` and
+/// `/queries` endpoints. Both call sites — startup (fatal) and SIGHUP reload
+/// (warn + keep current) — flow through here, so the collision can never
+/// reach the router.
+fn normalize_metrics_path(path: &str) -> anyhow::Result<String> {
     let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return "/metrics".to_string();
-    }
-    if trimmed.starts_with('/') {
-        trimmed.to_string()
+    let normalised = if trimmed.is_empty() {
+        "/metrics".to_string()
+    } else if let Some(rest) = trimmed.strip_prefix('/') {
+        format!("/{rest}")
     } else {
         format!("/{trimmed}")
+    };
+    if RESERVED_METRICS_PATHS.contains(&normalised.as_str()) {
+        anyhow::bail!(
+            "metrics.path `{path}` collides with the fixed `{normalised}` endpoint; pick \
+             another path (the metrics listener always serves /health and /queries)"
+        );
     }
+    Ok(normalised)
 }
 
 /// Drop every Linux capability from every set after the daemon has
@@ -1739,10 +1765,31 @@ mod tests {
 
     #[test]
     fn normalize_metrics_path_prepends_slash() {
-        assert_eq!(normalize_metrics_path(""), "/metrics");
-        assert_eq!(normalize_metrics_path("foo"), "/foo");
-        assert_eq!(normalize_metrics_path("/foo"), "/foo");
-        assert_eq!(normalize_metrics_path("  /foo  "), "/foo");
+        assert_eq!(normalize_metrics_path("").unwrap(), "/metrics");
+        assert_eq!(normalize_metrics_path("foo").unwrap(), "/foo");
+        assert_eq!(normalize_metrics_path("/foo").unwrap(), "/foo");
+        assert_eq!(normalize_metrics_path("  /foo  ").unwrap(), "/foo");
+    }
+
+    #[test]
+    fn normalize_metrics_path_rejects_reserved_endpoints() {
+        // A metrics.path colliding with the fixed /health or /queries
+        // endpoints would insert a duplicate axum route — a PANIC at serve
+        // time ("Overlapping method route"), fatal under release
+        // panic=abort and reachable from both startup and SIGHUP. Both
+        // reserved paths must be rejected with a name-the-collision error.
+        for bad in ["/health", "/queries", "health", "queries"] {
+            let err = normalize_metrics_path(bad)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be rejected"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("collides"),
+                "{bad} rejection must explain the collision: {msg}"
+            );
+        }
+        // Sanity: non-reserved paths still pass.
+        assert!(normalize_metrics_path("/mymetrics").is_ok());
     }
 
     // ---- check_config_permissions ------------------------------------------
