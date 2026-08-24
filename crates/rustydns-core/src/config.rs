@@ -1351,10 +1351,21 @@ impl serde::Serialize for Secret {
 // ---------------------------------------------------------------------------
 
 /// Is this URL query-parameter key one that commonly carries a credential?
+///
+/// Covers the mainstream shapes an operator will actually meet: bearer/API
+/// tokens (`token`, `apikey`, …), OAuth/OIDC (`access_token`, `auth`),
+/// presigned-object-store signatures (`sig`, `signature`,
+/// `x-amz-signature`, `x-goog-signature`), and generic secret carriers.
+/// Over-matching a benign parameter costs only a `<redacted>` in a dump;
+/// under-matching leaks a live credential into terminals and CI logs.
 fn is_secret_param_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
         "token"
+            | "access_token"
+            | "auth"
+            | "auth_token"
+            | "authorization"
             | "apikey"
             | "api_key"
             | "api-key"
@@ -1363,6 +1374,12 @@ fn is_secret_param_key(key: &str) -> bool {
             | "password"
             | "passwd"
             | "pass"
+            | "sig"
+            | "signature"
+            | "x-amz-signature"
+            | "x-goog-signature"
+            | "x-ms-signature"
+            | "hmac"
     )
 }
 
@@ -1604,7 +1621,16 @@ mod display_redaction_tests {
         const PASSES: [&str; 3] = ["hunter2", "t0ps3cret", "pW123"];
         const HOSTS: [&str; 4] = ["dns.example", "127.0.0.1", "[2001:db8::1]", "relay.example"];
         const PATHS: [&str; 3] = ["", "/dns-query", "/a/list"];
-        const SECRET_KEYS: [&str; 6] = ["token", "TOKEN", "api_key", "key", "secret", "password"];
+        const SECRET_KEYS: [&str; 8] = [
+            "token",
+            "TOKEN",
+            "api_key",
+            "key",
+            "secret",
+            "password",
+            "access_token",
+            "X-Amz-Signature",
+        ];
         const PLAIN_KEYS: [&str; 3] = ["format", "q", "cache"];
         const PLAIN_VALS: [&str; 3] = ["hosts", "1", "abc"];
 
