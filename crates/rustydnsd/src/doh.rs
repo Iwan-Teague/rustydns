@@ -38,7 +38,12 @@ use rustydns_core::client::ClientId;
 use crate::handler::DnsHandler;
 
 const MAX_DOH_MESSAGE_BYTES: usize = 65_535;
-const DOH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Floor for the DoH response deadline. The effective deadline is derived
+/// from the configured upstream timeout so a slow upstream can never race —
+/// and lose — the HTTP layer while UDP/TCP would still have served.
+const DOH_TIMEOUT_FLOOR: Duration = Duration::from_secs(5);
+/// Slack added on top of `2 x upstream.timeout_ms` (hickory may retry once).
+const DOH_TIMEOUT_SLACK: Duration = Duration::from_millis(500);
 const DOH_PATH: &str = "/dns-query";
 
 /// Start the DoH listener (HTTP, no TLS) on a pre-bound listener until
@@ -51,8 +56,16 @@ pub async fn serve(
     handler: Arc<DnsHandler>,
     listener: TcpListener,
     shutdown: CancellationToken,
+    upstream_timeout: Duration,
 ) -> Result<(), RustyDnsError> {
-    let state = DohState { handler };
+    // Deadline formula: floor of 5 s, else 2x the upstream timeout plus
+    // slack — hickory may retry once inside its budget, and the HTTP layer
+    // must never win a race against a DNS answer UDP/TCP would deliver.
+    let doh_timeout = (upstream_timeout * 2 + DOH_TIMEOUT_SLACK).max(DOH_TIMEOUT_FLOOR);
+    let state = DohState {
+        handler,
+        doh_timeout,
+    };
     let app = Router::new()
         .route(DOH_PATH, get(handle_get).post(handle_post))
         // Reject oversized POST bodies at the framework layer, before the
@@ -87,6 +100,7 @@ pub async fn serve(
 #[derive(Clone)]
 struct DohState {
     handler: Arc<DnsHandler>,
+    doh_timeout: Duration,
 }
 
 #[derive(Deserialize)]
@@ -104,7 +118,7 @@ async fn handle_get(
         Err(_) => return bad_request("invalid base64url in dns parameter"),
     };
 
-    handle_dns_message(state.handler.clone(), src, decoded).await
+    handle_dns_message(state.handler.clone(), state.doh_timeout, src, decoded).await
 }
 
 async fn handle_post(
@@ -123,7 +137,7 @@ async fn handle_post(
             .body(Body::from("content-type must be application/dns-message"))
             .unwrap();
     }
-    handle_dns_message(state.handler.clone(), src, body.to_vec()).await
+    handle_dns_message(state.handler.clone(), state.doh_timeout, src, body.to_vec()).await
 }
 
 /// True iff the request declares the RFC 8484 DNS media type. Parameters
@@ -140,7 +154,12 @@ fn is_dns_message_content_type(headers: &HeaderMap) -> bool {
         })
 }
 
-async fn handle_dns_message(handler: Arc<DnsHandler>, src: SocketAddr, bytes: Vec<u8>) -> Response {
+async fn handle_dns_message(
+    handler: Arc<DnsHandler>,
+    doh_timeout: Duration,
+    src: SocketAddr,
+    bytes: Vec<u8>,
+) -> Response {
     if bytes.is_empty() {
         return bad_request("empty DNS message");
     }
@@ -177,7 +196,7 @@ async fn handle_dns_message(handler: Arc<DnsHandler>, src: SocketAddr, bytes: Ve
         .handle_request::<_, hickory_server::net::runtime::TokioTime>(&request, response_handler)
         .await;
 
-    let response_bytes = match timeout(DOH_TIMEOUT, rx).await {
+    let response_bytes = match timeout(doh_timeout, rx).await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(_)) => return server_error("failed to build DNS response"),
         Err(_) => return server_error("DNS response timed out"),
@@ -369,7 +388,15 @@ mod tests {
         let shutdown_for_task = shutdown.clone();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         tokio::spawn(async move {
-            let _ = serve(handler, listener, shutdown_for_task).await;
+            // Tests use the documented default upstream timeout (5 s), which
+            // maps to the 5 s deadline floor.
+            let _ = serve(
+                handler,
+                listener,
+                shutdown_for_task,
+                Duration::from_millis(5000),
+            )
+            .await;
         });
 
         // Wait for the listener to come up. axum binds inside serve()
