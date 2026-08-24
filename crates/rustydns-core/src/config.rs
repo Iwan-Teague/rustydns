@@ -1197,6 +1197,20 @@ pub struct NodePolicy {
     ///
     /// Matched against the source IP of every incoming query. Use
     /// this until the NodeId-based path is wired up.
+    ///
+    /// # IPv6 caveat — exact /128 match, rotation-aware operators only
+    ///
+    /// Matching is EXACT: an entry for `2001:db8::1` does not match
+    /// `2001:db8::2`, and hosts using SLAAC privacy extensions rotate their
+    /// interface identifier (daily by default on major OSes) — after which
+    /// this policy silently stops applying to them. Restrictive fields
+    /// (`zones_allowed`, `block_windows`) therefore fail OPEN across a
+    /// rotation. Deliberate trade-off: collapsing to a `/64` prefix (as the
+    /// rate limiter does) would over-apply `blocklist_bypass` and other
+    /// fields to every device sharing that link. Operators needing
+    /// rotation-proof enforcement today should disable v6 privacy
+    /// extensions on the managed device or enforce at the firewall; the
+    /// NodeId path will subsume this. See `docs/TODO.md`.
     #[serde(default)]
     pub client_ip: Option<String>,
 

@@ -26,6 +26,21 @@ Effort legend: S (hours) · M (a day) · L (multi-day / needs design)
 These live in `roadmap.md` too; repeated here for completeness. **Do not start**
 — they need an upstream/sibling change first.
 
+- **1.0 🟠 IPv6 `[[policy]]` rotation escape — design decision pending.** Policy
+  entries match the EXACT /128 source address, but SLAAC privacy extensions
+  rotate the interface identifier (daily on major OSes), so restrictive fields
+  (`zones_allowed`, `block_windows`) silently fail OPEN across a rotation.
+  Collapsing v6 policies to /64 like the rate limiter is NOT a safe fix: it
+  would over-apply the PERMISSIVE field (`blocklist_bypass`) to every device
+  sharing that link — privilege escalation in the other direction. A split
+  semantics (restrictive fields prefix-matched, permissive fields exact) is a
+  candidate but changes operator-visible matching and needs a deliberate
+  design call. Current behaviour is documented in
+  `NodePolicy::client_ip` (rustydns-core) and pinned by
+  `policy_v6_matching_is_exact_no_prefix_fallback`; operators needing
+  rotation-proof enforcement today should disable v6 privacy extensions on
+  the managed device or enforce at the firewall. The NodeId path (2.1)
+  subsumes this entirely.
 - **1.1 🟠 RFC 7816 query minimisation** — `hickory-resolver 0.26` exposes no
   knob. Scaffolding (`PrivacyConfig::query_minimization` + startup warning)
   already in place. Adopt when hickory ships it. Files:
