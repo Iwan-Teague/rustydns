@@ -983,6 +983,8 @@ fn rcode_metric_label(rcode: ResponseCode) -> &'static str {
         ResponseCode::NXDomain => "NXDOMAIN",
         ResponseCode::NotImp => "NOTIMP",
         ResponseCode::Refused => "REFUSED",
+        // Emitted by gate_edns_version since RFC 6891 conformance landed.
+        ResponseCode::BADVERS => "BADVERS",
         _ => "other",
     }
 }
@@ -1100,6 +1102,10 @@ mod tests {
         assert_eq!(rcode_metric_label(ResponseCode::NXDomain), "NXDOMAIN");
         assert_eq!(rcode_metric_label(ResponseCode::NotImp), "NOTIMP");
         assert_eq!(rcode_metric_label(ResponseCode::Refused), "REFUSED");
+        // BADVERS is emitted by gate_edns_version (RFC 6891) and gets its
+        // own series — operators need to see EDNS-version probes separately
+        // from the generic "other" bucket.
+        assert_eq!(rcode_metric_label(ResponseCode::BADVERS), "BADVERS");
         // Anything else collapses to a single "other" bucket, so an unusual
         // upstream rcode can never inflate the metric's label cardinality.
         assert_eq!(rcode_metric_label(ResponseCode::NXRRSet), "other");
