@@ -386,7 +386,8 @@ fn validate_block_entry(s: &str) -> Option<String> {
     if !d.contains('.') {
         tracing::warn!(
             domain = %d,
-            "skipped blocklist entry: single-label / TLD-level entries are not allowed              (an entry for a TLD would block every domain under it)"
+            "skipped blocklist entry: single-label / TLD-level entries are not allowed \
+             (an entry for a TLD would block every domain under it)"
         );
         return None;
     }
