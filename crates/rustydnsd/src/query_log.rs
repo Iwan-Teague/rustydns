@@ -35,7 +35,6 @@
 //! (`VecDeque::pop_front`). All operations are O(1).
 
 use std::collections::VecDeque;
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
