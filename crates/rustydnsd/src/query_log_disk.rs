@@ -119,6 +119,7 @@ pub fn spawn(
         path,
         max_file_bytes,
         max_files,
+        io_error_streak: 0,
         cur_size: initial_size,
         out: BufWriter::new(tokio::fs::File::from_std(initial)),
         metrics,
@@ -172,6 +173,11 @@ struct Writer {
     max_file_bytes: u64,
     max_files: usize,
     cur_size: u64,
+    /// Consecutive I/O failures on the active file. Drives warn suppression:
+    /// first failure and every 1000th are logged; the rest only bump the
+    /// metric so a persistent disk-full cannot flood the journal at query
+    /// rate.
+    io_error_streak: u64,
     out: BufWriter<tokio::fs::File>,
     metrics: Arc<Metrics>,
 }
@@ -222,11 +228,22 @@ impl Writer {
         match self.out.write_all(bytes).await {
             Ok(()) => {
                 self.cur_size += bytes.len() as u64;
+                self.io_error_streak = 0;
                 self.metrics.inc_query_log_disk_written();
             }
             Err(e) => {
+                self.io_error_streak += 1;
+                // Flood-safety: first failure warns loudly; sustained
+                // failure reminds every 1000th. The metric always counts.
+                if self.io_error_streak == 1 || self.io_error_streak % 1000 == 0 {
+                    warn!(
+                        streak = self.io_error_streak,
+                        error = %e,
+                        path = %self.path.display(),
+                        "query-log disk write failed"
+                    );
+                }
                 self.metrics.inc_query_log_disk_io_errors();
-                warn!(error = %e, path = %self.path.display(), "query-log disk write failed");
             }
         }
     }
