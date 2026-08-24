@@ -54,6 +54,10 @@ impl BlocklistLoader {
             // AGENTS.md privacy invariant "HTTPS-only blocklist
             // sources" is then enforced in two places, not one.
             .https_only(true)
+            // Same floor as the upstream resolver and ODoH clients: source
+            // URLs may embed access tokens, and there is no reason to let a
+            // CDN negotiate TLS 1.2 when every major provider speaks 1.3.
+            .min_tls_version(reqwest::tls::Version::TLS_1_3)
             // reqwest's default of 10 redirects gives a 3xx-chain
             // operator far too much rope. Three hops covers normal
             // host-rename / CDN-edge patterns (e.g. raw.githubusercontent
