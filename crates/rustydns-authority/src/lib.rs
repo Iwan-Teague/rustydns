@@ -594,7 +594,23 @@ fn static_record_to_dns_record(sr: &StaticRecord) -> AuthorityResult<DnsRecord> 
         "PTR" => RecordData::Ptr(normalise_name(require_target(sr, "PTR")?).into_owned()),
         "TXT" => {
             let target = require_target(sr, "TXT")?;
-            RecordData::Txt(vec![target.as_bytes().to_vec()])
+            let bytes = target.as_bytes();
+            // RFC 1035 §3.3: a TXT character-string is limited to 255 bytes.
+            // hickory's TXT rdata accepts longer values infallibly and only
+            // fails at WIRE-ENCODE time — i.e. at query time — which would
+            // turn this name into a silent blackhole (response encode fails,
+            // clients time out). Reject at load instead: fail closed at the
+            // door, not mid-pipeline.
+            if bytes.len() > 255 {
+                return Err(RustyDnsError::Zone(format!(
+                    "static record `{}` TXT value is {} bytes — a single TXT \
+                     character-string is limited to 255 bytes (RFC 1035 §3.3). \
+                     Shorten the value or split it across multiple records.",
+                    sr.name,
+                    bytes.len()
+                )));
+            }
+            RecordData::Txt(vec![bytes.to_vec()])
         }
         "NS" => RecordData::Ns(normalise_name(require_target(sr, "NS")?).into_owned()),
         "MX" => {
@@ -900,6 +916,42 @@ mod tests {
             RustyDnsError::Zone(msg) => assert!(msg.contains("FOO"), "msg = {msg}"),
             other => panic!("expected Zone error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn invalid_static_record_oversize_txt_rejected_at_load() {
+        // RFC 1035 §3.3 caps a TXT character-string at 255 bytes. hickory's
+        // rdata accepts longer values and only fails at WIRE-ENCODE time, so
+        // an unvalidated over-long TXT would load fine and then blackhole
+        // every query for the name (encode failure → no response). The
+        // authority must reject it at startup instead.
+        let bad = StaticRecord {
+            name: "big.mesh".to_string(),
+            record_type: "TXT".to_string(),
+            address: None,
+            target: Some("x".repeat(256)),
+            ttl: 300,
+            client_filter: None,
+        };
+        let err = Authority::new(cfg(vec![bad])).expect_err("oversize TXT must be rejected");
+        match err {
+            RustyDnsError::Zone(msg) => {
+                assert!(msg.contains("256 bytes"), "msg = {msg}");
+                assert!(msg.contains("255"), "msg = {msg}");
+            }
+            other => panic!("expected Zone error, got {other:?}"),
+        }
+
+        // Boundary: exactly 255 bytes is legal.
+        let ok = StaticRecord {
+            name: "edge.mesh".to_string(),
+            record_type: "TXT".to_string(),
+            address: None,
+            target: Some("x".repeat(255)),
+            ttl: 300,
+            client_filter: None,
+        };
+        Authority::new(cfg(vec![ok])).expect("exactly-255-byte TXT must load");
     }
 
     #[test]
