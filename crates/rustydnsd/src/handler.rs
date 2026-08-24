@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use hickory_proto::op::{Header, HeaderCounts, Metadata, OpCode, ResponseCode};
+use hickory_proto::op::{Edns, Header, HeaderCounts, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, PTR, SRV, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinEncoder;
@@ -368,28 +368,39 @@ impl DnsHandler {
                 Some(e) => (e.max_payload() as usize).clamp(512, MAX_EDNS_PAYLOAD as usize),
                 None => 512,
             };
-            let measure = |ans: &[Record], tc: bool, m0: Metadata| -> Option<usize> {
-                let mut m = m0;
-                m.truncation = tc;
-                let b = MessageResponseBuilder::from_message_request(request);
-                let r = b.build(
-                    m,
-                    ans.iter(),
-                    std::iter::empty::<&Record>(),
-                    std::iter::empty::<&Record>(),
-                    std::iter::empty::<&Record>(),
-                );
-                let mut scratch = Vec::with_capacity(cap * 2);
-                let mut enc = BinEncoder::new(&mut scratch);
-                r.destructive_emit(&mut enc).ok()?;
-                Some(scratch.len())
+            // The probe MUST include the same echoed EDNS the final
+            // emission attaches — otherwise shed decisions under-count by
+            // the OPT size and an "fits" verdict can still ship an
+            // over-cap datagram.
+            let measure =
+                |ans: &[Record], tc: bool, m0: Metadata, edns: Option<&Edns>| -> Option<usize> {
+                    let mut m = m0;
+                    m.truncation = tc;
+                    let mut b = MessageResponseBuilder::from_message_request(request);
+                    if let Some(e) = edns {
+                        b.edns(e);
+                    }
+                    let r = b.build(
+                        m,
+                        ans.iter(),
+                        std::iter::empty::<&Record>(),
+                        std::iter::empty::<&Record>(),
+                        std::iter::empty::<&Record>(),
+                    );
+                    let mut scratch = Vec::with_capacity(cap * 2);
+                    let mut enc = BinEncoder::new(&mut scratch);
+                    r.destructive_emit(&mut enc).ok()?;
+                    Some(scratch.len())
+                };
+            let measure_now = |ans: &[Record], tc: bool, m0: Metadata| -> Option<usize> {
+                measure(ans, tc, m0, normalized_edns.as_ref())
             };
-            if measure(&answers, false, metadata).is_none_or(|n| n > cap) {
+            if measure_now(&answers, false, metadata).is_none_or(|n| n > cap) {
                 metadata.truncation = true;
                 let original = answers.len();
                 let mut shed = 0usize;
                 while !answers.is_empty()
-                    && measure(&answers, true, metadata).is_none_or(|n| n > cap)
+                    && measure_now(&answers, true, metadata).is_none_or(|n| n > cap)
                 {
                     answers.pop();
                     shed += 1;
