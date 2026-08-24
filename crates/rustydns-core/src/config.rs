@@ -1340,7 +1340,14 @@ impl serde::Serialize for Secret {
 fn is_secret_param_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
-        "token" | "apikey" | "api_key" | "api-key" | "key" | "secret" | "password" | "passwd"
+        "token"
+            | "apikey"
+            | "api_key"
+            | "api-key"
+            | "key"
+            | "secret"
+            | "password"
+            | "passwd"
             | "pass"
     )
 }
@@ -1440,7 +1447,7 @@ mod secret_tests {
 
 #[cfg(test)]
 mod display_redaction_tests {
-    use super::{redact_url_credentials, DnsConfig};
+    use super::{DnsConfig, redact_url_credentials};
 
     #[test]
     fn userinfo_password_is_redacted() {

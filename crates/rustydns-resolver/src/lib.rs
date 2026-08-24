@@ -67,9 +67,7 @@ use hickory_resolver::net::NetError;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
 use rustydns_core::RustyDnsError;
-use rustydns_core::config::{
-    DnsConfig, TlsVersion, UpstreamProtocol, redact_url_credentials,
-};
+use rustydns_core::config::{DnsConfig, TlsVersion, UpstreamProtocol, redact_url_credentials};
 use rustydns_core::record::{DnsRecord, RecordData};
 
 mod odoh;

@@ -241,10 +241,7 @@ fn build_mock_response(mode: MockMode, query: &Message) -> Result<Vec<u8>, OdohE
             raw.extend_from_slice(QNAME);
             raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
             let self_offset = (12 + QNAME.len() + 4) as u16;
-            raw.extend_from_slice(&[
-                0xC0 | (self_offset >> 8) as u8,
-                self_offset as u8,
-            ]);
+            raw.extend_from_slice(&[0xC0 | (self_offset >> 8) as u8, self_offset as u8]);
             raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
             raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
             raw.extend_from_slice(&[0x00, 0x04, 203, 0, 113, 7]);
@@ -472,7 +469,11 @@ async fn odoh_compression_pointer_loop_fails_closed_in_bounded_work() {
         .resolve("example.com.", RecordType::A, false)
         .await
         .expect_err("a decompression loop must fail closed");
-    assert_eq!(err.kind_label(), "dns_parse", "the plaintext must fail DNS parsing, not transport or crypto");
+    assert_eq!(
+        err.kind_label(),
+        "dns_parse",
+        "the plaintext must fail DNS parsing, not transport or crypto"
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(5),
         "pointer-loop rejection exceeded the bounded-work budget"
