@@ -1208,6 +1208,66 @@ fn combined_rewrite_rules(
     rules
 }
 
+#[cfg(test)]
+mod safesearch_combine_tests {
+    use super::*;
+
+    #[test]
+    fn operator_rewrites_override_injected_safesearch_rules() {
+        // Documented contract: Safe Search rules are injected FIRST so an
+        // explicit [[rewrite]] for the same name overrides them — an
+        // operator who pins google.com to their own mirror must win over
+        // the built-in forcesafesearch CNAME. Rewriting the combine order
+        // (or switching RewriteMap::from_rules to first-insert-wins) would
+        // silently break operator customisation.
+        let mut cfg = rustydns_core::config::DnsConfig::default();
+        cfg.safesearch.enabled = true;
+        cfg.safesearch.google = true;
+        cfg.rewrite.push(rustydns_core::config::RewriteRule {
+            name: "google.com".to_string(),
+            address: Some("10.0.0.9".to_string()),
+            target: None,
+            block: false,
+        });
+
+        let rules = combined_rewrite_rules(&cfg);
+        assert!(
+            !rules.is_empty(),
+            "safesearch rules must be injected when enabled"
+        );
+
+        let map = crate::rewrite::RewriteMap::from_rules(&rules);
+        match map.lookup("google.com.", hickory_proto::rr::RecordType::A) {
+            Some(crate::rewrite::RewriteDecision::Answer(recs)) => {
+                assert_eq!(
+                    recs.len(),
+                    1,
+                    "operator override must replace the safesearch CNAME: {recs:?}"
+                );
+                assert!(
+                    matches!(&recs[0].data, rustydns_core::record::RecordData::A(ip) if ip.to_string() == "10.0.0.9"),
+                    "operator address must win, got {:?}",
+                    recs[0].data
+                );
+            }
+            other => panic!("operator rewrite must win over safesearch, got {other:?}"),
+        }
+
+        // Non-overridden engines still enforce.
+        match map.lookup("www.bing.com.", hickory_proto::rr::RecordType::A) {
+            Some(crate::rewrite::RewriteDecision::Answer(recs)) => {
+                assert!(
+                    matches!(&recs[0].data, rustydns_core::record::RecordData::Cname(t)
+                    if t == "strict.bing.com."),
+                    "bing strict must still apply: {:?}",
+                    recs[0].data
+                );
+            }
+            other => panic!("expected bing strict CNAME, got {other:?}"),
+        }
+    }
+}
+
 async fn apply_hot_swaps(handler: &DnsHandler, new_config: &rustydns_core::config::DnsConfig) {
     match Resolver::new(new_config.clone()).await {
         Ok(resolver) => {
