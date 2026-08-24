@@ -876,6 +876,63 @@ async fn truncated_label_length_fails_closed_bounded() {
 }
 
 #[tokio::test]
+async fn truncated_rdlength_fails_closed_bounded() {
+    // Sibling of the label-length probe, for the RDATA field: an answer
+    // whose RDLENGTH claims 65 535 bytes while only a few remain before EOF
+    // must abort record parsing (never satisfied out of range), fail closed
+    // as AllUpstreamsFailed within budget, and leave the resolver serving.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().expect("local_addr");
+    let shutdown = CancellationToken::new();
+    let sh = shutdown.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            tokio::select! {
+                _ = sh.cancelled() => break,
+                res = socket.recv_from(&mut buf) => {
+                    let Ok((_, src)) = res else { continue };
+
+                    let mut raw: Vec<u8> = Vec::new();
+                    raw.extend_from_slice(&[0x12, 0x34, 0x80, 0x00]); // id, QR
+                    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QD=1 AN=1
+                    raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                    raw.extend_from_slice(b"\x06victim\x07example\x03org\x00");
+                    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // @29..33
+                    // Answer owner: full uncompressed name, then A IN, ttl,
+                    // and an RDLENGTH of 0xFFFF with only four bytes present.
+                    raw.extend_from_slice(b"\x06victim\x07example\x03org\x00"); // @33..46
+                    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+                    raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
+                    raw.extend_from_slice(&[0xFF, 0xFF]); // RDLENGTH 65535!
+                    raw.extend_from_slice(b"\x7f\x00\x00\x01"); // 4 bytes only
+
+                    let _ = socket.send_to(&raw, src).await;
+                }
+            }
+        }
+    });
+
+    let resolver = Resolver::new(plain_config(&addr.to_string()))
+        .await
+        .expect("resolver init");
+    let started = std::time::Instant::now();
+    let err = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect_err("an over-long RDLENGTH must fail closed");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "truncated-RDLENGTH reply must fail closed, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "rejection exceeded the bounded-work budget"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn compression_pointer_overlap_trap_fails_closed_bounded() {
     // Exercises the RECURSIVE pointer-follow path with only PRIOR pointers —
     // every other hostile-pointer test in this suite dies on hop 1, so the
