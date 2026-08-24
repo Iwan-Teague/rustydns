@@ -113,13 +113,27 @@ impl ClientId {
                 IpAddr::V4(octets.into())
             }
             IpAddr::V6(v6) => {
-                let mut segs = v6.segments();
-                // Zero the interface identifier (last 64 bits = segments 4–7).
-                segs[4] = 0;
-                segs[5] = 0;
-                segs[6] = 0;
-                segs[7] = 0;
-                IpAddr::V6(segs.into())
+                // Dual-stack sockets report IPv4 peers as IPv4-mapped IPv6
+                // (`::ffff:a.b.c.d`). Normalise onto the native form FIRST so
+                // the /16 rule applies as intended: anonymising the mapped
+                // form directly would zero its last 64 bits and collapse
+                // EVERY IPv4 client onto one indistinguishable
+                // `::ffff:0:0/64/anon` bucket, destroying the operator's
+                // ability to tell clients apart while leaking nothing extra.
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    let mut octets = v4.octets();
+                    octets[2] = 0;
+                    octets[3] = 0;
+                    IpAddr::V4(octets.into())
+                } else {
+                    // Zero the interface identifier (last 64 bits = segments 4–7).
+                    let mut segs = v6.segments();
+                    segs[4] = 0;
+                    segs[5] = 0;
+                    segs[6] = 0;
+                    segs[7] = 0;
+                    IpAddr::V6(segs.into())
+                }
             }
         };
         // Node ID is intentionally omitted: it is a stable long-lived device
@@ -227,6 +241,47 @@ mod tests {
         assert!(
             !anon.contains("dead"),
             "interface ID should be zeroed, got: {anon}"
+        );
+    }
+
+    #[test]
+    fn anonymized_ipv4_mapped_v6_normalises_to_native_v4() {
+        // Dual-stack sockets report IPv4 peers as `::ffff:a.b.c.d` (the rate
+        // limiter already normalises this for keying). Anonymising the
+        // mapped form directly would zero segments 4-7 of the MAPPED
+        // address and collapse every IPv4 client onto one
+        // `::ffff:0:0/64/anon` string — useless operationally and no more
+        // private than the /16 the invariant asks for. The mapped form must
+        // be unwrapped first so the IPv4 /16 rule applies.
+        let id = ClientId::from_ip("::ffff:192.168.1.100".parse().unwrap());
+        let anon = id.anonymized().to_string();
+        assert!(
+            anon.contains("192.168.0.0"),
+            "mapped client must anonymise under the native v4 /16 rule, got: {anon}"
+        );
+        assert!(
+            anon.contains("/16/anon"),
+            "normalised v4 client must carry the /16 label, got: {anon}"
+        );
+        assert!(
+            !anon.contains("ffff"),
+            "no mapped-form residue may remain, got: {anon}"
+        );
+
+        // The mapped loopback gets the same treatment.
+        let loopback = ClientId::from_ip("::ffff:127.0.0.1".parse().unwrap());
+        let anon_lb = loopback.anonymized().to_string();
+        assert!(
+            anon_lb.contains("127.0.0.0/16/anon"),
+            "mapped loopback must normalise to 127.0.0.0/16/anon, got: {anon_lb}"
+        );
+
+        // A genuine global IPv6 is untouched by the unwrap (only the true
+        // ::ffff:0:0/96 range maps back to v4).
+        let real_v6 = ClientId::from_ip("2001:db8::ffff".parse().unwrap());
+        assert!(
+            real_v6.anonymized().to_string().contains("2001:db8::/64/anon"),
+            "non-mapped v6 must keep /64 handling"
         );
     }
 
