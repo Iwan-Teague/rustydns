@@ -89,6 +89,7 @@ attacker-chosen query types or unusual upstream response codes.
 | `rustydns_blocklist_heap_bytes`              | gauge   | Approximate heap of the blocklist state         |
 | `rustydns_blocklist_reload_success_total`    | counter | Reloads that loaded ≥1 source successfully      |
 | `rustydns_blocklist_reload_failure_total`    | counter | Reloads where every source failed               |
+| `rustydns_blocklist_reload_skipped_total`    | counter | SIGHUP fetch rounds skipped by the minimum-spacing guard |
 | `rustydns_blocklist_last_reload_seconds`     | gauge   | Unix ts of the most recent reload attempt       |
 
 ### Mesh zone
@@ -144,6 +145,7 @@ $ curl -s http://127.0.0.1:9153/queries | jq
 {
   "capacity": 1000,
   "count": 2,
+  "returned": 2,
   "entries": [
     {
       "ts": 1779441467,
@@ -168,6 +170,11 @@ $ curl -s http://127.0.0.1:9153/queries | jq
 Buffer size is `privacy.query_log_ring_size` (default 1000, max
 100,000). Set it to `0` to disable the buffer entirely.
 
+At most **1000 newest entries** are rendered per scrape
+(`"returned"` vs `"count"` shows when the cap clipped the output) — this
+keeps a max-ring scrape from serialising ~20 MB on Pi-class hardware.
+Operators needing full fidelity use the opt-in on-disk NDJSON log.
+
 ### Field semantics
 
 - `ts` — unix seconds when the query was received.
@@ -175,10 +182,11 @@ Buffer size is `privacy.query_log_ring_size` (default 1000, max
   IPv6 → `/64/anon`. The raw client IP is never serialised. Setting
   `privacy.log_client_ips = true` does NOT change this field; the
   flag governs `tracing` output, not the inspection endpoint.
-- `qname_hash` — 16-char lowercase hex of a salted u64 hash. The
-  salt is a per-process random value (`rand::random()` at startup),
-  so hashes do NOT cross deployment or restart boundaries. Reversing
-  the hash to a domain is computationally infeasible.
+- `qname_hash` — 16-char lowercase hex of a u64 hash keyed with
+  256 bits of per-instance OS entropy (seeding ahash's full key slot,
+  generated once at startup). Hashes are stable within one process but do
+  NOT cross deployment or restart boundaries, and reversing to a domain
+  requires brute-forcing those keys first.
 - `qtype` — interned RFC 1035 type label (`A`, `AAAA`, `MX`, …).
   Uncommon types collapse to `OTHER`.
 - `rcode` — wire-level DNS response code (`0`=NoError, `2`=ServFail,
