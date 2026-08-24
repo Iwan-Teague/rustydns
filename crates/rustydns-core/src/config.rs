@@ -1508,6 +1508,24 @@ mod display_redaction_tests {
     }
 
     #[test]
+    fn reqwest_error_display_strings_are_redacted() {
+        // odoh.rs wraps transport errors as
+        // OdohError::Http(redact_url_credentials(&e.to_string())). reqwest's
+        // Display embeds the request URL — pin that the redactor scrubs
+        // credentials out of that surrounding-text form, not just bare URLs.
+        let err = format!(
+            "error sending request for url ({})",
+            "https://alice:hunter2@relay.example/query"
+        );
+        let out = redact_url_credentials(&err);
+        assert!(!out.contains("hunter2"), "leaked: {out}");
+        assert!(
+            out.contains("<redacted>@relay.example/query"),
+            "host/path must survive: {out}"
+        );
+    }
+
+    #[test]
     fn config_display_clone_redacts_every_url_field() {
         let toml_body = r#"
 [upstream]
