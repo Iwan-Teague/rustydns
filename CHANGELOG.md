@@ -180,6 +180,29 @@ See `docs/operator-endpoints.md` for the full reference.
   fleet-wide via the wildcard-parent matcher. All four block-entry parse
   sites now route through a >= 2-label guard; skipped entries warn naming
   the domain.
+- **Listener-role address overlaps rejected.** `server.dot_listen` /
+  `doq_listen` sharing an address with `server.listen` made the kernel hand
+  each connection to a random role (plain DNS vs TLS/QUIC) on SO_REUSEPORT
+  sockets. `validate_config` now rejects the overlap while DoT + DoQ
+  sharing :853 stays allowed (different transports).
+- **`authority.poll_interval_secs = 0` rejected.** It fed
+  `tokio::time::interval`, which panics on a zero period — aborting the
+  daemon at startup under release panic=abort.
+- **UDP truncation logs one summary line, not one per shed record.** A
+  large upstream answer over the datagram cap previously flooded the
+  journal per query; shed/kept/original counts and the cap are in a single
+  warn now.
+- **Gate refusals log at debug, not warn.** Rate-limit, block-window, and
+  zones_allowed refusals emitted a warn PER refused query — journal
+  flooding exactly under flood or parental-control conditions. Production
+  visibility stays on the bounded metric series; RUST_LOG opts back into
+  per-event detail.
+- **CLI contract pinned by integration tests.** Unknown flags and a
+  valueless `--config` fail loudly; `--version` / `--help` exit 0 listing
+  the documented options.
+- **QDCOUNT=0 joined the question-count pin.** Empty-question datagrams
+  must not panic or misattribute an outcome; differential construction
+  proves second-question processing stays observable if it ever happens.
 - **EDNS version mismatch now answered with BADVERS (RFC 6891 §6.1.3).**
   A query advertising EDNS0 version > 0 previously got a bare SERVFAIL:
   hickory-server's BADVERS handling lives in its zone-handler `Catalog`,
