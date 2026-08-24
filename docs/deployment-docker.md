@@ -134,7 +134,7 @@ docker compose ps
 # 2. /health on the host (compose publishes :9153 only inside the
 #    container; reach it through docker exec or a sidecar in the
 #    same netns — see "Port exposure" above).
-docker compose exec rustydnsd wget -qO- http://127.0.0.1:9153/health
+docker compose exec rustydnsd bash -c 'exec 3<>/dev/tcp/127.0.0.1/9153; printf "GET /health HTTP/1.0\r\n\r\n" >&3; cat <&3'
 #   {"status":"ok","mesh_zone":{...}}
 
 # 3. A normal name resolves through the daemon (host-side test).
@@ -146,8 +146,8 @@ dig @127.0.0.1 doubleclick.net +short
 #   (empty — status: NXDOMAIN if you use `dig +noshort`)
 
 # 5. The blocklist hit counter increments.
-docker compose exec rustydnsd \
-    wget -qO- http://127.0.0.1:9153/metrics | grep blocklist_hits_total
+docker compose exec rustydnsd bash -c 'exec 3<>/dev/tcp/127.0.0.1/9153; \
+    printf "GET /metrics HTTP/1.0\r\n\r\n" >&3; grep blocklist_hits_total <&3'
 #   rustydns_blocklist_hits_total 1
 ```
 
@@ -215,7 +215,9 @@ is still running.
 **`SERVFAIL` on every query**
 
 Upstream DoH resolvers are unreachable. Check the container's egress
-path — `docker compose exec rustydnsd wget -q --spider
-https://dns.quad9.net/dns-query` is a quick probe. The non-root user's
-PATH includes `/usr/bin` so `wget` and other slim utilities resolve
-without absolute paths.
+path — the image is debian-slim, which deliberately ships no wget/curl,
+so probe with bash's built-in /dev/tcp instead:
+
+```bash
+docker compose exec rustydnsd bash -c 'exec 3<>/dev/tcp/9.9.9.9/443 && echo egress-ok'
+```
