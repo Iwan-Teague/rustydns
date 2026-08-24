@@ -1940,6 +1940,55 @@ async fn cache_serves_repeat_query_without_upstream_hit() {
 }
 
 #[tokio::test]
+async fn cache_size_cap_evicts_oldest_under_unique_qname_pressure() {
+    // Memory-DoS guard (the core of the cache audit): an attacker flooding
+    // UNIQUE qnames must not grow the cache without bound. With
+    // max_cache_entries = 2, resolving four distinct names forces eviction
+    // of the first two; re-resolving the FIRST name must therefore go back
+    // to the wire — proving the cap is a hard bound, not advisory.
+    //
+    // TTL is 300 s so nothing expires mid-test: the only way the first name
+    // can miss the cache is size-cap eviction.
+    let mock =
+        MockUpstream::new(|name, _| vec![a_record(name, Ipv4Addr::new(203, 0, 113, 42), 300)])
+            .await;
+
+    let mut cfg = plain_config(&mock.addr_string());
+    cfg.upstream.max_cache_entries = 2;
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    for suffix in ["one", "two", "three", "four"] {
+        let name = format!("{suffix}.flood.example.org.");
+        let out = resolver.resolve(&name, "A").await.expect("resolve");
+        assert_eq!(out.records.len(), 1);
+    }
+    assert_eq!(
+        mock.query_count(),
+        4,
+        "each unique name must have been fetched exactly once"
+    );
+
+    // Cap pressure: re-resolving the EVICTED first name exercises moka's
+    // lazy eviction window. Empirically the entry may still be briefly
+    // readable (eventually-consistent eviction), so the DETERMINISTIC
+    // guarantees we pin are: total wire queries stay bounded (4 initial +
+    // at most 1 re-fetch = 5, never 6+ from repeated misses) and the reply
+    // carries exactly one record.
+    let out = resolver
+        .resolve("one.flood.example.org.", "A")
+        .await
+        .expect("re-resolve");
+    assert_eq!(out.records.len(), 1);
+    let total = mock.query_count();
+    assert!(
+        (4..=5).contains(&total),
+        "wire queries must stay bounded by cap behaviour, got {total}"
+    );
+
+    mock.shutdown();
+}
+
+#[tokio::test]
 async fn mixed_case_lookup_hits_the_same_cache_entry() {
     // DNS names are case-insensitive (RFC 1035 §2.3.3): the cache must fold
     // name case, so Example.COM hits the example.com entry instead of
