@@ -172,6 +172,25 @@ See `docs/operator-endpoints.md` for the full reference.
 - Per-crate `lib.rs` modules carry the security/privacy rules in
   their crate-level docs.
 
+### Security
+
+- **Transitive RUSTSEC fixes re-verified against the advisory database
+  (2026-08-24).** The lockfile-only bumps in 27a0493/3e47043 were checked
+  against each advisory's published patched range on rustsec.org:
+  `crossbeam-epoch` 0.9.18 → 0.9.20 (RUSTSEC-2026-0204, patched
+  ≥ 0.9.20), `h2` 0.4.14 → 0.4.18 (RUSTSEC-2026-0258, patched
+  ≥ 0.4.16), `quinn-proto` 0.11.14 → **0.11.15** (RUSTSEC-2026-0185,
+  patched **≥ 0.11.15**), and `anyhow` → 1.0.104 (RUSTSEC-2026-0190).
+  Correction: the 27a0493 commit message says quinn-proto was bumped to
+  "0.11.17"; the actual — and sufficient — version is 0.11.15, which is
+  exactly the patched floor. Recorded here so a future auditor does not
+  mistake the message/logfile mismatch for an incomplete fix. Also
+  noted for the record: that bump carried unmentioned `windows-sys`
+  0.61.2 → 0.60.2 downgrades in several transitive packages
+  (`cargo update` collateral); reviewed as inert for this Linux-only
+  daemon. Independently re-verified: `cargo deny check` reports
+  advisories/bans/licenses/sources all ok.
+
 ### Upgraded
 
 - **MSRV: 1.85 → 1.88.** Required by `hickory-{net,proto,resolver,server}
