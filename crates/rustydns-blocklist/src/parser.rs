@@ -134,7 +134,7 @@ pub fn parse_hosts(content: &str) -> Vec<ParsedEntry> {
             _ => continue,
         }
         for domain in parts {
-            if let Some(d) = validate_and_normalize(domain)
+            if let Some(d) = validate_block_entry(domain)
                 && !is_always_skipped(&d)
             {
                 entries.push(ParsedEntry::Exact(d));
@@ -172,7 +172,7 @@ pub fn parse_plain(content: &str) -> Vec<ParsedEntry> {
         if line.is_empty() || line.contains(' ') || line.contains('\t') {
             continue;
         }
-        if let Some(d) = validate_and_normalize(line)
+        if let Some(d) = validate_block_entry(line)
             && !is_always_skipped(&d)
         {
             entries.push(ParsedEntry::Exact(d));
@@ -224,10 +224,10 @@ pub fn parse_rpz(content: &str) -> Vec<ParsedEntry> {
             }
         } else if rdata == "." {
             if let Some(parent) = name.strip_prefix("*.") {
-                if let Some(d) = validate_and_normalize(parent) {
+                if let Some(d) = validate_block_entry(parent) {
                     entries.push(ParsedEntry::WildcardParent(d));
                 }
-            } else if let Some(d) = validate_and_normalize(name)
+            } else if let Some(d) = validate_block_entry(name)
                 && !is_always_skipped(&d)
             {
                 entries.push(ParsedEntry::Exact(d));
@@ -276,7 +276,7 @@ pub fn parse_adguard(content: &str) -> Vec<ParsedEntry> {
             if domain_part.contains('/') {
                 continue; // URL path rule — skip
             }
-            if let Some(d) = validate_and_normalize(domain_part)
+            if let Some(d) = validate_block_entry(domain_part)
                 && !is_always_skipped(&d)
             {
                 entries.push(ParsedEntry::Exact(d.clone()));
@@ -376,6 +376,23 @@ fn validate_allow_entry(s: &str) -> Option<String> {
     Some(d)
 }
 
+/// Validate a BLOCKLIST entry: ordinary domain rules plus the same >= 2-label
+/// TLD guard the allowlist has — in the opposite direction. A single-label
+/// block wildcard (`||com^`) admitted from ONE compromised source would
+/// blackhole every .com domain fleet-wide, so it is skipped with a warn at
+/// parse time rather than loaded into the engine.
+fn validate_block_entry(s: &str) -> Option<String> {
+    let d = validate_and_normalize(s)?;
+    if !d.contains('.') {
+        tracing::warn!(
+            domain = %d,
+            "skipped blocklist entry: single-label / TLD-level entries are not allowed              (an entry for a TLD would block every domain under it)"
+        );
+        return None;
+    }
+    Some(d)
+}
+
 fn is_ip_address(s: &str) -> bool {
     s.parse::<std::net::Ipv4Addr>().is_ok() || s.parse::<std::net::Ipv6Addr>().is_ok()
 }
@@ -412,6 +429,55 @@ mod tests {
     }
     fn allow(s: &str) -> ParsedEntry {
         ParsedEntry::Allow(s.to_string())
+    }
+
+    // --- TLD guard for BLOCK entries (symmetry with the allowlist) ----------
+
+    #[test]
+    fn adguard_tld_wildcard_block_skipped() {
+        // One line from ONE compromised source must not blackhole an entire
+        // TLD fleet-wide. Same rationale as the allowlist TLD guard, opposite
+        // direction: block-side single-label wildcards are skipped at parse.
+        let entries = parse_adguard(
+            "||com^
+||example.com^
+",
+        );
+        let blocked: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| match e {
+                ParsedEntry::WildcardParent(d) | ParsedEntry::Exact(d) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        // ||example.com^ legitimately pushes BOTH an exact entry and a
+        // wildcard parent; the TLD line must contribute nothing.
+        assert_eq!(
+            blocked,
+            vec!["example.com", "example.com"],
+            "got {blocked:?}"
+        );
+    }
+
+    #[test]
+    fn hosts_single_label_block_skipped() {
+        assert!(
+            parse_hosts(
+                "0.0.0.0 com
+"
+            )
+            .is_empty()
+        );
+        // Two labels still load.
+        assert_eq!(
+            parse_hosts(
+                "0.0.0.0 example.com
+"
+            )
+            .len(),
+            1,
+            "ordinary entries must keep loading"
+        );
     }
 
     // --- format detection ---------------------------------------------------
