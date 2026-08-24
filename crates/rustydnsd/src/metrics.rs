@@ -530,15 +530,28 @@ async fn health_handler(ready: Arc<AtomicBool>) -> Response {
 /// Render the query ring buffer as JSON. Newest entry first. Hand-rolls
 /// the JSON so we don't pull `serde_json` in just for this endpoint —
 /// every field is a primitive or a known-ASCII string.
+/// Hard cap on how many ring entries one `/queries` scrape renders
+/// (newest first). At the maximum configured ring size (100 000) an
+/// uncapped render would allocate ~20 MB and burn Pi-class CPU on the SAME
+/// listener that serves `/health` — slow enough for orchestrator health
+/// checks to time out against a healthy daemon. Operators needing full
+/// fidelity have the opt-in on-disk NDJSON log; this endpoint is for spot
+/// inspection.
+const MAX_QUERIES_RENDERED: usize = 1000;
+
 async fn queries_handler(query_log: Arc<QueryLog>) -> Response {
     let entries = query_log.snapshot();
-    let mut out = String::with_capacity(64 + entries.len() * 128);
+    // Snapshot is newest-first, so `.take()` keeps the most recent entries.
+    let total = entries.len();
+    let rendered = total.min(MAX_QUERIES_RENDERED);
+    let mut out = String::with_capacity(96 + rendered * 128);
     out.push_str(&format!(
-        "{{\"capacity\":{},\"count\":{},\"entries\":[",
+        "{{\"capacity\":{},\"count\":{},\"returned\":{},\"entries\":[",
         query_log.capacity(),
-        entries.len()
+        total,
+        rendered
     ));
-    for (idx, e) in entries.iter().enumerate() {
+    for (idx, e) in entries.iter().take(rendered).enumerate() {
         if idx > 0 {
             out.push(',');
         }
@@ -684,6 +697,42 @@ mod tests {
         // endpoint reports that honestly instead of growing without limit.
         assert!(body.contains("\"capacity\":4"));
         assert!(body.contains("\"count\":4"));
+        assert!(body.contains("\"returned\":4"));
+    }
+
+    #[tokio::test]
+    async fn queries_endpoint_render_is_capped_at_1000_entries() {
+        // Self-DoS guard: at the maximum configured ring size an uncapped
+        // render would serialise 100 000 entries (~20 MB) per scrape on the
+        // SAME listener that serves /health — slow enough for orchestrator
+        // health checks to time out against a healthy daemon. The handler
+        // must render at most MAX_QUERIES_RENDERED (newest first), while
+        // `count` still reports the true number of surviving entries.
+        let log = Arc::new(QueryLog::new(1500));
+        let client = ClientId::from_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)));
+        for i in 0..1400u32 {
+            log.record(
+                &client,
+                &format!("q-{i}.example.org."),
+                "A",
+                0,
+                ServedBy::Resolver,
+            );
+        }
+
+        let resp = queries_handler(log.clone()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body collect");
+        let body = std::str::from_utf8(&body).expect("utf-8 body");
+
+        assert!(
+            body.contains("\"count\":1400"),
+            "true survivor count must be reported: {body:>80}"
+        );
+        assert!(body.contains("\"returned\":1000"));
+        let rendered = body.matches("\"qname_hash\":\"").count();
+        assert_eq!(rendered, 1000, "render must be capped at 1000 entries");
     }
 
     #[test]
