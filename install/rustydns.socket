@@ -34,6 +34,7 @@
 [Unit]
 Description=rustydns DNS listening sockets (socket activation)
 Documentation=https://github.com/Iwan-Teague/rustydns
+Documentation=man:rustydnsd(8)
 
 [Socket]
 Service=rustydns.service
