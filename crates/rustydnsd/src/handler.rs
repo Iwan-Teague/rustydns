@@ -4004,6 +4004,225 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dot_hostile_pointer_query_fails_closed_and_daemon_stays_live() {
+        // Decompression pin over DoT — the last transport without one.
+        //
+        // The client sends a query whose QUESTION NAME is a compression
+        // pointer pointing back at itself (offset 12 -> offset 12).
+        // hickory's strictly-prior rule rejects it on the first hop; the
+        // pinned contract is bounded work: silence or an error rcode within
+        // budget, NEVER a served answer derived from attacker bytes. A
+        // control leg (valid query first) proves any rejection is caused by
+        // the hostile bytes alone, and a final liveness leg proves the
+        // daemon keeps serving afterwards.
+        use crate::test_pem::{TEST_CA_PEM, TEST_CERT_CN, TEST_LEAF_CERT_PEM, TEST_LEAF_KEY_PEM};
+        use std::io::Write;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::{
+            ClientConfig,
+            pki_types::{CertificateDer, ServerName, pem::PemObject},
+        };
+
+        let _ = tokio_rustls::rustls::crypto::CryptoProvider::install_default(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        );
+
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority = Arc::new(
+            Authority::new(AuthorityConfig {
+                mesh_zone_bundle_path: None,
+                mesh_zone_verifier_key_path: None,
+                mesh_zone_max_age_secs: 600,
+                mesh_zone: "mesh.".to_string(),
+                static_records: vec![static_a("router.mesh", "100.64.0.7")],
+                poll_interval_secs: 30,
+            })
+            .unwrap(),
+        );
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            ..BlocklistConfig::default()
+        }));
+        let mut dns_config = DnsConfig {
+            upstream: UpstreamConfig {
+                resolvers: vec!["https://127.0.0.1:1/dns-query".to_string()],
+                timeout_ms: 500,
+                ..UpstreamConfig::default()
+            },
+            ..DnsConfig::default()
+        };
+        dns_config.privacy.randomize_upstream_selection = false;
+        dns_config.upstream.dnssec_validation = false;
+        let resolver = Arc::new(Resolver::new(dns_config).await.unwrap());
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            Arc::new(crate::query_log::QueryLog::new(16)),
+            Arc::new(crate::rate_limiter::RateLimiter::new(
+                &rustydns_core::config::RateLimitConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )),
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let cert_path = std::env::temp_dir().join(format!("rustydns-dot-hp-cert-{id}.pem"));
+        let key_path = std::env::temp_dir().join(format!("rustydns-dot-hp-key-{id}.pem"));
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(TEST_LEAF_CERT_PEM.as_bytes())
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(TEST_LEAF_KEY_PEM.as_bytes())
+            .unwrap();
+
+        use rustydns_core::config::ServerConfig as RsServerConfig;
+        let tls_server_cfg = crate::load_tls_config(&RsServerConfig {
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
+            ..RsServerConfig::default()
+        })
+        .expect("load_tls_config");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut server = Server::new(handler);
+        server
+            .register_tls_listener_with_tls_config(listener, Duration::from_secs(5), tls_server_cfg)
+            .expect("register DoT listener");
+
+        // --- Control leg: valid query must be served --------------------
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        let ca_der = CertificateDer::from_pem_slice(TEST_CA_PEM.as_bytes()).expect("parse CA");
+        roots.add(ca_der).expect("add CA");
+        let client_cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+        let server_name = ServerName::try_from(TEST_CERT_CN.to_string()).expect("server name");
+
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut tls = connector.connect(server_name.clone(), tcp).await.unwrap();
+        let mut msg = Message::new(0x1111, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query({
+            let mut qq = Query::new();
+            qq.set_name(ProtoName::from_ascii("router.mesh.").unwrap());
+            qq.set_query_type(ProtoRecordType::A);
+            qq
+        });
+        let body = msg.to_bytes().unwrap();
+        tls.write_all(&(body.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        tls.write_all(&body).await.unwrap();
+        let mut hdr = [0u8; 2];
+        tls.read_exact(&mut hdr)
+            .await
+            .expect("control reply length");
+        let n = u16::from_be_bytes(hdr) as usize;
+        let mut resp = vec![0u8; n];
+        tls.read_exact(&mut resp).await.unwrap();
+        let ok = Message::from_bytes(&resp).unwrap();
+        assert_eq!(ok.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(ok.answers.len(), 1, "authority hit expected");
+
+        // --- Hostile leg: self-referential pointer as the question name --
+        // Wire: header(QDCOUNT=1) | 0xC0 0x0C (pointer to offset 12 = the
+        // question name itself) | A IN.
+        let mut hostile = vec![0xDE, 0xAD, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        hostile.extend_from_slice(&[0xC0, 0x0C]);
+        hostile.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+        let tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut tls2 = connector.connect(server_name.clone(), tcp2).await.unwrap();
+        tls2.write_all(&(hostile.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        tls2.write_all(&hostile).await.unwrap();
+
+        // Bounded read: either an error response arrives within budget, or
+        // the stream ends — never an unbounded wait on attacker bytes.
+        let mut hdr2 = [0u8; 2];
+        let reply: Option<Vec<u8>> = tokio::time::timeout(Duration::from_secs(3), async {
+            tls2.read_exact(&mut hdr2).await.ok()?;
+            if hdr2 == [0, 0] {
+                return None;
+            }
+            let n2 = u16::from_be_bytes(hdr2) as usize;
+            let mut body = vec![0u8; n2];
+            tls2.read_exact(&mut body).await.ok()?;
+            Some(body)
+        })
+        .await
+        .unwrap_or_default();
+
+        match reply {
+            // Silence (timeout) satisfies the contract.
+            None => {}
+            Some(bytes) => {
+                // A reply DID come back for attacker bytes: it must never be
+                // a served answer. FORMERR or another error rcode is fine;
+                // NoError-with-records is not.
+                if let Ok(parsed) = Message::from_bytes(&bytes) {
+                    assert!(
+                        !(parsed.metadata.response_code == ResponseCode::NoError
+                            && !parsed.answers.is_empty()),
+                        "DoT pointer-loop query produced a served answer: {parsed:?}"
+                    );
+                }
+            }
+        }
+        // Silence and errors are both acceptable; what matters is that the
+        // daemon survived, proven by the liveness leg below.
+
+        // Liveness leg: a FRESH TLS connection still gets served promptly.
+        let tcp3 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut tls3 = connector.connect(server_name.clone(), tcp3).await.unwrap();
+        let mut msg3 = Message::new(0x3333, MessageType::Query, OpCode::Query);
+        msg3.metadata.recursion_desired = true;
+        msg3.add_query({
+            let mut q = Query::new();
+            q.set_name(ProtoName::from_ascii("router.mesh.").unwrap());
+            q.set_query_type(ProtoRecordType::A);
+            q
+        });
+        let body3 = msg3.to_bytes().unwrap();
+        tls3.write_all(&(body3.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        tls3.write_all(&body3).await.unwrap();
+        let mut hdr3 = [0u8; 2];
+        tls3.read_exact(&mut hdr3)
+            .await
+            .expect("liveness reply length");
+        let n3 = u16::from_be_bytes(hdr3) as usize;
+        let mut resp3 = vec![0u8; n3];
+        tls3.read_exact(&mut resp3).await.expect("liveness body");
+        let ok3 = Message::from_bytes(&resp3).unwrap();
+        assert_eq!(ok3.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(ok3.answers.len(), 1, "authority hit expected");
+
+        drop(server);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dot_listener_refuses_plaintext_connection_on_its_port() {
         // DoT is RFC 7858: the port speaks TLS and NOTHING else. Control
         // leg proves the port serves real TLS DNS; attack leg connects a
