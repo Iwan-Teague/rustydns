@@ -741,6 +741,10 @@ struct ActiveListeners {
     live_doq: Option<SocketAddr>,
     live_tls_paths: (Option<PathBuf>, Option<PathBuf>),
     live_doh: Option<SocketAddr>,
+    /// Upstream timeout the CURRENT DoH server was built with — a SIGHUP
+    /// that changes only `upstream.timeout_ms` must still rebind DoH so its
+    /// derived deadline tracks the resolver.
+    live_doh_timeout: Option<Duration>,
     live_metrics: Option<SocketAddr>,
     live_metrics_path: String,
     /// Flipped once startup has finished binding the DNS listeners. `/health`
@@ -774,6 +778,7 @@ impl ActiveListeners {
             live_doq,
             live_tls_paths,
             live_doh: None,
+            live_doh_timeout: None,
             live_metrics: None,
             live_metrics_path: String::new(),
             health_ready: Arc::new(AtomicBool::new(false)),
@@ -821,6 +826,7 @@ impl ActiveListeners {
             old.cancel();
         }
         self.live_doh = Some(addr);
+        self.live_doh_timeout = Some(upstream_timeout);
         info!(listen = %addr, "DoH listener started");
         Ok(())
     }
@@ -1001,7 +1007,8 @@ impl ActiveListeners {
                 return;
             }
         };
-        if new_doh == self.live_doh {
+        let new_timeout = Duration::from_millis(cfg.upstream.timeout_ms);
+        if new_doh == self.live_doh && Some(new_timeout) == self.live_doh_timeout {
             return;
         }
         match new_doh {
@@ -1010,6 +1017,7 @@ impl ActiveListeners {
                     old.cancel();
                 }
                 self.live_doh = None;
+                self.live_doh_timeout = None;
                 info!("SIGHUP: DoH listener removed");
             }
             Some(addr) if listeners::is_privileged(&addr) => {
@@ -2192,6 +2200,7 @@ mod tests {
             live_doq: None,
             live_tls_paths: (None, None),
             live_doh: Some("127.0.0.1:8053".parse().unwrap()),
+            live_doh_timeout: Some(Duration::from_millis(5000)),
             live_metrics: Some("127.0.0.1:8089".parse().unwrap()),
             live_metrics_path: "/metrics".to_string(),
             health_ready: Arc::new(AtomicBool::new(false)),
@@ -2235,6 +2244,36 @@ mod tests {
         assert!(
             al.metrics_token.is_some(),
             "current metrics listener must stay alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn sighup_rebinds_doh_when_only_upstream_timeout_changes() {
+        // The DoH deadline derives from upstream.timeout_ms. If a SIGHUP
+        // changes ONLY that value, reload_doh_group must NOT take the
+        // address-unchanged fast path — otherwise the running HTTP server
+        // keeps the old deadline while the rebuilt resolver honours the new
+        // one, reintroducing the transport race for that timeout.
+        let mut al = reload_test_listeners().await;
+
+        let mut cfg = base_config();
+        cfg.server.doh_listen = Some("127.0.0.1:8053".to_string()); // same addr as live
+        cfg.upstream.timeout_ms = 900; // differs from the 5000 recorded
+        al.reload_doh_group(&cfg);
+
+        assert_eq!(
+            al.live_doh_timeout,
+            Some(Duration::from_millis(900)), // raw upstream ms (derive happens in serve)
+            "timeout-only change must force a DoH rebind tracking the new upstream timeout"
+        );
+
+        // Idempotent leg: reloading with identical settings must be a no-op
+        // (no spurious rebinds).
+        let before = al.live_doh_timeout;
+        al.reload_doh_group(&cfg);
+        assert_eq!(
+            al.live_doh_timeout, before,
+            "identical reload must not churn"
         );
     }
 
