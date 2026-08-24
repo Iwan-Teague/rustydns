@@ -1844,6 +1844,28 @@ pub fn load_config(path: &std::path::Path) -> Result<DnsConfig, crate::RustyDnsE
 pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     // --- Server ------------------------------------------------------------------
 
+    // Plain DNS listeners are the daemon's reason to exist: an empty or
+    // whitespace-only `listen` list would produce a running process that
+    // serves no DNS at all — silent uselessness rather than a clean error.
+    if cfg.server.listen.is_empty() {
+        return Err(crate::RustyDnsError::Config(
+            "server.listen is empty — configure at least one address:port for plain DNS \
+             (e.g. `[\"127.0.0.1:53\"]`)"
+                .to_string(),
+        ));
+    }
+    let any_parseable = cfg
+        .server
+        .listen
+        .iter()
+        .any(|l| l.parse::<std::net::SocketAddr>().is_ok());
+    if !any_parseable {
+        return Err(crate::RustyDnsError::Config(format!(
+            "none of server.listen entries are parseable addresses: {:?}",
+            cfg.server.listen
+        )));
+    }
+
     // mesh_zone must end with '.'
     if !cfg.server.mesh_zone.ends_with('.') {
         return Err(crate::RustyDnsError::Config(format!(
@@ -2697,6 +2719,20 @@ mod tests {
         let mut cfg = baseline();
         cfg.server.mesh_zone = "MESH.".to_string();
         validate_config(&cfg).expect("case-only difference must pass");
+    }
+
+    #[test]
+    fn empty_plain_listen_rejected() {
+        let mut cfg = baseline();
+        cfg.server.listen = Vec::new();
+        assert_config_err(validate_config(&cfg), "server.listen is empty");
+    }
+
+    #[test]
+    fn unparseable_only_plain_listen_rejected() {
+        let mut cfg = baseline();
+        cfg.server.listen = vec!["not-an-addr".to_string()];
+        assert_config_err(validate_config(&cfg), "none of server.listen");
     }
 
     #[test]
