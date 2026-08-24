@@ -21,6 +21,18 @@ use crate::config::BlockWindow;
 /// Bit `i` (Mon=0 … Sun=6) set means that weekday is included. `0x7f` = all.
 const ALL_DAYS: u8 = 0b0111_1111;
 
+/// Before this instant the system clock is considered UNRELIABLE (dead RTC,
+/// fresh board defaulting to the epoch). Evaluating block windows against
+/// such a clock would match arbitrary 1970 weekdays — silently failing OPEN
+/// for most configurations — so consumers must enforce conservatively
+/// instead (see [`BlockSchedule::is_blocked_at_conservative`]).
+pub const MIN_TRUSTED_UNIX_SECS: u64 = 1_577_836_800; // 2020-01-01 UTC
+
+/// True iff `unix_secs` is trustworthy for schedule evaluation.
+pub fn unix_secs_is_trusted(unix_secs: u64) -> bool {
+    unix_secs >= MIN_TRUSTED_UNIX_SECS
+}
+
 /// A single compiled window.
 #[derive(Debug, Clone, Copy)]
 struct CompiledWindow {
@@ -89,6 +101,18 @@ impl BlockSchedule {
     /// Returns `true` if `unix_secs` falls inside any block window.
     pub fn is_blocked_at(&self, unix_secs: u64) -> bool {
         self.windows.iter().any(|w| window_matches(w, unix_secs))
+    }
+
+    /// Conservative evaluation used by the daemon: when the wall clock is
+    /// UNTRUSTED (before [`MIN_TRUSTED_UNIX_SECS`] — dead RTC battery,
+    /// fresh board), a client with configured windows stays RESTRICTED
+    /// rather than silently gaining unrestricted access until the clock is
+    /// fixed. Empty schedules are unaffected.
+    pub fn is_blocked_at_conservative(&self, unix_secs: u64) -> bool {
+        if !unix_secs_is_trusted(unix_secs) {
+            return !self.windows.is_empty();
+        }
+        self.is_blocked_at(unix_secs)
     }
 
     /// Returns `true` if no windows are configured.
@@ -283,6 +307,27 @@ mod tests {
     fn equal_start_end_rejected() {
         let err = BlockSchedule::compile(&[win(&[], Some("09:00"), Some("09:00"), 0)]).unwrap_err();
         assert!(err.contains("equal"), "{err}");
+    }
+
+    #[test]
+    fn untrusted_clock_enforces_windows_conservatively() {
+        // Pre-epoch wall clock: matching against 1970-01-01 (a Thursday)
+        // would fail OPEN for most window shapes. Conservative evaluation
+        // must keep ANY configured restriction active until the clock is
+        // trustworthy, and must NOT restrict clients without windows.
+        let s = BlockSchedule::compile(&[win(&["mon"], None, None, 0)]).unwrap();
+        assert!(
+            s.is_blocked_at_conservative(0),
+            "untrusted clock + windows -> restricted"
+        );
+        // Trusted clock behaves normally (Monday noon not in a sun-only
+        // window... use the mon window at Monday noon -> blocked).
+        assert!(s.is_blocked_at_conservative(MON_NOON_UTC));
+        let empty = BlockSchedule::default();
+        assert!(
+            !empty.is_blocked_at_conservative(0),
+            "no windows -> never conservative-block"
+        );
     }
 
     #[test]

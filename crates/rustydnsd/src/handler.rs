@@ -249,7 +249,11 @@ impl DnsHandler {
                 log_all_queries: p.log_all_queries,
                 // Evaluate the (pre-compiled) block schedule against now. Cheap
                 // when no windows are configured (empty schedule → false).
-                schedule_blocked: !p.schedule.is_empty() && p.schedule.is_blocked_at(now_unix()),
+                // Conservative eval: an untrusted wall clock (pre-epoch, dead RTC)
+                // keeps configured restrictions ACTIVE instead of silently
+                // failing open.
+                schedule_blocked: !p.schedule.is_empty()
+                    && p.schedule.is_blocked_at_conservative(now_unix()),
                 blocklist_group: p.blocklist_group.clone(),
             },
             None => PolicyDecision::default(),
