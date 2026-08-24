@@ -139,6 +139,10 @@ fn set_reuse(socket: &Socket) -> Result<()> {
 pub struct InheritedSockets {
     udp: Vec<(SocketAddr, tokio::net::UdpSocket)>,
     tcp: Vec<(SocketAddr, tokio::net::TcpListener)>,
+    /// Total fds systemd passed, captured at adoption time. Stays non-zero
+    /// as the set drains so late-binding listeners can still tell that
+    /// socket activation is ACTIVE.
+    total_passed: usize,
 }
 
 impl InheritedSockets {
@@ -149,7 +153,14 @@ impl InheritedSockets {
         Self {
             udp: Vec::new(),
             tcp: Vec::new(),
+            total_passed: 0,
         }
+    }
+
+    /// Whether socket activation was active for this process (any fds were
+    /// handed over), regardless of how many remain unadopted.
+    pub fn socket_activation_active(&self) -> bool {
+        self.total_passed > 0
     }
 
     /// Adopt every socket passed via `LISTEN_FDS`.
@@ -164,6 +175,7 @@ impl InheritedSockets {
     /// conversions register with the reactor).
     pub fn from_env() -> Result<Self> {
         let mut lf = ListenFd::from_env();
+        let total_passed = lf.len();
         let mut udp = Vec::new();
         let mut tcp = Vec::new();
         for idx in 0..lf.len() {
@@ -194,7 +206,11 @@ impl InheritedSockets {
                 );
             }
         }
-        Ok(Self { udp, tcp })
+        Ok(Self {
+            udp,
+            tcp,
+            total_passed,
+        })
     }
 
     /// `true` if no sockets were inherited (the common, non-socket-activated
@@ -234,12 +250,24 @@ fn udp_listener(
             tracing::info!(listen = %addr, "adopted UDP socket from systemd (LISTEN_FDS)");
             Ok(sock)
         }
-        None => bind_udp(addr),
+        None => {
+            // Under ACTIVE socket activation, falling through to a fresh
+            // bind usually means the .socket unit's Listen directive does
+            // not match this configured address exactly: systemd keeps the
+            // port queued for an accept loop that will never come, while we
+            // serve elsewhere — a silent external blackhole. Make it loud.
+            if inherited.socket_activation_active() {
+                tracing::warn!(
+                    listen = %addr,
+                    "socket activation active but no inherited UDP socket matches this \
+                     listener; bound fresh — verify the .socket unit Listen directives"
+                );
+            }
+            bind_udp(addr)
+        }
     }
 }
 
-/// Use an inherited (socket-activated) TCP listener bound to `addr` if one was
-/// passed, else bind a fresh one with `SO_REUSEPORT`.
 fn tcp_listener(
     addr: SocketAddr,
     inherited: &mut InheritedSockets,
@@ -249,7 +277,16 @@ fn tcp_listener(
             tracing::info!(listen = %addr, "adopted TCP listener from systemd (LISTEN_FDS)");
             Ok(listener)
         }
-        None => bind_tcp(addr),
+        None => {
+            if inherited.socket_activation_active() {
+                tracing::warn!(
+                    listen = %addr,
+                    "socket activation active but no inherited TCP listener matches this \
+                     listener; bound fresh — verify the .socket unit Listen directives"
+                );
+            }
+            bind_tcp(addr)
+        }
     }
 }
 
@@ -377,6 +414,7 @@ mod tests {
         let mut inherited = InheritedSockets {
             udp: vec![(addr, seeded)],
             tcp: Vec::new(),
+            total_passed: 1,
         };
         assert!(!inherited.is_empty());
         assert_eq!(inherited.remaining(), 1);
@@ -400,6 +438,7 @@ mod tests {
         let mut inherited = InheritedSockets {
             udp: Vec::new(),
             tcp: vec![(addr, seeded)],
+            total_passed: 1,
         };
 
         let adopted = tcp_listener(addr, &mut inherited).unwrap();
@@ -426,6 +465,7 @@ mod tests {
         let mut inherited = InheritedSockets {
             udp: vec![(addr, seeded)],
             tcp: Vec::new(),
+            total_passed: 1,
         };
 
         // Build a server that listens on a *different* unprivileged port: the
