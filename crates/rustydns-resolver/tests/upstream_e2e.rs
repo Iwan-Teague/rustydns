@@ -817,6 +817,134 @@ async fn compression_pointer_loop_fails_closed() {
 }
 
 #[tokio::test]
+async fn compression_pointer_overlap_trap_fails_closed_bounded() {
+    // Exercises the RECURSIVE pointer-follow path with only PRIOR pointers —
+    // every other hostile-pointer test in this suite dies on hop 1, so the
+    // nested-decode guards are never exercised by attacker input.
+    //
+    // The trap: answer 2's owner name is a single prior pointer into answer
+    // 1's owner LABEL DATA, crafted so the nested label walk crosses answer
+    // 2's own start offset at a label boundary. hickory's decoder bounds
+    // each nested read to its originating name (`LabelOverlapsWithOther`,
+    // max_idx guard) — cross-record bytes may not be reinterpreted as part
+    // of another name. Pinned: fail closed (AllUpstreamsFailed) within an
+    // explicit wall-clock budget.
+    //
+    // Deliberately NOT built here: a maximal-length (~32k hop) descending
+    // chain. Pointer targets must strictly decrease, so total hops are
+    // bounded by the message offset of the first compressed name — a
+    // correctness invariant proven by the hop-1 tests, not something a
+    // bigger message would test differently; the overlap trap below is what
+    // actually reaches new code paths.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().expect("local_addr");
+    let shutdown = CancellationToken::new();
+    let sh = shutdown.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            tokio::select! {
+                _ = sh.cancelled() => break,
+                res = socket.recv_from(&mut buf) => {
+                    let Ok((_, src)) = res else { continue };
+
+                    // Layout (offsets tracked programmatically):
+                    //   header(12) | question | answer1(TXT whose rdata is a
+                    //   chain of two length-prefixed character-strings) |
+                    //   answer2(owner = single prior pointer INTO answer1's
+                    //   rdata, i.e. at the first string-length byte).
+                    //
+                    // Decoding answer 2's owner walks: label(63) →
+                    // label(62) → and the second label's END lands exactly on
+                    // answer 2's own start offset — the max_idx guard must
+                    // fire (`LabelOverlapsWithOther`) instead of letting one
+                    // record's rdata be reinterpreted as another record's
+                    // name.
+                    let raw = build_overlap_trap_wire();
+                    let _ = socket.send_to(&raw, src).await;
+                }
+            }
+        }
+    });
+
+    let resolver = Resolver::new(plain_config(&addr.to_string()))
+        .await
+        .expect("resolver init");
+    let started = std::time::Instant::now();
+    let err = resolver
+        .resolve("victim.example.org.", "A")
+        .await
+        .expect_err("an overlapping decompression must fail closed");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "overlap-trap reply must fail closed, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "overlap rejection exceeded the bounded-work budget"
+    );
+    shutdown.cancel();
+}
+
+/// Build the overlap-trap wire. Split out so the decoder-level contract can
+/// be asserted directly (see `overlap_trap_wire_hits_label_overlap_error`).
+fn build_overlap_trap_wire() -> Vec<u8> {
+    let mut raw: Vec<u8> = Vec::new();
+    raw.extend_from_slice(&[0x12, 0x34, 0x80, 0x00]); // id, QR
+    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x02]); // QD=1 AN=2
+    raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    // Question: victim.example.org. A IN
+    raw.extend_from_slice(b"\x06victim\x07example\x03org\x00");
+    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+    // Answer 1 owner: "t." + TXT
+    let s = raw.len();
+    raw.extend_from_slice(b"\x01t\x00");
+    raw.extend_from_slice(&[0x00, 0x10]); // TXT
+    raw.extend_from_slice(&[0x00, 0x01]); // IN
+    raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
+    let trap: Vec<u8> = [
+        [0x3F].as_slice(),
+        &[b'z'; 63],
+        [0x3E].as_slice(),
+        &[b'y'; 62],
+    ]
+    .concat();
+    raw.extend_from_slice(&(trap.len() as u16).to_be_bytes());
+    let t = raw.len(); // trap target: first string-length byte
+    raw.extend_from_slice(&trap);
+    let a2_start = raw.len();
+
+    // Answer 2: owner = prior pointer to T, then A-record tail.
+    raw.extend_from_slice(&[0xC0, t as u8]);
+    raw.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+    raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
+    raw.extend_from_slice(&[0x00, 0x04, 203, 0, 113, 2]);
+
+    debug_assert_eq!(a2_start, s + 3 + 10 + trap.len());
+    // The nested walk from T must land exactly on answer 2's own start:
+    // length byte + 63 data + length byte + 62 data == distance to a2_start.
+    debug_assert_eq!(t + 1 + 63 + 1 + 62, a2_start);
+    raw
+}
+
+#[test]
+fn overlap_trap_wire_hits_label_overlap_error() {
+    // Decoder-level proof for the e2e leg above: the resolver only exposes
+    // AllUpstreamsFailed, so pin the underlying cause here — hickory must
+    // reject this wire with the label-overlap guard (cross-record bytes may
+    // not be reinterpreted as another name), NOT with a first-hop pointer
+    // rejection (the target is genuinely prior) and NOT by decoding it.
+    use hickory_proto::serialize::binary::DecodeError;
+    let wire = build_overlap_trap_wire();
+    let err = Message::from_bytes(&wire).expect_err("overlap trap must not decode");
+    assert!(
+        matches!(err, DecodeError::LabelOverlapsWithOther { .. }),
+        "expected LabelOverlapsWithOther, got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn txid_mismatch_is_dropped_not_served() {
     // The exchange correlates replies to pending queries by 16-bit
     // transaction ID. A hostile reply with a FOREIGN id (a guessed or
