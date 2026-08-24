@@ -251,6 +251,14 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Packaging
 
+- **Container healthcheck actually works now.** The Dockerfile and
+  compose healthchecks called `wget`, which `debian:bookworm-slim`
+  deliberately does not ship — every container reported `unhealthy`
+  while serving perfectly. The probe now uses bash's built-in
+  `/dev/tcp` to GET `/health` (bash + grep are Essential packages in
+  even `-slim`), requires a literal `200 OK` so it still gates on
+  listener readiness, and gains `start_period=15s` for slow first
+  blocklist fetches. Verified against the release binary.
 - **Multi-stage `Dockerfile`** — `rust:1.88-bookworm` builder →
   `debian:bookworm-slim` runtime. Non-root `rustydns` user,
   `cap_net_bind_service` file capability on the binary so `:53`
