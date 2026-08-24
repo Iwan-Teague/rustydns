@@ -563,6 +563,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn doh_get_duplicate_dns_param_is_handled_deterministically() {
+        // RFC 8484 does not define repeated `dns=` parameters, but proxies
+        // and middleboxes sometimes append one. Whatever axum's
+        // duplicate-key resolution is (reject / first-wins / last-wins),
+        // the pinned contract is: the request either fails as a bad request,
+        // or behaves EXACTLY like a single well-formed query for the name in
+        // the FIRST parameter — never a mixed/garbage-derived answer, and
+        // never more than one DNS response.
+        let handler = build_handler(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+        let client = reqwest::Client::builder().build().unwrap();
+
+        let valid = build_query("router.mesh.", ProtoRecordType::A);
+        let mut garbage = vec![0xFFu8; 16]; // undecodable header+question bytes
+        garbage[2] = 0x01;
+        let dup_url = format!(
+            "{base}/dns-query?dns={}&dns={}",
+            URL_SAFE_NO_PAD.encode(&valid),
+            URL_SAFE_NO_PAD.encode(&garbage),
+        );
+
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.get(&dup_url).send())
+            .await
+            .expect("duplicate-param GET must not hang")
+            .expect("GET completes");
+        let status = resp.status();
+        let _body = resp.bytes().await.unwrap();
+
+        // Observed axum 0.8 / serde_urlencoded behaviour, pinned: a repeated
+        // `dns` key is a struct-deserialisation error → Query extractor
+        // rejects with 400 BAD_REQUEST before any DNS parsing happens. The
+        // request can never execute a payload chosen by duplicate-key
+        // resolution.
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "duplicate dns= params must be rejected as malformed"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "duplicate-param handling exceeded the bounded-work budget"
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn doh_rejects_unsupported_methods() {
         // Input hardening: the router registers ONLY GET and POST on
         // /dns-query. PUT/DELETE are rejected by the framework with 405
