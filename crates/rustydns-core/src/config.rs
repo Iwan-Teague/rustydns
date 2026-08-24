@@ -151,6 +151,31 @@ pub struct DnsConfig {
     pub safesearch: SafeSearchConfig,
 }
 
+impl DnsConfig {
+    /// A clone of this config that is safe to print or dump: every
+    /// URL-bearing field (upstream resolvers, ODoH proxies, conditional
+    /// routes, blocklist sources) has its credential components replaced via
+    /// [`redact_url_credentials`].
+    ///
+    /// Used by `--print-config` so operator terminals, CI logs and shell
+    /// history never receive embedded upstream credentials. Validation is
+    /// unaffected — run it on the real config (`load_config` does).
+    pub fn redacted_for_display(&self) -> DnsConfig {
+        let mut cfg = self.clone();
+        let redact_list = |list: &Vec<String>| -> Vec<String> {
+            list.iter().map(|u| redact_url_credentials(u)).collect()
+        };
+        cfg.upstream.resolvers = redact_list(&cfg.upstream.resolvers);
+        cfg.upstream.odoh_proxies = redact_list(&cfg.upstream.odoh_proxies);
+        for route in &mut cfg.upstream.routes {
+            route.resolvers = redact_list(&route.resolvers);
+        }
+        cfg.blocklist.sources = redact_list(&cfg.blocklist.sources);
+        cfg.blocklist.trusted_rpz_sources = redact_list(&cfg.blocklist.trusted_rpz_sources);
+        cfg
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DNS rewrite / local cloaking map
 // ---------------------------------------------------------------------------
@@ -1307,6 +1332,80 @@ impl serde::Serialize for Secret {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Display-time credential redaction
+// ---------------------------------------------------------------------------
+
+/// Is this URL query-parameter key one that commonly carries a credential?
+fn is_secret_param_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "token" | "apikey" | "api_key" | "api-key" | "key" | "secret" | "password" | "passwd"
+            | "pass"
+    )
+}
+
+/// Redact credential components from a URL string for safe display.
+///
+/// Two rules, applied textually (no full URL parser — the inputs are
+/// operator-written strings that already passed validation):
+///
+/// 1. **Userinfo**: anything between `scheme://` and the last `@` before the
+///    first `/` or `?` becomes `<redacted>` (`https://user:pass@host/p` →
+///    `https://<redacted>@host/p`). Using the *last* `@` keeps passwords
+///    containing literal `@` working; percent-encoded characters are never
+///    decoded. A password containing a raw unencoded `/` is malformed input
+///    and not handled.
+/// 2. **Query parameters** whose key is a common credential name (token,
+///    apikey, key, secret, password, … — case-insensitive) get their value
+///    replaced (`…/list?token=t0p` → `…/list?token=<redacted>`).
+///
+/// Strings without a `scheme://` prefix (file paths, bare hosts) are returned
+/// untouched. Hosts, ports, paths and non-credential query parameters are
+/// preserved so the output stays useful for debugging. The result is
+/// intentionally NOT round-trippable into a running daemon when a redaction
+/// fired — paste credentials from the real config file, not from a dump.
+pub fn redact_url_credentials(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after_scheme = &url[scheme_end + 3..];
+    let authority_end = after_scheme.find(['/', '?']).unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let rest = &after_scheme[authority_end..];
+
+    let mut out = String::with_capacity(url.len() + "<redacted>".len());
+    out.push_str(&url[..scheme_end + 3]);
+    match authority.rfind('@') {
+        Some(at) => {
+            out.push_str("<redacted>@");
+            out.push_str(&authority[at + 1..]);
+        }
+        None => out.push_str(authority),
+    }
+    out.push_str(rest);
+
+    // Redact credential-bearing query parameters, preserving order and all
+    // other pairs.
+    if let Some(q) = out.find('?') {
+        let head = out[..=q].to_string();
+        let redacted = out[q + 1..]
+            .split('&')
+            .map(|pair| {
+                let mut kv = pair.splitn(2, '=');
+                let key = kv.next().unwrap_or("");
+                match (key, kv.next()) {
+                    (_, Some(_)) if is_secret_param_key(key) => format!("{key}=<redacted>"),
+                    _ => pair.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        out = head + &redacted;
+    }
+    out
+}
+
 #[cfg(test)]
 mod secret_tests {
     use super::Secret;
@@ -1336,6 +1435,105 @@ mod secret_tests {
     fn deserialize_reads_real_value() {
         let h: Holder = toml::from_str("token = \"hunter2\"").unwrap();
         assert_eq!(h.token.expose(), "hunter2");
+    }
+}
+
+#[cfg(test)]
+mod display_redaction_tests {
+    use super::{redact_url_credentials, DnsConfig};
+
+    #[test]
+    fn userinfo_password_is_redacted() {
+        assert_eq!(
+            redact_url_credentials("https://alice:hunter2@dns.example/dns-query"),
+            "https://<redacted>@dns.example/dns-query"
+        );
+    }
+
+    #[test]
+    fn userinfo_without_password_is_redacted() {
+        assert_eq!(
+            redact_url_credentials("https://alice@dns.example/dns-query"),
+            "https://<redacted>@dns.example/dns-query"
+        );
+    }
+
+    #[test]
+    fn password_containing_at_still_redacts_fully() {
+        // The LAST '@' in the authority terminates the userinfo.
+        assert_eq!(
+            redact_url_credentials("https://alice:p@ss@dns.example/dns-query"),
+            "https://<redacted>@dns.example/dns-query"
+        );
+    }
+
+    #[test]
+    fn url_without_credentials_is_untouched() {
+        let plain = "https://dns.example/dns-query?cache=1";
+        assert_eq!(redact_url_credentials(plain), plain);
+        let bare = "127.0.0.1:5353";
+        assert_eq!(redact_url_credentials(bare), bare);
+    }
+
+    #[test]
+    fn non_url_paths_are_untouched() {
+        let path = "/var/lib/rustydns/mesh-zone.ndjson";
+        assert_eq!(redact_url_credentials(path), path);
+    }
+
+    #[test]
+    fn credential_query_parameters_are_redacted() {
+        assert_eq!(
+            redact_url_credentials("https://lists.example/list?token=t0ps3cret&format=hosts"),
+            "https://lists.example/list?token=<redacted>&format=hosts"
+        );
+        // Case-insensitive key match.
+        assert_eq!(
+            redact_url_credentials("https://lists.example/l?Token=x&ApiKey=y&other=z"),
+            "https://lists.example/l?Token=<redacted>&ApiKey=<redacted>&other=z"
+        );
+    }
+
+    #[test]
+    fn ipv6_authority_without_userinfo_is_untouched() {
+        let url = "https://[2001:db8::1]:8443/dns-query";
+        assert_eq!(redact_url_credentials(url), url);
+    }
+
+    #[test]
+    fn config_display_clone_redacts_every_url_field() {
+        let toml_body = r#"
+[upstream]
+resolvers = ["https://alice:hunter2@dns.example/dns-query"]
+odoh_proxies = ["https://proxyuser:pw@relay.example/query"]
+
+[[upstream.routes]]
+zone = "lan."
+resolvers = ["quic://r:secret-pw@192.168.0.2:853"]
+
+[blocklist]
+sources = ["https://lists.example/a?token=t0ps3cret"]
+trusted_rpz_sources = ["https://rpz.example/rpz?key=k3y"]
+"#;
+        let cfg: DnsConfig = toml::from_str(toml_body).expect("parse");
+        let shown = cfg.redacted_for_display();
+        assert!(
+            !shown.upstream.resolvers[0].contains("hunter2")
+                && shown.upstream.resolvers[0].contains("<redacted>"),
+            "global resolvers must be redacted: {:?}",
+            shown.upstream.resolvers
+        );
+        assert!(shown.upstream.odoh_proxies[0].contains("<redacted>@"));
+        assert!(shown.upstream.routes[0].resolvers[0].contains("<redacted>@"));
+        assert!(shown.blocklist.sources[0].contains("token=<redacted>"));
+        assert!(shown.blocklist.trusted_rpz_sources[0].contains("key=<redacted>"));
+
+        // The ORIGINAL config keeps its secrets — only the display clone is
+        // scrubbed (a running daemon must still authenticate).
+        assert!(
+            cfg.upstream.resolvers[0].contains("hunter2"),
+            "display-redaction must not mutate the live config"
+        );
     }
 }
 
