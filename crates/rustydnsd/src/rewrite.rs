@@ -294,8 +294,10 @@ mod tests {
         ));
         // apex → NOT matched (wildcard excludes apex)
         assert!(map.lookup("ads.example.com.", RecordType::A).is_none());
-        // unrelated name that merely shares a trailing label → NOT matched
+        // unrelated names that merely share trailing label text → NOT matched
+        // ("notads" glues onto "ads"; label boundary, not substring match)
         assert!(map.lookup("notads.example.com.", RecordType::A).is_none());
+        assert!(map.lookup("evilads.example.com.", RecordType::A).is_none());
     }
 
     #[test]
@@ -314,6 +316,11 @@ mod tests {
             map.lookup("other.example.com.", RecordType::A),
             Some(RewriteDecision::Nxdomain)
         ));
+        // A name whose LABEL TEXT glues onto the zone ("evil"+"example.com")
+        // must NOT match the *.example.com rule — the doc comment on
+        // `suffixes` promises this; pin it so a refactor to substring
+        // matching cannot silently rewrite attacker-registered lookalikes.
+        assert!(map.lookup("evilexample.com.", RecordType::A).is_none());
     }
 
     #[test]
