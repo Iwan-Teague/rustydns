@@ -417,10 +417,39 @@ fn build_record(
 }
 
 fn enforce_freshness(bundle: &LoadedBundle, max_age_secs: u64) -> Result<(), MeshBundleError> {
-    let now = SystemTime::now()
+    enforce_freshness_at(bundle, max_age_secs, unix_now_secs())
+}
+
+/// Wall clock, floored at 0 for pre-epoch clocks. Callers MUST treat a value
+/// below [`MIN_TRUSTED_UNIX_SECS`] as an untrusted clock (see
+/// `enforce_freshness_at`) rather than evaluating freshness with it.
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Before this instant the system clock is considered UNRELIABLE (dead RTC,
+/// fresh board defaulting to the epoch). Evaluating bundle freshness against
+/// such a clock would pass every expiry check (now = 0 < any expires_at),
+/// letting old signed bundles replay indefinitely — so we fail closed.
+const MIN_TRUSTED_UNIX_SECS: u64 = 1_577_836_800; // 2020-01-01 UTC
+
+fn enforce_freshness_at(
+    bundle: &LoadedBundle,
+    max_age_secs: u64,
+    now: u64,
+) -> Result<(), MeshBundleError> {
+    if now < MIN_TRUSTED_UNIX_SECS {
+        return Err(MeshBundleError::Stale {
+            reason: format!(
+                "system clock reads unix={now}, before the plausibility floor \
+                 ({MIN_TRUSTED_UNIX_SECS}); refusing to evaluate bundle freshness with an \
+                 untrusted clock. Fix the system time and reload."
+            ),
+        });
+    }
 
     if now >= bundle.expires_at_unix {
         return Err(MeshBundleError::Stale {
@@ -576,6 +605,39 @@ fn nibble(b: u8) -> Result<u8, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bundle_at(generated: u64, expires: u64) -> LoadedBundle {
+        LoadedBundle {
+            records: Vec::new(),
+            generated_at_unix: generated,
+            expires_at_unix: expires,
+            nonce: 1,
+        }
+    }
+
+    #[test]
+    fn freshness_untrusted_clock_fails_closed() {
+        // A pre-floor clock (dead RTC, fresh board) must REJECT the bundle:
+        // with now=0 every expiry check would trivially pass, letting old
+        // signed bundles replay indefinitely.
+        let b = bundle_at(1_000_000_000, 2_000_000_000);
+        let err = enforce_freshness_at(&b, 600, 0).expect_err("untrusted clock must fail closed");
+        assert!(matches!(err, MeshBundleError::Stale { .. }));
+    }
+
+    #[test]
+    fn freshness_sane_clock_still_enforces_windows() {
+        const NOW: u64 = 1_700_000_000; // post-floor sanity
+        // Fresh + unexpired -> ok.
+        enforce_freshness_at(&bundle_at(NOW - 60, NOW + 3600), 600, NOW).unwrap();
+        // Expired -> rejected.
+        let expired = bundle_at(NOW - 7200, NOW - 3600);
+        assert!(enforce_freshness_at(&expired, 600, NOW).is_err());
+        // Older than max_age -> rejected.
+        let aged = bundle_at(NOW - 10_000, NOW + 3600);
+        assert!(enforce_freshness_at(&aged, 600, NOW).is_err());
+    }
+
     use ed25519_dalek::{Signer, SigningKey};
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
