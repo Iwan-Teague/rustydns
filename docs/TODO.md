@@ -368,3 +368,33 @@ blocklist groups shipped — `[[blocklist.groups]]` named sets + a
   carries a literal `// TODO: add EDNS options here?` with no padding field and
   no RFC 8467 block-size logic — so DoH/DoQ padding remains genuinely blocked.
   The scaffolding + startup warnings stay; adopt when hickory ships the knobs.
+- **Adversarial sweep (agent/rustydns-work, Aug 2026) — shipped:** name-
+  decompression bounds pinned at every decode seam (hop-1 cycle rejections,
+  prior-pointer overlap trap hitting `LabelOverlapsWithOther` at decoder AND
+  resolver level, bounded-work budgets); DoQ/DoT ALPN separation pinned at
+  wire level (foreign-ALPN handshake rejected on the shared certificate) and
+  builder level; SIGHUP metrics rebinding pinned to route through the loopback
+  forcing choke point; multi-question UDP datagrams pinned to never surface the
+  second question's outcome.
+- **Credential-redaction class closed (Aug 2026):** `--print-config`,
+  resolver bootstrap/warn log lines, ODoH transport error strings, and blocklist
+  fetch error messages all emit URLs through `redact_url_credentials`
+  (userinfo → `<redacted>@host`, credential query values → `key=<redacted>`),
+  property/fuzz-tested for no-panic, no-leak, host preservation, and
+  idempotence. Found because the `Secret` wrapper was dead code while comments
+  claimed it guarded `--print-config`.
+- **Conformance fixes from invariant re-audit (Aug 2026):** plain-upstream
+  warning now contains both mandated words ("UNENCRYPTED" + "leaks");
+  over-long (>255 B) TXT static records are rejected at load instead of
+  blackholing the name at wire-encode time; v4-mapped client addresses
+  anonymise under the native IPv4 /16 rule instead of collapsing every IPv4
+  client to one `::/64/anon`; `--validate-config` exit-code contract pinned
+  for the systemd ExecStartPre gate.
+- **Verified-clean this pass (no action needed):** SHA-256 KATs reproduced
+  against coreutils sha256sum; RUSTSEC patched ranges confirmed against
+  rustsec.org (see CHANGELOG); `name_within_zone` boundary math provably safe;
+  blocklist wildcard walk label-split by construction; rewrite suffix leading-
+  dot invariant pinned (`evilexample.com` non-match); authority CNAME chase
+  cycle/depth/partial-chain legs already tested; bundle poll keeps last-good
+  snapshot with warn + failure metric; disk query-log NDJSON privacy pinned;
+  install.sh mode model correct (config 640 root:rustydns).
