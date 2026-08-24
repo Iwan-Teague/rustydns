@@ -787,7 +787,8 @@ impl ActiveListeners {
             let addr = s.parse::<SocketAddr>().with_context(|| {
                 format!("server.doh_listen `{s}` is not a valid socket address")
             })?;
-            self.install_doh(addr)?;
+            let upstream_timeout = Duration::from_millis(cfg.upstream.timeout_ms);
+            self.install_doh(addr, upstream_timeout)?;
         }
         Ok(())
     }
@@ -801,7 +802,7 @@ impl ActiveListeners {
 
     /// Bind + spawn a DoH server on `addr`, then cancel any prior one
     /// (zero-drop). On bind failure the old server is left untouched.
-    fn install_doh(&mut self, addr: SocketAddr) -> Result<()> {
+    fn install_doh(&mut self, addr: SocketAddr, upstream_timeout: Duration) -> Result<()> {
         if !addr.ip().is_loopback() {
             warn!(listen = %addr, "DoH listener is not loopback; ensure a TLS reverse proxy and access controls are in place");
         }
@@ -811,7 +812,8 @@ impl ActiveListeners {
         let handler = Arc::new(self.handler.clone());
         let task_token = token.clone();
         tokio::spawn(async move {
-            if let Err(e) = doh_server::serve(handler, listener, task_token).await {
+            if let Err(e) = doh_server::serve(handler, listener, task_token, upstream_timeout).await
+            {
                 warn!(error = %e, "DoH server failed");
             }
         });
@@ -1014,7 +1016,8 @@ impl ActiveListeners {
                 warn!(listen = %addr, "SIGHUP: DoH listener change needs a restart — privileged port (<1024), capabilities dropped; NOT applied");
             }
             Some(addr) => {
-                if let Err(e) = self.install_doh(addr) {
+                let upstream_timeout = Duration::from_millis(cfg.upstream.timeout_ms);
+                if let Err(e) = self.install_doh(addr, upstream_timeout) {
                     warn!(error = %e, "SIGHUP: DoH rebind failed; keeping current DoH listener");
                 } else {
                     info!(listen = %addr, "SIGHUP: DoH listener rebound live");
