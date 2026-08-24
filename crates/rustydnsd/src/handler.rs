@@ -2715,10 +2715,31 @@ mod tests {
             .expect("reply within timeout")
             .expect("udp recv");
         let resp = Message::from_bytes(&buf[..n]).expect("decode reply");
+        assert_eq!(resp.edns.as_ref().map(|e| e.max_payload()), Some(4096),);
+
+        // --- Leg 4: RFC 6891 §6.2.3 sub-512 advertisement ----------------
+        // A client advertising BELOW the 512-byte minimum must still get
+        // replies (the size BUDGET floors at 512) while its advertisement
+        // is echoed as-is — no silent rewriting in either direction.
+        client
+            .send_to(&send_with(100), format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("reply within timeout")
+            .expect("udp recv");
+        let small = Message::from_bytes(&buf[..n]).expect("decode reply");
+        // Observed contract: sub-floor advertisements are FLOORED to the
+        // RFC 6891 §6.2.3 minimum of 512 on echo, never sent back as-is.
         assert_eq!(
-            resp.edns.as_ref().map(|e| e.max_payload()),
-            Some(4096),
-            "exactly-at-cap advertisements must pass through unclamped"
+            small.edns.as_ref().map(|e| e.max_payload()),
+            Some(512),
+            "sub-floor advertisement must be normalised up to 512"
+        );
+        assert!(
+            n <= 512 + 4,
+            "datagram must still respect the classic cap for this exchange"
         );
     }
 
