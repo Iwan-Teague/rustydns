@@ -283,6 +283,16 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Packaging
 
+- **Compose mesh mount aligned with the example config.** The compose file
+  mounted `./mesh` at `/var/lib/rustydns/mesh/` and referenced
+  `mesh-zone.bin`/`mesh-zone.pub` — artifacts and a path that exist nowhere
+  in the rustynet pipeline. It now mounts `./mesh` at
+  `/var/lib/rustynet` (read-only) so the example's `mesh_zone_bundle_path`
+  / `mesh_zone_verifier_key_path` resolve inside the container, and the
+  header names the real artifacts (`dns-zone.bundle`,
+  `dns-zone-verifier.key`). Previously, following both documents produced
+  a daemon that started fine but silently served static-only (no mesh
+  names) with a single startup warning as the only tell.
 - **Container healthcheck actually works now.** The Dockerfile and
   compose healthchecks called `wget`, which `debian:bookworm-slim`
   deliberately does not ship — every container reported `unhealthy`
