@@ -74,7 +74,7 @@ sources = [
 
 # How blocked queries are answered: "nxdomain" (default), "sinkhole",
 # or "refused".
-response_code = "nxdomain"
+block_response = "nxdomain"
 
 [privacy]
 # All options default to maximum privacy — anonymised client logging,
