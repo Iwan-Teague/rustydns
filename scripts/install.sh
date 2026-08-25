@@ -137,6 +137,24 @@ if [[ -f "$SYSTEMD_UNIT" ]]; then
     install -m 644 -o root -g root "$SYSTEMD_UNIT" /etc/systemd/system/rustydns.service
     systemctl daemon-reload
     echo "    Installed: /etc/systemd/system/rustydns.service"
+
+    # Optional socket unit: enables the tightest capability posture (systemd
+    # binds :53/:853 so the daemon needs ZERO capabilities). Not enabled
+    # automatically — operators must opt in via a drop-in (see socket unit
+    # header for instructions).
+    SOCKET_UNIT="$SCRIPT_DIR/../install/rustydns.socket"
+    if [[ -f "$SOCKET_UNIT" ]]; then
+        install -m 644 -o root -g root "$SOCKET_UNIT" /etc/systemd/system/rustydns.socket
+        systemctl daemon-reload
+        echo "    Also installed: /etc/systemd/system/rustydns.socket (optional socket activation)"
+        echo ""
+        echo "    Socket activation eliminates CAP_NET_BIND_SERVICE entirely:"
+        echo "      systemctl edit rustydns.service"
+        echo "        [Service]"
+        echo "        AmbientCapabilities="
+        echo "        CapabilityBoundingSet="
+        echo "    Then: systemctl enable --now rustydns.socket"
+    fi
 else
     warn "Systemd unit not found at $SYSTEMD_UNIT — skipping."
 fi
