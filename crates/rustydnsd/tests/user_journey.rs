@@ -611,3 +611,41 @@ async fn missing_config_error_is_actionable() {
         );
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_existing_config_error_names_file_and_hints() {
+    // The OTHER error site: an EXISTING config that fails semantic
+    // validation must still name the FILE in the top-level context and
+    // carry the --config hint (both come from the load wrapper).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg = tmp.path().join("rustydns.toml");
+    std::fs::write(&cfg, "[server]\nlisten = [\"999.999.1.1:53\"]\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--validate-config")
+        .output()
+        .await
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    let combined = String::from_utf8_lossy(&out.stdout).to_string()
+        + "\n"
+        + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        combined.contains("failed to load configuration file"),
+        "top-level context must name the file: {combined}"
+    );
+    assert!(
+        combined.contains("--config"),
+        "must carry the hint: {combined}"
+    );
+    assert!(
+        combined.contains("server.listen entries are parseable"),
+        "inner cause must survive wrapping: {combined}"
+    );
+}
