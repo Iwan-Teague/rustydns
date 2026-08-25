@@ -308,3 +308,79 @@ async fn resolve_a(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> Message
     }
     panic!("no reply for {name}");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_malformed_packets_never_crash_or_poison() {
+    use std::sync::atomic::Ordering;
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Hostile datagram battery - each shape targets a different parser edge:
+    //   1. Pure garbage bytes
+    //   2. Truncated header (< 12 bytes)
+    //   3. Valid header claiming QDCOUNT=0xFFFF (parse bomb)
+    //   4. Compression-pointer loop in QNAME (self-referential @12)
+    //   5. Oversized blob (6 KB, beyond any sane inbound cap)
+    //   6. Zero-length datagram
+    let mut hostile: Vec<Vec<u8>> = Vec::new();
+    hostile.push(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+    hostile.push(vec![0u8; 5]);
+    let mut bomb = vec![0u8; 12];
+    bomb[6..8].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    hostile.push(bomb);
+    let mut ptrloop = vec![0u8; 20];
+    ptrloop[4..6].copy_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    ptrloop[12..14].copy_from_slice(&[0xC0, 0x0C]); // self-pointer
+    hostile.push(ptrloop);
+    hostile.push(vec![0x41; 6000]);
+    hostile.push(Vec::new());
+    for pkt in &hostile {
+        let _ = sock.send(pkt).await.expect("send hostile");
+    }
+
+    // Drain window: give the daemon a moment to (maybe) emit FORMERRs or
+    // drop silently - none of these may become a served answer.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut drain = vec![0u8; 4096];
+    while let Ok(_) =
+        tokio::time::timeout(Duration::from_millis(50), sock.recv_from(&mut drain)).await
+    {
+        if let Ok(msg) = Message::from_bytes(&drain) {
+            assert!(
+                !(msg.metadata.response_code == ResponseCode::NoError && !msg.answers.is_empty()),
+                "hostile datagram produced a SERVED ANSWER: {:?}",
+                msg.answers
+            );
+        }
+        drain = vec![0u8; 4096];
+    }
+
+    // Liveness: normal resolution still works after the battery.
+    let ok = resolve_a(&sock, 99, "alive.test.").await;
+    assert_eq!(ok.metadata.response_code, ResponseCode::NoError);
+
+    // Only the liveness query reached the upstream - hostile bytes were
+    // never forwarded as if they were legitimate questions.
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // The child process itself must still be running (no crash).
+    assert!(
+        matches!(child.try_wait(), Ok(None)),
+        "daemon crashed under malformed-packet battery"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
