@@ -1931,6 +1931,13 @@ mod tests {
             Some(Duration::from_secs(30)),
             Duration::from_secs(60)
         ));
+        // EXACTLY at the minimum: allowed (inclusive >=). Pins the
+        // off-by-one boundary — a strict `>` would defer SIGHUPs spaced
+        // precisely at the configured interval.
+        assert!(fetch_spacing_ok(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        ));
         // Old-enough round: allowed.
         assert!(fetch_spacing_ok(
             Some(Duration::from_secs(61)),
