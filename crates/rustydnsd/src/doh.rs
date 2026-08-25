@@ -920,6 +920,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn doh_get_invalid_base64_is_rejected_before_dns_processing() {
+        // The decode-error arm must 400 with the base64-specific message —
+        // NOT fall through to the generic empty/malformed-message paths,
+        // which would blur which layer rejected the request.
+        let handler = build_handler(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .get(format!("{base}/dns-query?dns=not%%20base64!!"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = resp.text().await.expect("body text");
+        assert!(
+            body.contains("invalid base64url"),
+            "decode errors must be attributed to base64, got: {body}"
+        );
+
+        shutdown.cancel();
+    }
+
     async fn doh_get_without_dns_param_is_rejected() {
         // axum 0.7→0.8 migration pin (d097ffe): the Query<DohQuery>
         // extractor must still reject a parameter-less GET with 400 before
