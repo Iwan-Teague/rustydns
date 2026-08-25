@@ -353,8 +353,9 @@ async fn binary_e2e_malformed_packets_never_crash_or_poison() {
     // drop silently - none of these may become a served answer.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut drain = vec![0u8; 4096];
-    while let Ok(_) =
-        tokio::time::timeout(Duration::from_millis(50), sock.recv_from(&mut drain)).await
+    while tokio::time::timeout(Duration::from_millis(50), sock.recv_from(&mut drain))
+        .await
+        .is_ok()
     {
         if let Ok(msg) = Message::from_bytes(&drain) {
             assert!(
