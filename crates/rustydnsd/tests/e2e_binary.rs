@@ -1201,3 +1201,50 @@ async fn binary_e2e_default_logging_never_leaks_client_or_query_name() {
         );
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_repeat_query_served_from_cache_without_upstream() {
+    use std::sync::atomic::Ordering;
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // First query: MISS -> upstream hit.
+    let r1 = resolve_a(&sock, 50, "cached.test.").await;
+    assert_eq!(r1.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // Identical repeat: HIT from cache - same answer, ZERO new upstream
+    // traffic. This pins the resolver cache end-to-end; a regression that
+    // forwards every query would show hits == 2 here.
+    let r2 = resolve_a(&sock, 51, "cached.test.").await;
+    assert_eq!(r2.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        r2.answers.iter().any(|r| matches!(&r.data,
+            hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")),
+        "cached reply must carry the same A answer"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "repeat query must be served from cache, not re-forwarded"
+    );
+
+    // Distinct name: MISS again -> counter advances exactly once more.
+    let r3 = resolve_a(&sock, 52, "fresh.test.").await;
+    assert_eq!(r3.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
