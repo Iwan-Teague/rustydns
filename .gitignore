@@ -5,3 +5,11 @@
 *.swp
 *.swo
 .DS_Store
+
+# Operator-local deployment artifacts — created in-place by the Docker and
+# systemd quick-starts. Your live rustydns.toml encodes your environment
+# (per-client policy IPs, internal hostnames in rewrites); keep it out of
+# version control. Force-add explicitly if you truly intend to publish one.
+/rustydns.toml
+/mesh/
+/blocklists/
