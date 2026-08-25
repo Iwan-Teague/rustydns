@@ -33,6 +33,11 @@ impl IpDenylist {
     /// Parse a list of `"addr"` or `"addr/prefix"` entries. A bare address is
     /// treated as a single host (`/32` or `/128`). Returns the offending entry
     /// in the error so `validate_config` can surface a precise message.
+    ///
+    /// IPv4-mapped V6 entries (`::ffff:a.b.c.d[/p]`) whose prefix reaches into
+    /// the embedded v4 space (`p >= 96`) are canonicalised to their IPv4
+    /// meaning, so a configured `6.6.6.0/24` block cannot be bypassed by an
+    /// upstream answering AAAA `::ffff:6.6.6.x`.
     pub fn parse(entries: &[String]) -> Result<Self, String> {
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
@@ -46,8 +51,14 @@ impl IpDenylist {
     }
 
     /// Returns `true` if `ip` falls inside any configured range.
+    ///
+    /// IPv6-mapped query addresses additionally test their embedded IPv4
+    /// value against the v4 rules, closing the family-confusion bypass where
+    /// `AAAA ::ffff:c0ff:ee01` dodges a `192.255.238.1`-style v4 rule.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match ip {
+        // Raw-family check first (covers non-matched-family entries and any
+        // exotic short-prefix mapped entries left as raw v6).
+        let raw_hit = match ip {
             IpAddr::V4(v4) => {
                 let bits = u32::from(v4);
                 self.v4.iter().any(|(net, mask)| (bits & mask) == *net)
@@ -56,7 +67,19 @@ impl IpDenylist {
                 let bits = u128::from(v6);
                 self.v6.iter().any(|(net, mask)| (bits & mask) == *net)
             }
+        };
+        if raw_hit {
+            return true;
         }
+        // Family-canonical second pass: mapped v6 queries also face the v4
+        // rule set via their embedded address.
+        if let IpAddr::V6(v6) = ip
+            && let Some(v4) = v6.to_ipv4_mapped()
+        {
+            let bits = u32::from(v4);
+            return self.v4.iter().any(|(net, mask)| (bits & mask) == *net);
+        }
+        false
     }
 
     /// Total number of ranges (v4 + v6).
@@ -100,6 +123,26 @@ fn parse_entry(entry: &str) -> Result<Cidr, String> {
         }
         IpAddr::V6(v6) => {
             let prefix = parse_prefix(prefix_part, 128, entry)?;
+            // Canonicalise mapped forms whose prefix reaches the embedded
+            // v4 bits (p >= 96): store as an equivalent v4 rule so both
+            // entry families line up at match time. Shorter prefixes keep
+            // raw-v6 semantics (they can span beyond the mapped range).
+            if prefix >= 96
+                && let Some(v4) = v6.to_ipv4_mapped()
+            {
+                // prefix ≤ 128, so prefix - 96 ≤ 32 always fits u8.
+                let v4_prefix = prefix - 96;
+                let bits = u32::from(v4);
+                let mask = if v4_prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - v4_prefix)
+                };
+                return Ok(Cidr::V4 {
+                    network: bits & mask,
+                    mask,
+                });
+            }
             let bits = u128::from(v6);
             let mask = if prefix == 0 {
                 0
@@ -212,5 +255,53 @@ mod tests {
     fn non_numeric_prefix_rejected() {
         let err = IpDenylist::parse(&["1.2.3.0/foo".to_string()]).unwrap_err();
         assert!(err.contains("invalid prefix"), "{err}");
+    }
+
+    // --- IPv4-mapped V6 canonicalisation ---------------------------------
+
+    #[test]
+    fn mapped_v6_host_entry_blocks_mapped_and_v4_forms() {
+        // Operator writes the mapped form of a host; both spellings must
+        // block, and the equivalent bare v4 must also hit.
+        let d = list(&["::ffff:6.6.6.6"]);
+        assert!(d.contains("::ffff:6.6.6.6".parse().unwrap()));
+        assert!(d.contains("6.6.6.6".parse().unwrap()));
+        assert!(!d.contains("6.6.6.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn mapped_v6_cidr_entry_blocks_mapped_aaaa_bypassing_v4_rule() {
+        // THE bypass this module previously missed: an upstream answers AAAA
+        // ::ffff:6.6.6.9 while only a plain v4 rule exists. Query-side
+        // canonicalisation routes the embedded v4 through the v4 rule set,
+        // closing the bypass with NO extra operator config.
+        let d = list(&["6.6.6.0/24"]);
+        assert!(
+            d.contains("::ffff:6.6.6.9".parse().unwrap()),
+            "mapped AAAA must face the v4 rule set"
+        );
+        assert!(!d.contains("::ffff:6.6.7.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn non_mapped_v6_query_still_matches_only_raw_v6_entries() {
+        let d = list(&["2001:db8::/32"]);
+        assert!(d.contains("2001:db8::1".parse().unwrap()));
+        // A non-mapped v6 address must not suddenly face v4 rules.
+        assert!(!d.contains("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn short_prefix_mapped_entry_keeps_raw_v6_semantics() {
+        // Prefix < 96 cannot be expressed as pure v4 (the mask spans part of
+        // the ffff:ffff prefix) — entry stays raw and its span therefore
+        // reaches beyond strictly-mapped forms.
+        let d = list(&["::ffff:0:0/80"]);
+        assert!(d.contains("::ffff:1.2.3.4".parse().unwrap()));
+        // Bits 80..95 are unmasked: a non-'ffff' value there still matches.
+        assert!(d.contains("::1234:102:304".parse().unwrap()));
+        assert!(d.contains("::ffff:255.255.255.255".parse().unwrap()));
+        assert!(!d.contains("2001:db8::1".parse().unwrap()));
+        assert!(!d.contains("5.6.7.8".parse().unwrap()));
     }
 }
