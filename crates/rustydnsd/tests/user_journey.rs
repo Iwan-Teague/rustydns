@@ -458,3 +458,61 @@ async fn config_error_ux_names_the_offender_and_exits_nonzero() {
     // without our contextual wrapping.
     assert!(out.contains("configuration error") || out.contains("failed to load configuration"));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn shipped_docker_template_stays_valid_with_privacy_posture() {
+    // The Docker template once carried a silent field typo
+    // (response_code vs block_response) that deny_unknown_fields caught.
+    // This pin keeps BOTH shipped templates honest forever after:
+    // - the example must validate byte-for-byte (journey 1 covers runtime;
+    //   here we re-assert parse validity cheaply)
+    // - the docker template must validate AND retain its security posture:
+    //   wildcard DNS binds (container requirement), loopback-only metrics
+    //   (privacy invariant), and the correctly-named block response field.
+    for rel in ["rustydns.example.toml", "rustydns.docker.toml"] {
+        let src = repo_root().join(rel);
+        let body =
+            std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("{rel} must exist: {e}"));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = tmp.path().join("c.toml");
+        std::fs::write(&cfg, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+            .arg("--config")
+            .arg(&cfg)
+            .arg("--validate-config")
+            .output()
+            .await
+            .expect("spawn");
+        assert!(
+            out.status.success(),
+            "{rel} drifted out of validity:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Posture assertions on the docker template specifically.
+    let docker =
+        std::fs::read_to_string(repo_root().join("rustydns.docker.toml")).expect("docker tpl");
+    assert!(
+        docker.contains("listen = [\"0.0.0.0:53\"]"),
+        "container template must bind wildcard (loopback is unreachable through published ports)"
+    );
+    assert!(
+        docker.contains("block_response = \"nxdomain\""),
+        "the fixed field name must stay fixed"
+    );
+    assert!(
+        !docker.contains("response_code"),
+        "legacy typo must not return"
+    );
+    assert!(
+        docker.contains("listen = \"127.0.0.1:9153\""),
+        "metrics stay loopback-only"
+    );
+}
