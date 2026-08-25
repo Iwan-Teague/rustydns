@@ -3734,7 +3734,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn rewrite_self_referential_target_rejected() {
         // A CNAME rewrite whose target equals its own name creates an
         // infinite CNAME loop served to clients. Reject at validation.
@@ -3748,6 +3747,7 @@ mod tests {
         assert_config_err(validate_config(&cfg), "self-referential");
     }
 
+    #[test]
     fn rewrite_bad_address_rejected() {
         let mut cfg = baseline();
         cfg.rewrite = vec![rewrite("svc.example.com", Some("not-an-ip"), None, false)];
