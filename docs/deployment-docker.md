@@ -15,6 +15,7 @@ git clone https://github.com/Iwan-Teague/rustydns.git
 cd rustydns
 cp rustydns.docker.toml rustydns.toml
 $EDITOR rustydns.toml
+chmod 640 rustydns.toml   # required: the daemon refuses a world-readable config
 docker compose up -d
 ```
 
