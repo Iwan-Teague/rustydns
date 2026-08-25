@@ -176,7 +176,7 @@ impl BlocklistLoader {
                     // falls back to its LAST GOOD content so previously
                     // blocked domains stay blocked. Only a source with no
                     // history is dropped.
-                    if let Some(last) = self.take_last_good(&path.display().to_string()) {
+                    if let Some(last) = self.last_good_content(&path.display().to_string()) {
                         warn!(path = %path.display(), error = %e,
                               "local blocklist unreadable - using last good content");
                         sources.push((last, BlocklistSource::Trusted));
@@ -233,7 +233,7 @@ impl BlocklistLoader {
                     // this URL's LAST GOOD content so its entries remain
                     // actively blocked instead of silently vanishing from
                     // the rebuilt list.
-                    if let Some(last) = self.take_last_good(url) {
+                    if let Some(last) = self.last_good_content(url) {
                         warn!(
                             url = %redact_url_credentials(url),
                             error = %e,
@@ -264,14 +264,18 @@ impl BlocklistLoader {
             .insert(key.to_string(), content.to_string());
     }
 
-    /// Take (remove) the retained content for a source. Removal keeps the
-    /// map from growing unboundedly across many failed rounds when the
-    /// source is permanently gone; the next success re-seeds it.
-    fn take_last_good(&self, key: &str) -> Option<String> {
+    /// Retained content for a source, WITHOUT consuming it. Sustained
+    /// outages must keep falling back on every failed round - consuming
+    /// the entry would resume under-blocking after a single grace reload.
+    /// The map is bounded by the number of distinct configured sources;
+    /// entries for sources later removed from config linger until process
+    /// restart (tiny, and cleared by the next success).
+    fn last_good_content(&self, key: &str) -> Option<String> {
         self.last_good
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(key)
+            .get(key)
+            .cloned()
     }
 
     async fn read_local(&self, path: &Path) -> Result<String, RustyDnsError> {
