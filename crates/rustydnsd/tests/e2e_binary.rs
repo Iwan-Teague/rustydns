@@ -1938,3 +1938,60 @@ async fn binary_e2e_multi_upstream_queries_distribute_across_providers() {
     stub1.abort();
     stub2.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_serial_dispatch_still_fails_over_to_live_provider() {
+    // Regression guard for the num_concurrent_reqs=1 privacy fix: serial
+    // dispatch must NOT create an availability cliff. With provider 1
+    // dead from startup, every query must still resolve via provider 2
+    // (hickory retries remaining servers on timeout/error per request).
+    let (dns_port, metrics_port) = (reserve_port(), reserve_port());
+    let up_dead = reserve_port(); // nothing ever binds here
+    let up_live = reserve_port();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{up_dead}\", \"127.0.0.1:{up_live}\"]\n\
+         dnssec_validation = false\n\
+         timeout_ms = 1200\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let (stub, hits, _caps) = spawn_stub_udp_dns(up_live).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    for (idx, id) in (500u16..503).enumerate() {
+        let name = format!("failover-{idx}.test.");
+        let reply = resolve_a(&sock, id, &name).await;
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "query {id} must resolve via the live provider despite dead first"
+        );
+    }
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
