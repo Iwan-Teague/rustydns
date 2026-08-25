@@ -21,6 +21,9 @@ use crate::config::BlockWindow;
 /// Bit `i` (Mon=0 … Sun=6) set means that weekday is included. `0x7f` = all.
 const ALL_DAYS: u8 = 0b0111_1111;
 
+/// Short names for the weekday bits (Mon=0 … Sun=6), for log messages.
+const DAY_NAMES: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
 /// Before this instant the system clock is considered UNRELIABLE (dead RTC,
 /// fresh board defaulting to the epoch). Evaluating block windows against
 /// such a clock would match arbitrary 1970 weekdays — silently failing OPEN
@@ -89,6 +92,32 @@ impl BlockSchedule {
                 ));
             }
 
+            // Surface the documented single-day wrap gap at compile time:
+            // a window wrapping past midnight evaluates each minute against
+            // its own calendar day's mask, so a masked day whose SUCCESSOR
+            // is unmasked leaves that night's early-morning half unblocked.
+            // E.g. ["fri"] 22:00–06:00 blocks Fri 22:00–24:00 only — Sat
+            // 00:00–06:00 is open. Operators wanting the overnight half must
+            // include both days (["fri","sat"] — which also blocks Sat
+            // nights; precise single-night encoding is impossible).
+            if let Some((start, end)) = span
+                && end <= start
+                && days_mask != ALL_DAYS
+            {
+                for (d, name) in DAY_NAMES.iter().enumerate() {
+                    let bit = 1u8 << d;
+                    if days_mask & bit != 0 && days_mask & (1 << ((d + 1) % 7)) == 0 {
+                        tracing::warn!(
+                            window = i,
+                            "block_windows[{i}] wraps past midnight but day {}'s successor \
+                             is not configured — the after-midnight portion of that night \
+                             will NOT be blocked. Add the successor day to cover it.",
+                            name
+                        );
+                    }
+                }
+            }
+
             compiled.push(CompiledWindow {
                 days_mask,
                 span,
@@ -127,7 +156,7 @@ fn window_matches(w: &CompiledWindow, unix_secs: u64) -> bool {
     let local = unix_secs as i64 + (w.offset_min as i64) * 60;
     let days = local.div_euclid(86_400);
     // Epoch day 0 (1970-01-01) was a Thursday = weekday 3 with Mon=0.
-    let weekday = (days + 3).rem_euclid(7) as u8;
+    let weekday = ((days + 3).rem_euclid(7)) as u8;
     if w.days_mask & (1 << weekday) == 0 {
         return false;
     }
@@ -139,6 +168,9 @@ fn window_matches(w: &CompiledWindow, unix_secs: u64) -> bool {
                 tod_min >= start && tod_min < end
             } else {
                 // Wraps past midnight: [start, 24:00) ∪ [00:00, end).
+                // Each half is evaluated against ITS OWN calendar day's
+                // mask — see the compile-time warning in `compile` for the
+                // single-day coverage gap this creates.
                 tod_min >= start || tod_min < end
             }
         }
@@ -236,6 +268,43 @@ mod tests {
         assert!(s.is_blocked_at(at(MON_NOON_UTC, -6 * 60))); // 06:00 Mon
         assert!(!s.is_blocked_at(MON_NOON_UTC)); // 12:00 Mon
         assert!(!s.is_blocked_at(at(MON_NOON_UTC, -5 * 60))); // 07:00 exactly
+    }
+
+    #[test]
+    fn wrap_window_single_day_gap_is_documented_semantics() {
+        // Pins the DELIBERATE per-calendar-day attribution for wrapping
+        // windows (see wrapping_window_day_attribution_is_by_local_calendar_day):
+        // ["fri"] 22:00–06:00 blocks Fri 22:00–24:00 only. The Sat
+        // 00:00–06:00 half is evaluated against SATURDAY's mask and is
+        // therefore OPEN — compile() warns about exactly this gap; operators
+        // covering a full overnight window must list both days.
+        //
+        // Anchor: MON_NOON_UTC = Monday 12:00 UTC. +4d = Fri 12:00.
+        let fri_noon = at(MON_NOON_UTC, 4 * 24 * 60);
+        let s = BlockSchedule::compile(&[win(&["fri"], Some("22:00"), Some("06:00"), 0)]).unwrap();
+        assert!(s.is_blocked_at(at(fri_noon, 10 * 60)), "Fri 22:00 blocked");
+        assert!(s.is_blocked_at(at(fri_noon, 11 * 60)), "Fri 23:00 blocked");
+        assert!(
+            !s.is_blocked_at(at(fri_noon, 15 * 60)),
+            "Sat 03:00 OPEN — the documented single-day gap"
+        );
+        assert!(
+            s.is_blocked_at(at(fri_noon, -11 * 60)),
+            "Fri 01:00 blocked — Friday's OWN early half (window wraps into it)"
+        );
+        assert!(!s.is_blocked_at(at(fri_noon, -13 * 60)), "Thu 23:00 open");
+        assert!(
+            !s.is_blocked_at(at(fri_noon, 9 * 60 + 59)),
+            "Fri 21:59 open"
+        );
+        assert!(!s.is_blocked_at(at(fri_noon, 34 * 60)), "Sat 22:00 open");
+
+        // Both days configured → both halves covered (and Sat night too —
+        // the accepted trade-off of the only expressible encoding).
+        let s2 = BlockSchedule::compile(&[win(&["fri", "sat"], Some("22:00"), Some("06:00"), 0)])
+            .unwrap();
+        assert!(s2.is_blocked_at(at(fri_noon, 11 * 60)), "Fri 23:00 blocked");
+        assert!(s2.is_blocked_at(at(fri_noon, 15 * 60)), "Sat 03:00 blocked");
     }
 
     #[test]
