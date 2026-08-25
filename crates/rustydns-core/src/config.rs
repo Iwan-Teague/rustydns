@@ -163,10 +163,21 @@ impl MetricsConfig {
                 self.listen
             ))
         })?;
-        if addr.ip().is_loopback() {
-            return Ok(addr);
+        // Normalise IPv4-mapped V6 forms first so `::ffff:127.0.0.1` is
+        // recognised as (and kept as) IPv4 loopback rather than being
+        // re-bound to `[::1]` — a different socket than the operator asked
+        // for, invisible to raw-address overlap checks.
+        let ip = match addr.ip() {
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => std::net::IpAddr::V4(v4),
+                None => std::net::IpAddr::V6(v6),
+            },
+            v4 => v4,
+        };
+        if ip.is_loopback() {
+            return Ok(std::net::SocketAddr::new(ip, addr.port()));
         }
-        let loopback_ip = match addr.ip() {
+        let loopback_ip = match ip {
             std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
             std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         };
@@ -2931,6 +2942,24 @@ mod tests {
         let mut cfg = baseline();
         cfg.server.listen = vec!["0.0.0.0:53".to_string(), "127.0.0.1:53".to_string()];
         validate_config(&cfg).expect("same-role plain entries must be allowed");
+    }
+
+    #[test]
+    fn forced_metrics_loopback_collides_with_dns_on_same_loopback_port() {
+        // A non-loopback metrics address is FORCED to 127.0.0.1 at runtime.
+        // If a plain DNS listener also claims 127.0.0.1 on the same port,
+        // the overlap is INVISIBLE to raw-address comparison but REAL at
+        // bind time (SO_REUSEPORT random role dealing).
+        let mut cfg = baseline();
+        cfg.server.listen = vec!["127.0.0.1:9153".to_string()];
+        cfg.metrics.listen = "192.168.1.1:9153".to_string();
+        assert_config_err(validate_config(&cfg), "cannot share one TCP port");
+
+        // Same shape with IPv4-mapped form: forces to the same loopback.
+        let mut cfg = baseline();
+        cfg.metrics.listen = "[::ffff:127.0.0.1]:9153".to_string();
+        cfg.server.listen = vec!["127.0.0.1:9153".to_string()];
+        assert_config_err(validate_config(&cfg), "cannot share one TCP port");
     }
 
     #[test]
