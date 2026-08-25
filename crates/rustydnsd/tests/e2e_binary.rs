@@ -27,6 +27,8 @@ fn reserve_port() -> u16 {
 
 /// Minimal DNS-over-UDP stub upstream: for every datagram it flips the QR
 /// bit, sets RA, appends a single A answer (192.0.2.1) whose NAME is a
+type Captures = std::sync::Arc<std::sync::Mutex<Vec<(std::net::SocketAddr, Vec<u8>)>>>;
+
 /// compression pointer at offset 12 (the question), and echoes it back.
 /// Works for any single-question A query without touching hickory APIs.
 /// The returned counter increments for every datagram received - lets
@@ -36,11 +38,14 @@ async fn spawn_stub_udp_dns(
 ) -> (
     tokio::task::JoinHandle<()>,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    Captures,
 ) {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_task = Arc::clone(&hits);
+    let captures: Captures = Arc::new(Mutex::new(Vec::new()));
+    let task_caps = Arc::clone(&captures);
     let std_sock = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("stub bind");
     std_sock.set_nonblocking(true).expect("nonblocking");
     let sock = tokio::net::UdpSocket::from_std(std_sock).expect("stub into tokio");
@@ -52,6 +57,7 @@ async fn spawn_stub_udp_dns(
                 continue;
             };
             hits_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            task_caps.lock().unwrap().push((peer, buf[..n].to_vec()));
             if n < 12 {
                 continue;
             }
@@ -69,7 +75,7 @@ async fn spawn_stub_udp_dns(
             let _ = sock.send_to(&out, peer).await;
         }
     });
-    (handle, hits)
+    (handle, hits, captures)
 }
 
 /// Build a well-formed A query for `name` with the given id.
@@ -89,7 +95,7 @@ async fn binary_end_to_end_resolves_a_query_over_real_udp() {
     let (dns_port, upstream_port, metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
-    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
 
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
@@ -160,7 +166,7 @@ async fn binary_e2e_blocklist_blocks_domain_before_upstream() {
         metrics_port,
         Some("0.0.0.0 blocked.test\n"),
     );
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
 
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
@@ -318,7 +324,7 @@ async fn binary_e2e_malformed_packets_never_crash_or_poison() {
     let (dns_port, upstream_port, metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
 
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
@@ -423,7 +429,7 @@ async fn binary_e2e_sighup_picks_up_blocklist_change_live() {
             .expect("chmod config");
     }
 
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -499,7 +505,7 @@ async fn binary_e2e_operator_endpoints_health_metrics_queries() {
     let (dns_port, upstream_port, metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
-    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     let client = reqwest::Client::builder().build().unwrap();
@@ -569,7 +575,7 @@ async fn binary_e2e_resolves_over_tcp_with_length_framing() {
     let (dns_port, upstream_port, metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
-    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     // RFC 1035 4.2.2 framing: 2-byte big-endian length prefix per message.
@@ -637,7 +643,7 @@ async fn binary_e2e_doh_post_resolves_over_http_seam() {
             .expect("chmod config");
     }
 
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     // RFC 8484 POST: application/dns-message body -> same back.
@@ -699,7 +705,7 @@ async fn binary_e2e_doh_get_resolves_via_base64url_param() {
             .expect("chmod config");
     }
 
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     let client = reqwest::Client::builder().build().unwrap();
@@ -783,7 +789,7 @@ async fn binary_e2e_dot_tls_handshake_and_resolution() {
             .expect("chmod config");
     }
 
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     // TLS client trusting ONLY the embedded test CA; dial by leaf SAN.
@@ -880,7 +886,7 @@ async fn binary_e2e_doq_quic_stream_resolution_with_ca_trust() {
             .expect("chmod config");
     }
 
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     // Quinn client trusting ONLY the embedded test CA; ALPN exactly "doq".
@@ -1077,7 +1083,7 @@ async fn binary_e2e_default_logging_never_leaks_client_or_query_name() {
     });
 
     // Stub upstream so resolution succeeds and success-path logging runs.
-    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
 
     let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
@@ -1208,7 +1214,7 @@ async fn binary_e2e_repeat_query_served_from_cache_without_upstream() {
     let (dns_port, upstream_port, metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -1254,7 +1260,7 @@ async fn binary_e2e_any_qtype_refused_rfc8482() {
     let (dns_port, upstream_port, metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -1314,7 +1320,7 @@ async fn binary_e2e_edns_version_mismatch_answers_badvers() {
     let (dns_port, upstream_port, metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
-    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -1373,6 +1379,106 @@ async fn binary_e2e_edns_version_mismatch_answers_badvers() {
     assert!(saw_badvers);
     // The probe never reached upstream resolution.
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_upstream_privacy_no_ecs_no_identity_exact_qname() {
+    // UPSTREAM PRIVACY CONTRACT, asserted at the wire:
+    //   1. The forwarded QNAME is the ORIGINAL name (no search-suffix
+    //      prepending, no mutation) - compared case-insensitively.
+    //   2. NO EDNS Client Subnet option (code 8) on the upstream OPT -
+    //      the LAN client's network must never be disclosed upstream.
+    //   3. Datagrams originate from the DAEMON's socket (127.0.0.1 here),
+    //      never carrying any per-client source identity.
+    //   4. Plain path additionally applies 0x20 case randomization
+    //      (anti-spoofing), pinned positively via case divergence.
+    //
+    // QNAME minimisation note: we are a FORWARDING stub; RFC 9156 qmin
+    // governs iterative<->authoritative hops. The privacy levers that DO
+    // apply here - exact-name-only, ECS-free, encrypted transports, and
+    // ODoH for full obliviousness - are exactly what this test pins.
+    use std::sync::atomic::Ordering;
+
+    let canary = "privacy-sensitive-e7c4a9b2.example.";
+
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits, captures) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    for id in 300u16..304 {
+        let reply = resolve_a(&sock, id, canary).await;
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    }
+
+    // Give the daemon a beat to flush any final retry datagrams.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let caps = captures.lock().unwrap().clone();
+    assert!(!caps.is_empty(), "stub captured nothing");
+
+    use hickory_proto::rr::{RecordType, rdata::opt::EdnsCode};
+
+    let mut saw_case_divergence = false;
+    for (peer, raw) in &caps {
+        // (3) daemon-originated source.
+        assert_eq!(
+            peer.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "upstream datagram not originated by the daemon: {peer}"
+        );
+        let msg = Message::from_bytes(raw).expect("captured query must parse");
+        // (1) exactly one question, matching the original name.
+        assert_eq!(msg.queries.len(), 1, "multiple questions leaked");
+        let qname = msg.queries[0].name().to_string();
+        assert!(
+            qname.eq_ignore_ascii_case(canary),
+            "QNAME mutated in transit: got {qname}"
+        );
+        if qname != *canary {
+            saw_case_divergence = true;
+        }
+        // (2) EDNS present is fine; Client Subnet is not.
+        if let Some(edns) = msg.edns.as_ref() {
+            assert!(
+                edns.option(EdnsCode::Subnet).is_none(),
+                "EDNS CLIENT SUBNET leaked upstream! options: {:?}",
+                edns.options()
+            );
+            // No private/experimental option codes either (65001..=65535).
+            for (code, _val) in edns.options().as_ref() {
+                if let hickory_proto::rr::rdata::opt::EdnsCode::Unknown(num) = code {
+                    assert!(
+                        *num < 65001,
+                        "private-use EDNS option {num} leaked upstream"
+                    );
+                }
+            }
+        }
+        // Query-only shape: no answers travelling TO the upstream.
+        assert!(msg.answers.is_empty(), "answers leaked toward upstream");
+        let _ = RecordType::A; // keep import used if API changes
+    }
+
+    // (4) plain path must apply 0x20 randomization (case divergence seen).
+    assert!(
+        saw_case_divergence,
+        "plain-path queries lacked 0x20 case randomization (all-lowercase)"
+    );
+
+    // Sanity: every canary resolution produced at least one datagram.
+    assert!(hits.load(Ordering::SeqCst) >= 1);
 
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
