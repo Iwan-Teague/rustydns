@@ -1449,12 +1449,23 @@ async fn binary_e2e_upstream_privacy_no_ecs_no_identity_exact_qname() {
         if qname != *canary {
             saw_case_divergence = true;
         }
-        // (2) EDNS present is fine; Client Subnet is not.
+        // (2) EDNS present is fine; Client Subnet is not - and neither is
+        // the DNS Cookie option (10), another tracking/fingerprint vector,
+        // nor any TSIG/SIG0 signature material on the query itself.
         if let Some(edns) = msg.edns.as_ref() {
             assert!(
                 edns.option(EdnsCode::Subnet).is_none(),
                 "EDNS CLIENT SUBNET leaked upstream! options: {:?}",
                 edns.options()
+            );
+            assert!(
+                edns.option(EdnsCode::Cookie).is_none(),
+                "EDNS COOKIE leaked upstream (tracking vector): {:?}",
+                edns.options()
+            );
+            assert!(
+                msg.signature.is_none(),
+                "query carried TSIG/SIG0 signature material upstream"
             );
             // No private/experimental option codes either (65001..=65535).
             for (code, _val) in edns.options().as_ref() {
