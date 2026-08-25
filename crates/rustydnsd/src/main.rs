@@ -560,11 +560,14 @@ fn init_tracing() {
         }
     }
 
+    // LOGS GO TO STDERR. stdout is reserved for data (--print-config's
+    // TOML), so `rustydnsd --print-config > out.toml` yields pure,
+    // re-parseable TOML even when startup warnings fire.
     #[cfg(debug_assertions)]
-    let fmt_layer = fmt::layer().pretty();
+    let fmt_layer = fmt::layer().pretty().with_writer(std::io::stderr);
 
     #[cfg(not(debug_assertions))]
-    let fmt_layer = fmt::layer().json();
+    let fmt_layer = fmt::layer().json().with_writer(std::io::stderr);
 
     tracing_subscriber::registry()
         .with(filter)
