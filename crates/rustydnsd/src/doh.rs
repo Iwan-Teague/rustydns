@@ -817,9 +817,10 @@ mod tests {
         .await;
         let (base, shutdown) = spawn_doh(handler).await;
 
-        // One byte past the DNS message ceiling — must be rejected by the
-        // body-limit layer before the handler ever buffers it.
-        let oversized = vec![0u8; MAX_DOH_MESSAGE_BYTES + 1];
+        // One byte past the ABSOLUTE DNS message ceiling (u16 max wire
+        // size), deliberately NOT derived from MAX_DOH_MESSAGE_BYTES so the
+        // pin stays discriminating if the constant ever drifts upward.
+        let oversized = vec![0u8; 65_536];
         let client = reqwest::Client::builder().build().unwrap();
         let resp = client
             .post(format!("{base}/dns-query"))
