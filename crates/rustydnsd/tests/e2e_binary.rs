@@ -612,6 +612,19 @@ async fn binary_e2e_operator_endpoints_health_metrics_queries() {
     assert!(!qb.contains("counted.test"), "plaintext qname leaked: {qb}");
     assert!(qb.contains("\"qname_hash\""), "{qb}");
     assert!(qb.contains("/16"), "anonymised client marker missing: {qb}");
+    // served_by attribution: all three counted.test queries went through
+    // the resolver arm; the ring must reflect that - never mislabelled.
+    let resolver_entries = qb.matches("\"served_by\":\"resolver\"").count();
+    assert!(
+        resolver_entries >= 3,
+        "expected >=3 Resolver-attributed entries, dump: {qb}"
+    );
+    // The refused ANY probe is attributed to its own arm - gate
+    // rejections are distinguishable from pipeline answers in /queries.
+    assert!(
+        qb.contains("\"served_by\":\"rejected\""),
+        "refused-at-gate entry must carry rejected attribution: {qb}"
+    );
 
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
