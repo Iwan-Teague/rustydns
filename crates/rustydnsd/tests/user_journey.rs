@@ -392,3 +392,69 @@ async fn resolve_via(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> Messa
 fn quote_for_toml(p: &Path) -> String {
     format!("\"{}\"", p.display())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn config_error_ux_names_the_offender_and_exits_nonzero() {
+    // Journey 3: an operator's typo must produce an error that names the
+    // offending key, points at its line, and lists valid alternatives -
+    // never a silent ignore and never a raw parse dump.
+
+    async fn validate(body: &str) -> (Option<i32>, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = tmp.path().join("rustydns.toml");
+        std::fs::write(&cfg, body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+            .arg("--config")
+            .arg(&cfg)
+            .arg("--validate-config")
+            .output()
+            .await
+            .expect("run rustydnsd");
+        let combined = String::from_utf8_lossy(&out.stdout).to_string()
+            + "\n"
+            + &String::from_utf8_lossy(&out.stderr);
+        (out.status.code(), combined)
+    }
+
+    // Case A: typoed key inside [server].
+    let typo_body = "[server]\nlistenn = [\"127.0.0.1:53\"]\nmesh_zone = \"test.\"\n\
+                     [upstream]\nprotocol = \"plain\"\nresolvers = [\"127.0.0.1:5300\"]\n\
+                     dnssec_validation = false\n";
+    let (code, out) = validate(typo_body).await;
+    assert_ne!(code, Some(0), "typoed key must fail validation");
+    assert!(
+        out.contains("unknown field `listenn`"),
+        "must name the typo: {out}"
+    );
+    assert!(
+        out.contains("expected one of"),
+        "must list valid alternatives: {out}"
+    );
+    assert!(
+        out.contains("line 2"),
+        "must point at the offending line: {out}"
+    );
+
+    // Case B: unparseable listen address.
+    let bad_addr_body = "[server]\nlisten = [\"999.999.1.1:53\"]\nmesh_zone = \"test.\"\n\
+                         [upstream]\nprotocol = \"plain\"\nresolvers = [\"127.0.0.1:5300\"]\n\
+                         dnssec_validation = false\n";
+    let (code, out) = validate(bad_addr_body).await;
+    assert_ne!(code, Some(0), "bad address must fail validation");
+    assert!(
+        out.contains("server.listen entries are parseable"),
+        "error must name the server.listen key: {out}"
+    );
+    assert!(
+        out.contains("999.999.1.1:53"),
+        "error must echo the offending value: {out}"
+    );
+
+    // Actionability guard: neither message may be a bare serde/TOML dump
+    // without our contextual wrapping.
+    assert!(out.contains("configuration error") || out.contains("failed to load configuration"));
+}
