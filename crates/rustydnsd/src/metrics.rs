@@ -509,6 +509,7 @@ async fn metrics_handler(metrics: Arc<Metrics>) -> Response {
         warn!(error = %e, "failed to encode metrics");
         return Response::builder()
             .status(500)
+            .header("Cache-Control", "no-store")
             .body(Body::from("metrics encoding error"))
             .unwrap();
     }
@@ -516,6 +517,7 @@ async fn metrics_handler(metrics: Arc<Metrics>) -> Response {
     Response::builder()
         .status(200)
         .header("Content-Type", encoder.format_type())
+        .header("Cache-Control", "no-store")
         .body(Body::from(buffer))
         .unwrap()
 }
@@ -529,12 +531,14 @@ async fn health_handler(ready: Arc<AtomicBool>) -> Response {
         Response::builder()
             .status(200)
             .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-store")
             .body(Body::from("{\"status\":\"ok\"}"))
             .unwrap()
     } else {
         Response::builder()
             .status(503)
             .header("Content-Type", "application/json")
+            .header("Cache-Control", "no-store")
             .body(Body::from("{\"status\":\"starting\"}"))
             .unwrap()
     }
@@ -577,6 +581,7 @@ async fn queries_handler(query_log: Arc<QueryLog>) -> Response {
     Response::builder()
         .status(200)
         .header("Content-Type", "application/json")
+        .header("Cache-Control", "no-store")
         .body(Body::from(out))
         .unwrap()
 }
