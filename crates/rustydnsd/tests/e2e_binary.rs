@@ -1021,3 +1021,127 @@ async fn binary_e2e_dot_rejects_wrong_san_dial() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_default_logging_never_leaks_client_or_query_name() {
+    // CAPSTONE privacy contract, verified against the shipped binary with
+    // DEFAULT logging (RUST_LOG pinned to info): after driving canary
+    // queries through UDP and TCP, every byte the daemon emitted - stdout
+    // AND stderr - must be free of (a) the canary query name and (b) the
+    // client's full address:port identity.
+    use tokio::io::AsyncReadExt;
+
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+
+    // Pin the DEFAULT posture explicitly (unset env == info anyway).
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rustydnsd");
+
+    // Readiness poll (same contract as spawn_and_wait_ready).
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "daemon not ready");
+
+    // Drain both pipes concurrently so nothing blocks or truncates.
+    let mut out_pipe = child.stdout.take().expect("stdout piped");
+    let mut err_pipe = child.stderr.take().expect("stderr piped");
+    let out_task = tokio::spawn(async move {
+        let mut v = Vec::new();
+        let _ = out_pipe.read_to_end(&mut v).await;
+        v
+    });
+    let err_task = tokio::spawn(async move {
+        let mut v = Vec::new();
+        let _ = err_pipe.read_to_end(&mut v).await;
+        v
+    });
+
+    // Stub upstream so resolution succeeds and success-path logging runs.
+    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+
+    let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    client_sock
+        .connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+    let client_port = client_sock.local_addr().expect("local addr").port();
+
+    // Canary queries through both transports.
+    for id in [80u16, 81] {
+        client_sock
+            .send(&build_query(id, "canary-f7q9z.privacy.example."))
+            .await
+            .expect("send canary udp");
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client_sock.recv_from(&mut buf))
+            .await
+            .expect("udp reply")
+            .expect("recv");
+        let reply = Message::from_bytes(&buf[..n]).expect("decode");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+
+        // Same name over TCP.
+        use tokio::io::{AsyncReadExt as TcpRead, AsyncWriteExt as TcpWrite};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+            .await
+            .expect("tcp");
+        let q = build_query(id + 10, "canary-f7q9z.privacy.example.");
+        let mut framed = Vec::with_capacity(q.len() + 2);
+        framed.extend_from_slice(&(q.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&q);
+        stream.write_all(&framed).await.expect("write tcp");
+        let mut lb = [0u8; 2];
+        stream.read_exact(&mut lb).await.expect("len");
+        let rl = u16::from_be_bytes(lb) as usize;
+        let mut rb = vec![0u8; rl];
+        stream.read_exact(&mut rb).await.expect("body");
+        let treply = Message::from_bytes(&rb).expect("decode tcp");
+        assert_eq!(treply.metadata.response_code, ResponseCode::NoError);
+    }
+
+    // Teardown first: EOF flushes the drain tasks.
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+    let stdout_bytes = out_task.await.expect("stdout task");
+    let stderr_bytes = err_task.await.expect("stderr task");
+    let everything = String::from_utf8_lossy(&stdout_bytes).to_string()
+        + "\n"
+        + &String::from_utf8_lossy(&stderr_bytes);
+
+    // Prove we actually captured daemon output (not an empty pipe).
+    assert!(
+        everything.contains("rustydnsd starting"),
+        "startup banner missing from capture - collection broken"
+    );
+
+    // THE CONTRACT: neither identifier appears anywhere.
+    assert!(
+        !everything.contains("canary-f7q9z"),
+        "CANARY QUERY NAME leaked into daemon logs:\n{everything}"
+    );
+    assert!(
+        !everything.contains(&format!("127.0.0.1:{client_port}")),
+        "FULL CLIENT IDENTITY (ip:port) leaked into daemon logs:\n{everything}"
+    );
+}
