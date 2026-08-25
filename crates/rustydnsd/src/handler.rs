@@ -4278,6 +4278,68 @@ mod tests {
         drop(server);
     }
 
+    #[tokio::test]
+    async fn udp_malformed_opt_option_length_fails_closed() {
+        // RFC 6891 §6.1.2: each EDNS option carries a 2-byte OPTION-CODE,
+        // 2-byte OPTION-LENGTH, and OPTION-DATA of exactly that length.
+        // A hostile client can craft an OPT whose option-length exceeds the
+        // remaining RDATA bytes — probing whether the parser reads out of
+        // range or panics. Pinned contract: bounded work, silence or error
+        // rcode within budget, daemon stays live afterwards.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+
+        // Wire layout:
+        //   header(12): id, flags, QDCOUNT=1, ARCOUNT=1
+        //   question: victim.example.org. A IN
+        //   OPT root-record: type=41 class=4096 ttl=0 rdlen=6
+        //     rdata: code=8(ECS) len=0xFFFF(claims 65535 B, only 2 follow)
+        let mut wire = vec![0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 1];
+        wire.extend_from_slice(b"\x06victim\x07example\x03org\x00");
+        wire.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+        // OPT pseudo-record:
+        wire.push(0x00); // root name
+        wire.extend_from_slice(&[0x00, 0x29]); // type 41 (OPT)
+        wire.extend_from_slice(&[0x10, 0x00]); // class = 4096 payload
+        wire.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ttl: v0, no flags
+        wire.extend_from_slice(&[0x00, 0x06]); // rdlen = 6
+        // rdata: ECS option (code 8) claiming 0xFFFF bytes, then 2 pad bytes
+        wire.extend_from_slice(&[0x00, 0x08]); // option code = 8 (ECS)
+        wire.extend_from_slice(&[0xFF, 0xFF]); // option length = 65535 (!!)
+        wire.extend_from_slice(&[0xDE, 0xAD]); // only 2 actual bytes
+
+        client
+            .send_to(&wire, format!("127.0.0.1:{}", harness.port))
+            .await
+            .expect("send");
+
+        let mut buf = [0u8; 512];
+        match tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf)).await {
+            Err(_) => {} // silence satisfies the contract
+            Ok(Ok((n, _))) => {
+                if let Ok(msg) = Message::from_bytes(&buf[..n]) {
+                    assert!(
+                        !(msg.metadata.response_code == ResponseCode::NoError
+                            && !msg.answers.is_empty()),
+                        "malformed-OPT query produced a served answer"
+                    );
+                }
+            }
+            Ok(Err(e)) => panic!("socket error on malformed-OPT probe: {e}"),
+        }
+
+        // Liveness: daemon still serves valid queries afterwards.
+        let liveness = query(harness.port, "router.mesh.", ProtoRecordType::A).await;
+        assert_eq!(liveness.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(liveness.answers.len(), 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn dot_listener_refuses_plaintext_connection_on_its_port() {
         // DoT is RFC 7858: the port speaks TLS and NOTHING else. Control
