@@ -175,6 +175,22 @@ mod tests {
     }
 
     #[test]
+    fn glue_labels_never_match_suffix_entries() {
+        // The suffix walk is anchored at real label boundaries: only
+        // substrings that BEGIN AT A DOT are ever probed against stored
+        // ".zone" entries. An attacker-registered lookalike whose name
+        // merely ENDS with an allowlisted string must stay blockable —
+        // otherwise a single allowlist line exempts every glue-label
+        // lookalike from blocking.
+        let a = allow(&[".example.com"]);
+        assert!(!a.is_allowed("evilexample.com"));
+        assert!(!a.is_allowed("notexample.com"));
+        let b = allow(&["safe.internal.lan"]);
+        assert!(!b.is_allowed("safe-internal.lan"));
+        assert!(b.is_allowed("safe.internal.lan"));
+    }
+
+    #[test]
     fn case_insensitive() {
         let a = allow(&["Safe.Example.COM"]);
         assert!(a.is_allowed("safe.example.com"));
