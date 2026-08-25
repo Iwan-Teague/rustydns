@@ -5289,6 +5289,20 @@ mod tests {
         assert!(name_in_any_zone("mesh", &zones));
         // Not a subdomain — "meshx" must not match "mesh".
         assert!(!name_in_any_zone("meshx", &zones));
+        // Multi-label GLUE must not match either: "evilinternal.lan" ends
+        // with "internal.lan" as a raw string, but the character before the
+        // putative zone is '-' not '.', so it lives OUTSIDE the allowed
+        // zone. This is the leg that discriminates the byte-boundary check:
+        // a refactor to bare ends_with() passes every assertion above and
+        // silently widens the quarantine boundary to lookalike names.
+        assert!(!name_in_any_zone(
+            "evilinternal.lan.",
+            &["internal.lan.".to_string()]
+        ));
+        assert!(!name_in_any_zone(
+            "notlab.example.com.",
+            &["lab.example.com".to_string()]
+        ));
         // Outside any zone.
         assert!(!name_in_any_zone("example.com", &zones));
         // Empty zone list: caller treats as no restriction; we don't
