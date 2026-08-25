@@ -385,3 +385,107 @@ async fn binary_e2e_malformed_packets_never_crash_or_poison() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_sighup_picks_up_blocklist_change_live() {
+    use std::sync::atomic::Ordering;
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let bl_path = tmp.path().join("live.blocklist");
+    // Seed: exists but blocks nothing yet.
+    std::fs::write(&bl_path, "# empty seed\n").expect("write seed");
+
+    // Config identical to write_daemon_config except pointing local_files
+    // at the mutable path.
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\
+         local_files = [\"{}\"]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n",
+        bl_path.display()
+    );
+    std::fs::write(&cfg_path, config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Pre-HUP: late.test resolves through the stub.
+    let pre = resolve_a(&sock, 20, "late.test.").await;
+    assert_eq!(pre.metadata.response_code, ResponseCode::NoError);
+
+    // Operator edits the blocklist and signals a live reload.
+    std::fs::write(&bl_path, "0.0.0.0 late.test\n").expect("append block rule");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id().expect("pid") as i32),
+        nix::sys::signal::Signal::SIGHUP,
+    )
+    .expect("send SIGHUP");
+
+    // Poll until enforcement appears (reload is async), bounded.
+    let mut enforced = false;
+    'poll: for id in 30u16..60 {
+        sock.send(&build_query(id, "late.test."))
+            .await
+            .expect("send");
+        for _ in 0..6 {
+            let mut buf = vec![0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(300), sock.recv_from(&mut buf)).await {
+                Err(_) => break,
+                Ok(Err(_)) => continue,
+                Ok(Ok((n, _))) => {
+                    let Ok(reply) = Message::from_bytes(&buf[..n]) else {
+                        continue;
+                    };
+                    if reply.metadata.id != id {
+                        continue;
+                    }
+                    if reply.metadata.response_code == ResponseCode::NXDomain
+                        && reply.answers.is_empty()
+                    {
+                        enforced = true;
+                        break 'poll;
+                    }
+                    break; // non-NXDOMAIN reply: try next probe round
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(enforced, "SIGHUP did not activate the new blocklist entry");
+
+    // Control name unaffected post-reload.
+    let post = resolve_a(&sock, 70, "stillfine.test.").await;
+    assert_eq!(post.metadata.response_code, ResponseCode::NoError);
+
+    // Upstream only ever saw the two control queries - never late.test,
+    // before OR after enforcement.
+    assert!(
+        hits.load(Ordering::SeqCst) <= 3,
+        "unexpected upstream traffic: {}",
+        hits.load(Ordering::SeqCst)
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
