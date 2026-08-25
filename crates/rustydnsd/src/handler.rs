@@ -3355,6 +3355,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn blocked_domain_mixed_case_wire_query_is_still_blocked() {
+        // Case-variant bypass guard: the wire qname is canonicalised
+        // (lowercased) BEFORE blocklist/authority matching, so a client
+        // spelling the name "Ads.Example.COM." cannot dodge an exact-match
+        // block entry. Pins the WIRE-to-blocklist path, not just the
+        // helper's output.
+        let harness = build_harness(
+            vec![],
+            "0.0.0.0 ads.example.com\n",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        for spelling in ["Ads.Example.COM.", "ADS.EXAMPLE.COM.", "aDs.eXaMpLe.CoM."] {
+            let resp = query(harness.port, spelling, ProtoRecordType::A).await;
+            assert_eq!(
+                resp.metadata.response_code,
+                ResponseCode::NXDomain,
+                "{spelling} must be blocked like its lowercase form"
+            );
+            assert!(resp.answers.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn blocked_domain_refused_response_code() {
         let harness = build_harness(
             vec![],
