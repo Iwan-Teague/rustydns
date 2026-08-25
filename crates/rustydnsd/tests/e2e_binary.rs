@@ -549,10 +549,45 @@ async fn binary_e2e_operator_endpoints_health_metrics_queries() {
         assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
     }
 
+    // Refused-at-gate traffic counts TOO: an ANY probe is REFUSED before
+    // the pipeline but MUST still advance dns_queries_total - counters
+    // are placed PRE-GATE by design ("total DNS queries received").
+    // Pinning that placement: moving counters behind the gates makes this
+    // leg short by exactly one.
+    let mut any_msg = Message::new(44, MessageType::Query, hickory_proto::op::OpCode::Query);
+    any_msg.metadata.recursion_desired = true;
+    any_msg.add_query({
+        let mut q = hickory_proto::op::Query::new();
+        q.set_name(Name::from_ascii("any.counted.test.").expect("name"));
+        q.set_query_type(RecordType::ANY);
+        q
+    });
+    sock.send(&any_msg.to_vec().unwrap())
+        .await
+        .expect("send ANY");
+    let mut any_refused = false;
+    for _ in 0..8 {
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(400), sock.recv_from(&mut buf)).await {
+            Err(_) => break,
+            Ok(Err(_)) => continue,
+            Ok(Ok((n, _))) => {
+                if let Ok(m) = Message::from_bytes(&buf[..n])
+                    && m.metadata.id == 44
+                {
+                    assert_eq!(m.metadata.response_code, ResponseCode::Refused);
+                    any_refused = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(any_refused, "ANY probe must be REFUSED");
+
     let after = metric_value(&client, &base).await;
     assert!(
-        (after - before - 3.0).abs() < f64::EPSILON,
-        "expected +3 queries, {before} -> {after}"
+        (after - before - 4.0).abs() < f64::EPSILON,
+        "expected +4 queries (3 served + 1 refused-at-gate), {before} -> {after}"
     );
 
     // /queries: ring holds our entries - hashed qnames only, never the
