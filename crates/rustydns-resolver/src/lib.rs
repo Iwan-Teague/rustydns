@@ -1292,6 +1292,38 @@ mod tests {
     }
 
     #[test]
+    fn wrong_type_cname_query_drops_mixed_type_fillers() {
+        // Wrong-type filter edge: querying type CNAME must keep ONLY the
+        // CNAME record from a hostile response that mixes CNAME with A and
+        // TXT filler at the same owner name. Exercises type_label_matches
+        // with qtype=CNAME — a distinct code path from A/AAAA queries.
+        let mut records = vec![
+            DnsRecord::new(
+                "alias.example.org.",
+                RecordData::Cname("real-target.example.org.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "alias.example.org.",
+                RecordData::A(Ipv4Addr::new(192, 0, 2, 1)),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "alias.example.org.",
+                RecordData::Txt(vec![b"filler".to_vec()]),
+                Duration::from_secs(300),
+            ),
+        ];
+        let dropped = filter_wrong_type(&mut records, RecordType::CNAME);
+        assert_eq!(dropped, 2, "A + TXT fillers must be dropped");
+        assert_eq!(records.len(), 1);
+        assert!(
+            matches!(&records[0].data, RecordData::Cname(t) if t == "real-target.example.org."),
+            "only the CNAME must survive: {records:?}"
+        );
+    }
+
+    #[test]
     fn bailiwick_filter_terminates_on_cyclic_cname_links() {
         // Edge for the bailiwick fixpoint walk: a hostile answer whose CNAME
         // links form a CYCLE (victim -> a -> victim) plus records owned by
