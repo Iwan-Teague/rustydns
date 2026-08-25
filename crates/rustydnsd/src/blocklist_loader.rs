@@ -152,7 +152,7 @@ impl BlocklistLoader {
         let mut failed = 0usize;
 
         for path in local_files {
-            match self.read_local(path) {
+            match self.read_local(path).await {
                 Ok(content) => sources.push((content, BlocklistSource::Trusted)),
                 Err(e) => {
                     failed += 1;
@@ -213,27 +213,33 @@ impl BlocklistLoader {
         (sources, failed)
     }
 
-    fn read_local(&self, path: &Path) -> Result<String, RustyDnsError> {
-        // Stream the file under the same byte cap as remote fetches — the
-        // bounded-fetch invariant shouldn't depend on who owns the file, and
-        // this avoids buffering an oversized file fully into memory before
-        // noticing it's oversized.
-        use std::io::Read;
-        let file = std::fs::File::open(path)
-            .map_err(|e| RustyDnsError::Blocklist(format!("failed to read {path:?}: {e}")))?;
+    async fn read_local(&self, path: &Path) -> Result<String, RustyDnsError> {
+        // Spawn-blocking: local file I/O can block indefinitely on NFS mounts,
+        // FIFOs, or hung network filesystems. Moving it off the tokio runtime
+        // thread prevents stalling ALL async tasks (including DNS query
+        // processing) while the read completes or times out.
         let cap = self.config.max_fetch_bytes;
-        let mut limited = file.take(cap.saturating_add(1));
-        let mut bytes = Vec::new();
-        limited
-            .read_to_end(&mut bytes)
-            .map_err(|e| RustyDnsError::Blocklist(format!("failed to read {path:?}: {e}")))?;
-        if bytes.len() as u64 > cap {
-            return Err(RustyDnsError::Blocklist(format!(
-                "local blocklist {path:?} exceeds max_fetch_bytes ({len} > {cap})",
-                len = bytes.len(),
-            )));
-        }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        let path = path.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let file = std::fs::File::open(&path)
+                .map_err(|e| RustyDnsError::Blocklist(format!("failed to read {path:?}: {e}")))?;
+            let mut limited = file.take(cap.saturating_add(1));
+            let mut bytes = Vec::new();
+            limited
+                .read_to_end(&mut bytes)
+                .map_err(|e| RustyDnsError::Blocklist(format!("failed to read {path:?}: {e}")))?;
+            if bytes.len() as u64 > cap {
+                return Err(RustyDnsError::Blocklist(format!(
+                    "local blocklist {path:?} exceeds max_fetch_bytes ({len} > {cap})",
+                    len = bytes.len(),
+                )));
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .await
+        .map_err(|e| RustyDnsError::Blocklist(format!("spawn_blocking join error: {e}")))?;
+        result
     }
 
     async fn fetch_remote(&self, url: &str) -> Result<String, RustyDnsError> {
@@ -306,22 +312,25 @@ mod tests {
         BlocklistLoader::new(Arc::new(cfg)).expect("loader builds")
     }
 
-    #[test]
-    fn read_local_accepts_file_under_cap() {
+    #[tokio::test]
+    async fn read_local_accepts_file_under_cap() {
         let dir = std::env::temp_dir().join(format!("rustydns-bl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tempdir");
         let path = dir.join("under.cap");
         std::fs::write(&path, "ads.example.com\ntrackers.example.org\n").expect("write");
 
         let loader = loader_with_cap(1024);
-        let content = loader.read_local(&path).expect("under-cap file reads");
+        let content = loader
+            .read_local(&path)
+            .await
+            .expect("under-cap file reads");
         assert!(content.contains("ads.example.com"));
 
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn read_local_rejects_file_over_cap_without_fully_buffering() {
+    #[tokio::test]
+    async fn read_local_rejects_file_over_cap_without_fully_buffering() {
         let dir = std::env::temp_dir().join(format!("rustydns-bl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tempdir");
         let path = dir.join("over.cap");
@@ -333,6 +342,7 @@ mod tests {
         let loader = loader_with_cap(1024);
         let err = loader
             .read_local(&path)
+            .await
             .expect_err("over-cap local file must be rejected");
         assert!(err.to_string().contains("max_fetch_bytes"));
 
