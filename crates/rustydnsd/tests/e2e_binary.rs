@@ -603,3 +603,66 @@ async fn binary_e2e_resolves_over_tcp_with_length_framing() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_doh_post_resolves_over_http_seam() {
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let doh_port = reserve_port();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    // write_daemon_config covers the common shape; DoH needs one extra
+    // line, so build the config inline here.
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\
+         doh_listen = \"127.0.0.1:{doh_port}\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    // RFC 8484 POST: application/dns-message body -> same back.
+    let client = reqwest::Client::builder().build().unwrap();
+    let resp = client
+        .post(format!("http://127.0.0.1:{doh_port}/dns-query"))
+        .header("content-type", "application/dns-message")
+        .body(build_query(9, "doh.test."))
+        .send()
+        .await
+        .expect("DoH POST");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/dns-message")
+    );
+    let wire = resp.bytes().await.expect("response bytes");
+    let reply = Message::from_bytes(&wire).expect("decode DoH reply");
+    assert_eq!(reply.metadata.id, 9);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.answers.iter().any(|r| matches!(&r.data,
+        hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
+
+    // The query genuinely traversed the pipeline to our stub upstream.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
