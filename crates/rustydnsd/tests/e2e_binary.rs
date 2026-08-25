@@ -1723,3 +1723,57 @@ async fn binary_e2e_cache_entry_expires_and_reforwards() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_absurd_upstream_ttl_is_clamped() {
+    // CACHE-CEILING at the wire: an upstream advertising an absurd TTL
+    // (here ~11.5 days) cannot wedge an entry in the cache forever - the
+    // resolver clamps positive TTLs down to MAX_POSITIVE_CACHE_TTL_SECS
+    // (86 400). Assert the CLIENT-visible TTL reflects that clamp.
+    use std::sync::atomic::Ordering;
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits) = spawn_short_ttl_stub(upstream_port, 999_999).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    sock.send(&build_query(70, "wedged.test."))
+        .await
+        .expect("send");
+    let mut reply = None;
+    for _ in 0..10 {
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+            Err(_) => break,
+            Ok(Err(_)) => continue,
+            Ok(Ok((n, _))) => {
+                if let Ok(m) = Message::from_bytes(&buf[..n])
+                    && m.metadata.id == 70
+                {
+                    reply = Some(m);
+                    break;
+                }
+            }
+        }
+    }
+    let reply = reply.expect("no reply");
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(reply.answers.len(), 1);
+    let served_ttl = reply.answers[0].ttl;
+    assert!(
+        served_ttl > 0 && served_ttl <= 86_400,
+        "absurd upstream TTL must be clamped to <= 86 400, got {served_ttl}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
