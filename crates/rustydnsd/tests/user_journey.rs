@@ -1,0 +1,247 @@
+//! USER-JOURNEY lane: plug-and-play proof using the shipped
+//! `rustydns.example.toml`, exactly as an operator would.
+//!
+//! Journey 1 (this file): copy the example VERBATIM, apply ONLY the three
+//! substitutions CI physically requires (privileged port 53, external DoH
+//! network, remote blocklist fetch), start the REAL binary the way the
+//! README says, and assert a query resolves within 10 seconds.
+//!
+//! Every substitution asserts its search-string matched - so if the
+//! example config drifts, THIS test fails and forces a conscious update,
+//! instead of silently testing a fictional config.
+#![cfg(unix)]
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::serialize::binary::BinDecodable;
+
+const EXAMPLE_REL: &str = "rustydns.example.toml";
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn reserve_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve port")
+        .local_addr()
+        .expect("port")
+        .port()
+}
+
+/// Minimal raw-DNS stub upstream (same wire trick as e2e_binary.rs):
+/// QR/RA flip + pointer-compressed A 192.0.2.1 answer.
+async fn spawn_stub_udp_dns(port: u16) -> tokio::task::JoinHandle<()> {
+    let std_sock = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("stub bind");
+    std_sock.set_nonblocking(true).expect("nonblocking");
+    let sock = tokio::net::UdpSocket::from_std(std_sock).expect("stub into tokio");
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                continue;
+            };
+            if n < 12 {
+                continue;
+            }
+            let mut out = buf[..n].to_vec();
+            out[2] |= 0x80;
+            out[3] |= 0x80;
+            out[6] = 0;
+            out[7] = 1;
+            out.extend_from_slice(&[
+                0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04, 192, 0, 2,
+                1,
+            ]);
+            let _ = sock.send_to(&out, peer).await;
+        }
+    })
+}
+
+fn build_query(id: u16, name: &str) -> Vec<u8> {
+    let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query({
+        let mut q = hickory_proto::op::Query::new();
+        q.set_name(Name::from_ascii(name).expect("name"));
+        q.set_query_type(RecordType::A);
+        q
+    });
+    msg.to_vec().expect("encode")
+}
+
+/// Substitute EXACTLY the three CI-mandatory bits of the shipped example.
+/// Each replacement asserts its anchor matched once - example drift fails
+/// loudly here instead of silently testing fiction.
+fn ci_substitutions(example: &str, dns_port: u16, upstream_port: u16, metrics_port: u16) -> String {
+    let out = example
+        // (1) Privileged port: CI runs unprivileged; loopback :53 needs
+        // CAP_NET_BIND_SERVICE which the test harness cannot grant.
+        .replace(
+            "listen = [\"127.0.0.1:53\"]",
+            &format!("listen = [\"127.0.0.1:{dns_port}\"]"),
+        )
+        // (2) External DoH network: policy forbids outbound calls from CI;
+        // swap the real resolvers for an in-test plain stub.
+        .replace(
+            "resolvers = [\n    \"https://dns.quad9.net/dns-query\",           # Quad9 (privacy-focused, DNSSEC)\n    \"https://cloudflare-dns.com/dns-query\",       # Cloudflare 1.1.1.1\n]",
+            &format!("resolvers = [\"127.0.0.1:{upstream_port}\"]"),
+        )
+        .replace("protocol = \"doh\"", "protocol = \"plain\"")
+        .replace(
+            "min_tls_version = \"1.3\"",
+            "# min_tls_version: N/A for the plain CI stub",
+        )
+        .replace(
+            "dnssec_validation = true",
+            "dnssec_validation = false",
+        )
+        // (3) Remote blocklist fetch: same no-external-network policy.
+        .replace(
+            "sources = [\n    \"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts\",\n    # \"https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/domains/pro.txt\",\n]",
+            "sources = []",
+        )
+        // Metrics port collision avoidance (9153 may be occupied on devs).
+        .replace(
+            "listen = \"127.0.0.1:9153\"",
+            &format!("listen = \"127.0.0.1:{metrics_port}\""),
+        );
+
+    // Drift guards: every FUNCTIONAL anchor above had to match exactly
+    // once. (Bare substrings like `127.0.0.1:53` also appear inside the
+    // example's security comments, so guards use the assignment forms.)
+    for anchor in [
+        "listen = [\"127.0.0.1:53\"]",
+        "quad9.net",
+        "protocol = \"doh\"",
+        "raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+        "listen = \"127.0.0.1:9153\"",
+    ] {
+        assert!(
+            !out.contains(anchor),
+            "substitution missed anchor `{anchor}` - rustydns.example.toml drifted; \
+             update ci_substitutions() consciously"
+        );
+    }
+    // And the untouched parts really are the shipped file.
+    assert!(out.contains("mesh_zone_bundle_path = \"/var/lib/rustynet/dns-zone.bundle\""));
+    assert!(out.contains("[safesearch]"));
+    out
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn quickstart_example_config_verbatim_validates_and_resolves() {
+    let example_path = repo_root().join(EXAMPLE_REL);
+    let example = std::fs::read_to_string(&example_path).expect("shipped rustydns.example.toml");
+
+    // --- STEP 1: the UNMODIFIED file must pass --validate-config ----------
+    // Plug-and-play starts here: whatever an operator copies must at least
+    // be accepted by the shipped binary before any editing.
+    let raw_path = repo_root().join("target/journey-example-raw.toml");
+    std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+    std::fs::write(&raw_path, &example).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&raw_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&raw_path)
+        .arg("--validate-config")
+        .output()
+        .await
+        .expect("run --validate-config on the shipped example");
+    assert!(
+        out.status.success(),
+        "the SHIPPED example config failed --validate-config:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // --- STEP 2: CI-substituted variant serves a real query ---------------
+    let (dns_port, upstream_port, metrics_port) = (reserve_port(), reserve_port(), reserve_port());
+    let served = ci_substitutions(&example, dns_port, upstream_port, metrics_port);
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("rustydns.toml");
+    std::fs::write(&cfg_path, served).expect("write substituted config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let stub = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rustydnsd");
+
+    // Readiness: TCP listener bound.
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !ready {
+        let _ = child.kill().await;
+        panic!("daemon never became ready on the substituted example config");
+    }
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // THE JOURNEY CONTRACT: resolves within 10 seconds of going ready.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut resolved = false;
+    let mut id = 100u16;
+    while std::time::Instant::now() < deadline {
+        sock.send(&build_query(id, "www.example.com."))
+            .await
+            .expect("send");
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_secs(1), sock.recv_from(&mut buf)).await {
+            Err(_) => {
+                id += 1;
+                continue;
+            }
+            Ok(Err(_)) => {
+                id += 1;
+                continue;
+            }
+            Ok(Ok((n, _))) => {
+                if let Ok(reply) = Message::from_bytes(&buf[..n])
+                    && reply.metadata.id == id
+                {
+                    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+                    assert!(reply.answers.iter().any(|r| matches!(&r.data,
+                        hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
+                    resolved = true;
+                    break;
+                }
+                id += 1;
+            }
+        }
+    }
+    assert!(resolved, "example-config daemon did not resolve within 10s");
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}

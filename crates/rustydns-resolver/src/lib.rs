@@ -1180,6 +1180,31 @@ mod tests {
     use hickory_proto::rr::Name;
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, PTR, SRV, TXT};
 
+    // --- upstream decoder quirk (upgrade watchpoint) ----------------
+    //
+    // KNOWN ISSUE in hickory-proto 0.26: `ResponseCode::from(16)` maps to
+    // BADSIG, but RFC 6891 §6.1.3 and the IANA registry define extended
+    // code 16 as BADVERS (the TSIG-era BADSIG numbering does not apply to
+    // the extended DNS rcode space). Impact for us: when an upstream
+    // answers our query with a correct BADVERS encoding, the decoded
+    // error surfaces as BADSIG. Both are fail-closed, so security is
+    // unaffected; only surfaced error text is imprecise.
+    //
+    // Our binary-level EDNS conformance test asserts the WIRE fields
+    // (OPT rcode_high / version) rather than this decoder's enum, so the
+    // conformance pin stays correct. If a hickory upgrade fixes the map,
+    // flip this assertion to BADVERS as the upgrade signal.
+    #[test]
+    fn documents_hickory_extended_rcode16_decoded_as_badsig() {
+        use hickory_proto::op::ResponseCode;
+        assert_eq!(
+            <ResponseCode as From<u16>>::from(16u16),
+            ResponseCode::BADSIG,
+            "hickory 0.26 maps extended code 16 to BADSIG; if this ever \
+             returns BADVERS, also update any user-facing BADVERS wording"
+        );
+    }
+
     // --- conditional-forwarding zone matching -----------------------
     //
     // These tests exercise the pure matching helper (`zone_matches`)
