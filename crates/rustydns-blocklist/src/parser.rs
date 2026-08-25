@@ -398,6 +398,13 @@ fn is_ip_address(s: &str) -> bool {
     s.parse::<std::net::Ipv4Addr>().is_ok() || s.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
+/// Well-known names that must never become block entries.
+///
+/// Belt-and-braces: every name here is single-label, so the TLD guards in
+/// `validate_block_entry` / `validate_allow_entry` already reject them all
+/// (mutation-verified — disabling this list changes no behaviour today).
+/// Kept as explicit intent + a second line of defence should the TLD-guard
+/// semantics ever widen (e.g. to accept dotted special-names).
 fn is_always_skipped(domain: &str) -> bool {
     matches!(
         domain,
