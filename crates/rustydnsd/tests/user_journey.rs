@@ -364,6 +364,26 @@ async fn ad_block_out_of_the_box_doubleclick_blocked_google_resolves() {
     // 3) Only the allowed domain ever reached the upstream.
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
+    // 4) Ring attribution: the operator surface must distinguish the
+    // BLOCKLIST rejection from ordinary resolver answers - a refactor
+    // flattening served_by would silently merge enforcement with
+    // resolution in the audit surface.
+    let client = reqwest::Client::builder().build().unwrap();
+    let q = client
+        .get(format!("http://127.0.0.1:{metrics_port}/queries"))
+        .send()
+        .await
+        .expect("scrape /queries");
+    let qb = q.text().await.expect("queries body");
+    assert!(
+        qb.contains("\"served_by\":\"blocklist\""),
+        "blocked entry must carry blocklist attribution: {qb}"
+    );
+    assert!(
+        qb.contains("\"served_by\":\"resolver\""),
+        "allowed entry must carry resolver attribution: {qb}"
+    );
+
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
     stub.abort();
