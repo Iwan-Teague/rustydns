@@ -220,7 +220,7 @@ impl BlocklistLoader {
         // processing) while the read completes or times out.
         let cap = self.config.max_fetch_bytes;
         let path = path.to_path_buf();
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             use std::io::Read;
             let file = std::fs::File::open(&path)
                 .map_err(|e| RustyDnsError::Blocklist(format!("failed to read {path:?}: {e}")))?;
@@ -238,8 +238,7 @@ impl BlocklistLoader {
             Ok(String::from_utf8_lossy(&bytes).into_owned())
         })
         .await
-        .map_err(|e| RustyDnsError::Blocklist(format!("spawn_blocking join error: {e}")))?;
-        result
+        .map_err(|e| RustyDnsError::Blocklist(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn fetch_remote(&self, url: &str) -> Result<String, RustyDnsError> {

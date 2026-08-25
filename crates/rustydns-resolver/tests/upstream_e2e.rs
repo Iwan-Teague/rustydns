@@ -1994,8 +1994,6 @@ async fn upstream_failover_when_primary_dies_mid_session() {
     // and the primary dies mid-session (socket closed, process killed),
     // subsequent queries must transparently fail over to the secondary.
     // This pins the core value proposition of configuring multiple upstreams.
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // --- Phase 1: both alive, round-robin distribution ---
     let mock_a =

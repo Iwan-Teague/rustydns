@@ -544,6 +544,13 @@ fn build_resolver_opts(config: &DnsConfig, protocol: UpstreamProtocol) -> Resolv
     opts.positive_min_ttl = Some(Duration::from_secs(MIN_POSITIVE_CACHE_TTL_SECS));
     // CACHE-CEILING: clamp absurd TTLs so no entry outlives a bounded window.
     opts.positive_max_ttl = Some(Duration::from_secs(MAX_POSITIVE_CACHE_TTL_SECS));
+    // CACHE-FLOOR: negative responses (NXDOMAIN/NODATA) get the same
+    // bounded-TTL treatment as positive ones. Without explicit bounds,
+    // hickory defaults to its own internal ceiling — pinning ours here
+    // means a future hickory version raising the default cannot silently
+    // extend how long a hostile NXDOMAIN poisons the cache.
+    opts.negative_min_ttl = Some(Duration::from_secs(MIN_POSITIVE_CACHE_TTL_SECS));
+    opts.negative_max_ttl = Some(Duration::from_secs(MAX_POSITIVE_CACHE_TTL_SECS));
     // PRIVACY: never advertise EDNS0 Client Subnet. hickory does not
     // attach ECS automatically, but we also do not enable edns0
     // unless DNSSEC requires it (which we set below).
@@ -1224,6 +1231,12 @@ mod tests {
         let doh_opts = build_resolver_opts(&cfg, UpstreamProtocol::Doh);
         assert_eq!(doh_opts.positive_min_ttl, opts.positive_min_ttl);
         assert_eq!(doh_opts.positive_max_ttl, opts.positive_max_ttl);
+        // Negative-response bounds must match positive bounds (both use the
+        // same cache-ceiling constants for symmetric TTL enforcement).
+        assert_eq!(
+            doh_opts.negative_max_ttl,
+            Some(Duration::from_secs(MAX_POSITIVE_CACHE_TTL_SECS))
+        );
     }
 
     #[test]
