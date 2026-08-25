@@ -1,0 +1,89 @@
+# rustydns.toml — DOCKER / COMPOSE deployment template
+# ─────────────────────────────────────────────────────────────────────────────
+# This is the config docker-compose.yml expects. It differs from
+# rustydns.example.toml (the bare-metal/LAN template) in exactly one respect:
+#
+#   DNS listeners bind 0.0.0.0, not 127.0.0.1. Inside a container a loopback
+#   socket is unreachable through Docker's published ports — publishing
+#   "53:53/udp" forwards to the CONTAINER's address, so loopback binds would
+#   blackhole every published DNS port.
+#
+# Exposure is still governed by what you PUBLISH in docker-compose.yml: only
+# ports listed under `ports:` leave the host. Remove a mapping there and the
+# corresponding listener is effectively private again.
+#
+# The metrics endpoint stays on 127.0.0.1 INSIDE the container by design; it
+# is never published. Scrape it from a sidecar that joins this container's
+# network namespace (see docs/deployment-docker.md).
+
+[server]
+# Bind all container interfaces so published ports reach us.
+listen = ["0.0.0.0:53"]
+
+# Rustynet mesh zone name (must end with a dot).
+mesh_zone = "mesh."
+
+# DNS-over-HTTPS listener.
+# ⚠ SECURITY: 8053 is published by compose. A publicly reachable DoH endpoint
+#   can be abused as a DNS amplification vector — front it with a reverse
+#   proxy that enforces rate limiting, or delete its `ports:` mapping if you
+#   only need DoH inside your LAN.
+doh_listen = "0.0.0.0:8053"
+
+# DNS-over-TLS listener (uncomment to enable).
+# ⚠ SECURITY: requires tls_cert_path and tls_key_path below; the daemon
+#   refuses to start with dot_listen set but paths missing. Also uncomment
+#   the "853:853/tcp" mapping in docker-compose.yml.
+# dot_listen = "0.0.0.0:853"
+
+# DNS-over-QUIC listener (RFC 9250; uncomment to enable). Shares :853 with
+# DoT safely — different transports (UDP vs TCP), different sockets. Also
+# uncomment the "853:853/udp" mapping in docker-compose.yml.
+# doq_listen = "0.0.0.0:853"
+
+[upstream]
+# Upstream DoH resolver URLs (https:// only). Use operators from different
+# jurisdictions for the strongest query-history protection.
+resolvers = [
+    "https://dns.quad9.net/dns-query",
+    "https://cloudflare-dns.com/dns-query",
+]
+
+protocol = "doh"
+
+# ⚠ SECURITY: keep fail_closed = true. Disabling allows silent fallback to
+#   less secure behaviour when upstreams fail.
+fail_closed = true
+
+min_tls_version = "1.3"
+dnssec_validation = true
+timeout_ms = 5000
+max_cache_entries = 10000
+
+[blocklist]
+# Remote blocklist sources (https:// only). Any remote source is a potential
+# supply-chain vector — prefer several independent organisations' lists.
+sources = [
+    "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+]
+
+# Local blocklist files, if you mount them (compose maps ./blocklists onto
+# /var/lib/rustydns/blocklists). Supported: plain domain list, hosts file,
+# RPZ zone, AdGuard filter.
+# local_files = ["/var/lib/rustydns/blocklists/custom.txt"]
+
+# How blocked queries are answered: "nxdomain" (default), "sinkhole",
+# or "refused".
+response_code = "nxdomain"
+
+[privacy]
+# All options default to maximum privacy — anonymised client logging,
+# memory-only query ring buffer. Leave untouched unless you have read
+# docs/security.md and understand what log_client_ips / query_log_to_disk
+# expose.
+
+[metrics]
+# ⚠ SECURITY: loopback INSIDE the container; never publish this port.
+#   Metrics are unauthenticated. Scrape via a sidecar sharing this
+#   container's network namespace.
+listen = "127.0.0.1:9153"

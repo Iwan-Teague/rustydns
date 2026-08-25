@@ -13,7 +13,7 @@ for the management endpoints see
 ```bash
 git clone https://github.com/Iwan-Teague/rustydns.git
 cd rustydns
-cp rustydns.example.toml rustydns.toml
+cp rustydns.docker.toml rustydns.toml
 $EDITOR rustydns.toml
 docker compose up -d
 ```
