@@ -584,6 +584,20 @@ async fn binary_e2e_operator_endpoints_health_metrics_queries() {
     }
     assert!(any_refused, "ANY probe must be REFUSED");
 
+    // Per-qtype label correctness: the refused probe must appear under
+    // qtype="ANY", proving the bounded label mapping survives the early
+    // refusal path.
+    let m = client.get(format!("{base}/metrics")).send().await.unwrap();
+    let mtext = m.text().await.unwrap();
+    let any_line = mtext
+        .lines()
+        .find(|l| l.starts_with("rustydns_dns_queries_by_qtype_total{qtype=\"ANY\"}"))
+        .expect("ANY series must exist in by-qtype vector");
+    assert!(
+        any_line.trim_end().ends_with('1'),
+        "exactly one ANY query expected, got: {any_line}"
+    );
+
     let after = metric_value(&client, &base).await;
     assert!(
         (after - before - 4.0).abs() < f64::EPSILON,
