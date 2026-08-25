@@ -641,6 +641,47 @@ mod tests {
         );
     }
 
+    // --- Format detection ---------------------------------------------------
+
+    #[test]
+    fn detect_format_routes_each_family() {
+        use super::ListFormat;
+        // AdGuard markers win regardless of shape.
+        assert!(matches!(
+            detect_format("||ads.example.com^\n"),
+            ListFormat::AdGuard
+        ));
+        assert!(matches!(
+            detect_format("@@||safe.example.com^\n"),
+            ListFormat::AdGuard
+        ));
+        // 3+ tokens with a known rtype in position 2 -> RPZ.
+        assert!(matches!(
+            detect_format("evil.com CNAME .\n"),
+            ListFormat::Rpz
+        ));
+        // Leading IP -> Hosts.
+        assert!(matches!(
+            detect_format("0.0.0.0 evil.com\n"),
+            ListFormat::Hosts
+        ));
+        // Bare domain -> Plain.
+        assert!(matches!(
+            detect_format("just-a-domain.example.com\n"),
+            ListFormat::Plain
+        ));
+        // Comment/blank leading lines are skipped before detection.
+        assert!(matches!(
+            detect_format("# header\n\n0.0.0.0 evil.com\n"),
+            ListFormat::Hosts
+        ));
+        // Comments-only content falls back to Plain (and parses to nothing).
+        assert!(matches!(
+            detect_format("\n# only comments\n"),
+            ListFormat::Plain
+        ));
+    }
+
     #[test]
     fn passthru_single_label_tld_entries_skipped_in_both_formats() {
         // The allow-side TLD guard at the PARSER layer (the engine-level
