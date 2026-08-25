@@ -244,7 +244,8 @@ fn write_daemon_config(
          [upstream]\n\
          protocol = \"plain\"\n\
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
-         dnssec_validation = false\n\n\
+         dnssec_validation = false\n\
+         timeout_ms = 1500\n\n\
          {blocklist_section}\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n"
@@ -407,7 +408,8 @@ async fn binary_e2e_sighup_picks_up_blocklist_change_live() {
          [upstream]\n\
          protocol = \"plain\"\n\
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
-         dnssec_validation = false\n\n\
+         dnssec_validation = false\n\
+         timeout_ms = 1500\n\n\
          [blocklist]\n\
          local_files = [\"{}\"]\n\n\
          [metrics]\n\
@@ -1119,6 +1121,33 @@ async fn binary_e2e_default_logging_never_leaks_client_or_query_name() {
         assert_eq!(treply.metadata.response_code, ResponseCode::NoError);
     }
 
+    // Upstream-failure path: abort the stub, force one query through the
+    // fail-closed arm so its client-context WARN fires. Hickory's own
+    // retry/timeout window is ~5s, so wait generously for the SERVFAIL.
+    stub.abort();
+    let _ = client_sock
+        .send(&build_query(90, "after-death.privacy.example."))
+        .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(9);
+    while std::time::Instant::now() < deadline {
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(500), client_sock.recv_from(&mut buf))
+            .await
+        {
+            Err(_) => continue,
+            Ok(Err(_)) => continue,
+            Ok(Ok((n, _))) => {
+                if let Ok(m) = Message::from_bytes(&buf[..n])
+                    && m.metadata.id == 90
+                {
+                    assert_eq!(m.metadata.response_code, ResponseCode::ServFail);
+                    break;
+                }
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
     // Teardown first: EOF flushes the drain tasks.
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
@@ -1142,6 +1171,33 @@ async fn binary_e2e_default_logging_never_leaks_client_or_query_name() {
     );
     assert!(
         !everything.contains(&format!("127.0.0.1:{client_port}")),
-        "FULL CLIENT IDENTITY (ip:port) leaked into daemon logs:\n{everything}"
+        "FULL CLIENT IDENTITY (ip:port) leaked into daemon logs:\\n{everything}"
     );
+
+    // Identity-leg teeth: every client-context warn line must carry the
+    // ANONYMISED /16 form - never the raw client IP.
+    let client_lines: Vec<&str> = everything
+        .lines()
+        .filter(|l| l.contains("client"))
+        .collect();
+    eprintln!(
+        "DIAG capture_len={} client_lines={} sample={:?}",
+        everything.len(),
+        client_lines.len(),
+        everything.lines().take(4).collect::<Vec<_>>()
+    );
+    assert!(
+        !client_lines.is_empty(),
+        "expected at least one client-context warn after stub abort"
+    );
+    for l in &client_lines {
+        assert!(
+            l.contains("127.0.0.0/16"),
+            "client-context line missing anonymised form: {l}"
+        );
+        assert!(
+            !l.contains("127.0.0.1"),
+            "RAW CLIENT IP in client-context line: {l}"
+        );
+    }
 }
