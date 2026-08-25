@@ -1777,3 +1777,101 @@ async fn binary_e2e_absurd_upstream_ttl_is_clamped() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+/// Stub that answers EVERY query with authoritative NXDOMAIN (no SOA -
+// hickory tolerates its absence for caching defaults.
+async fn spawn_nxdomain_stub(
+    port: u16,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let task_hits = Arc::clone(&hits);
+    let std_sock = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("stub bind");
+    std_sock.set_nonblocking(true).expect("nonblocking");
+    let sock = tokio::net::UdpSocket::from_std(std_sock).expect("stub into tokio");
+
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                continue;
+            };
+            task_hits.fetch_add(1, Ordering::SeqCst);
+            if n < 12 {
+                continue;
+            }
+            let mut out = buf[..n].to_vec();
+            out[2] |= 0x80; // QR
+            out[3] = (out[3] & 0xF0) | 0x03; // RCODE=3 NXDOMAIN
+            out[6] = 0; // ANCOUNT
+            out[7] = 0; // NSCOUNT
+            let _ = sock.send_to(&out, peer).await;
+        }
+    });
+    (handle, hits)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_negative_responses_are_cached_then_expire() {
+    use std::sync::atomic::Ordering;
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits) = spawn_nxdomain_stub(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    async fn ask_nx(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> bool {
+        sock.send(&build_query(id, name)).await.expect("send");
+        for _ in 0..12 {
+            let mut buf = vec![0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(400), sock.recv_from(&mut buf)).await {
+                Err(_) => continue,
+                Ok(Err(_)) => continue,
+                Ok(Ok((n, _))) => {
+                    if let Ok(m) = Message::from_bytes(&buf[..n])
+                        && m.metadata.id == id
+                    {
+                        return m.metadata.response_code == ResponseCode::NXDomain;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // First NXDOMAIN: MISS -> forwarded.
+    assert!(
+        ask_nx(&sock, 80, "missing.test.").await,
+        "expected NXDOMAIN"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // Immediate repeat: served from NEGATIVE cache - no new upstream hit.
+    assert!(ask_nx(&sock, 81, "missing.test.").await);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "repeat must hit negative cache"
+    );
+
+    // Past the negative floor (same MIN constant, 2s): entry expires,
+    // upstream consulted again.
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    assert!(ask_nx(&sock, 82, "missing.test.").await);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
