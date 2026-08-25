@@ -489,3 +489,72 @@ async fn binary_e2e_sighup_picks_up_blocklist_change_live() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_operator_endpoints_health_metrics_queries() {
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let client = reqwest::Client::builder().build().unwrap();
+    let base = format!("http://127.0.0.1:{metrics_port}");
+
+    // /health: ready after listeners bound; no-store caching.
+    let health = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status(), 200);
+    assert_eq!(
+        health
+            .headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap()),
+        Some("no-store")
+    );
+    let hb = health.text().await.unwrap();
+    assert!(hb.contains("\"status\":\"ok\""), "{hb}");
+
+    // Baseline counter, then three real queries.
+    async fn metric_value(client: &reqwest::Client, base: &str) -> f64 {
+        let m = client.get(format!("{base}/metrics")).send().await.unwrap();
+        assert_eq!(m.status(), 200);
+        let body = m.text().await.unwrap();
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("rustydns_dns_queries_total ") {
+                return rest.trim().parse::<f64>().expect("counter value");
+            }
+        }
+        panic!("rustydns_dns_queries_total missing from metrics output");
+    }
+    let before = metric_value(&client, &base).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+    for id in 40u16..43 {
+        let reply = resolve_a(&sock, id, "counted.test.").await;
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    }
+
+    let after = metric_value(&client, &base).await;
+    assert!(
+        (after - before - 3.0).abs() < f64::EPSILON,
+        "expected +3 queries, {before} -> {after}"
+    );
+
+    // /queries: ring holds our entries - hashed qnames only, never the
+    // plaintext name, and the anonymised client form.
+    let q = client.get(format!("{base}/queries")).send().await.unwrap();
+    assert_eq!(q.status(), 200);
+    let qb = q.text().await.unwrap();
+    assert!(!qb.contains("counted.test"), "plaintext qname leaked: {qb}");
+    assert!(qb.contains("\"qname_hash\""), "{qb}");
+    assert!(qb.contains("/16"), "anonymised client marker missing: {qb}");
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
