@@ -67,8 +67,16 @@ impl BlockSchedule {
                 (Some(s), Some(e)) => {
                     let start = parse_hhmm(s)
                         .map_err(|err| format!("block_windows[{i}].start `{s}`: {err}"))?;
-                    let end = parse_hhmm(e)
-                        .map_err(|err| format!("block_windows[{i}].end `{e}`: {err}"))?;
+                    // `24:00` is accepted as an END-ONLY sentinel meaning
+                    // midnight-exclusive (minute 1440). Without it, a
+                    // "block until midnight" window must be written 23:59,
+                    // leaving the last minute of every night open.
+                    let end = if e.trim() == "24:00" {
+                        1440u16
+                    } else {
+                        parse_hhmm(e)
+                            .map_err(|err| format!("block_windows[{i}].end `{e}`: {err}"))?
+                    };
                     if start == end {
                         return Err(format!(
                             "block_windows[{i}]: start and end are equal (`{s}`); use \
@@ -428,5 +436,36 @@ mod tests {
     fn out_of_range_offset_rejected() {
         let err = BlockSchedule::compile(&[win(&[], None, None, 2000)]).unwrap_err();
         assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn end_sentinel_2400_closes_the_midnight_minute() {
+        // `end = "24:00"` means midnight-EXCLUSIVE (minute 1440). The old
+        // only-encoding, end="23:59", reopened for the final minute of
+        // every configured night.
+        let s = BlockSchedule::compile(&[win(&["mon"], Some("22:00"), Some("24:00"), 0)]).unwrap();
+        // Monday 22:00 and Monday 23:59:59 (tod=1439) both blocked...
+        assert!(
+            s.is_blocked_at(at(MON_NOON_UTC, 10 * 60)),
+            "Mon 22:00 blocked"
+        );
+        assert!(
+            s.is_blocked_at(at(MON_NOON_UTC, 11 * 60 + 59)),
+            "Mon 23:59 blocked — no reopen minute before midnight"
+        );
+        // ...and Tuesday 00:00 (the wrapped-into day) stays open because
+        // tue is not in the mask; with all days it would be open too
+        // (00:00 < start).
+        assert!(
+            !s.is_blocked_at(at(MON_NOON_UTC, 12 * 60)),
+            "Tue 00:00 open"
+        );
+
+        // Starts cannot use the sentinel: "24:00" as a start is rejected.
+        let err = BlockSchedule::compile(&[win(&[], Some("24:00"), Some("06:00"), 0)]).unwrap_err();
+        assert!(
+            err.contains(".start") && err.contains("hour must be 0..=23"),
+            "{err}"
+        );
     }
 }
