@@ -3168,6 +3168,19 @@ mod tests {
     }
 
     #[test]
+    fn odoh_without_proxies_rejected() {
+        // The inverse direction: protocol = "odoh" with NO relays would
+        // leave the resolver with nowhere to send the oblivious query.
+        // The proxy is what provides the anonymity guarantee — an ODoH
+        // target alone is just DoH with extra steps.
+        let mut cfg = baseline();
+        cfg.upstream.protocol = UpstreamProtocol::Odoh;
+        cfg.upstream.resolvers = vec!["https://odoh-target.example/dns-query".to_string()];
+        cfg.upstream.odoh_proxies = Vec::new();
+        assert_config_err(validate_config(&cfg), "requires at least one");
+    }
+
+    #[test]
     fn protocol_odoh_multiple_proxies_accepted() {
         // Several independent relays are the recommended ODoH posture — they
         // must all validate (each https).
