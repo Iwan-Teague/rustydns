@@ -15,6 +15,9 @@
 #      unreachable through Docker's published ports. The .docker template
 #      binds 0.0.0.0 for the container; exposure stays governed by what
 #      you publish under `ports:` below.)
+#      Then `chmod 640 rustydns.toml`: the daemon refuses to start if the
+#      config is world-readable, and a world-readable mount crash-loops
+#      under restart=unless-stopped.
 #   2. If you use the Rustynet mesh feature, drop the signed
 #      `dns-zone.bundle` and its hex-encoded ed25519 verifier key
 #      `dns-zone-verifier.key` into ./mesh/ — these are the artifact names

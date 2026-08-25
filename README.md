@@ -54,6 +54,7 @@ git clone https://github.com/Iwan-Teague/rustydns.git
 cd rustydns
 cp rustydns.docker.toml rustydns.toml   # container template: binds 0.0.0.0
 $EDITOR rustydns.toml
+chmod 640 rustydns.toml                 # required: world-readable configs are refused
 docker compose up -d
 ```
 
