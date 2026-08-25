@@ -1580,3 +1580,61 @@ async fn binary_e2e_spoofed_case_responses_fail_closed() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_doh_wrong_content_type_is_415() {
+    // RFC 8484 §6.1: the POST media type is contractual. A client
+    // declaring any other type must get 415 BEFORE the body reaches the
+    // parser - completing the binary-level DoH error trio alongside the
+    // empty-body and malformed-wire pins.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let doh_port = reserve_port();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\
+         doh_listen = \"127.0.0.1:{doh_port}\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let client = reqwest::Client::builder().build().unwrap();
+    for ct in ["text/plain", "application/json", ""] {
+        let mut req = client
+            .post(format!("http://127.0.0.1:{doh_port}/dns-query"))
+            .header("content-type", ct)
+            .body(build_query(88, "whatever.test."));
+        if ct.is_empty() {
+            req = req.header("content-type", "application/octet-stream");
+        }
+        let resp = req.send().await.expect("send");
+        assert_eq!(resp.status(), 415, "content-type `{ct}` must be 415");
+        assert_eq!(
+            resp.headers().get("accept").and_then(|v| v.to_str().ok()),
+            Some("application/dns-message"),
+            "415 must advertise the accepted type"
+        );
+    }
+    // Nothing reached the upstream.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
