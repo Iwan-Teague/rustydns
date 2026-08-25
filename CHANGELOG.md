@@ -174,6 +174,30 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Security
 
+- **IPv4-mapped IPv6 canonicalisation across all address-handling surfaces.**
+  Four surfaces accepted or keyed on `::ffff:a.b.c.d` spellings without
+  normalising them, letting representation confusion change security
+  behavior. All four now collapse mapped forms to native IPv4 (matching the
+  rate limiter's pre-existing convention):
+  - *Response-IP denylist* (`rustydns-core`): an upstream answering AAAA
+    `::ffff:6.6.6.9` bypassed a configured `6.6.6.0/24` rule — dual-stack
+    clients treat mapped forms as v4 connectivity to the same host.
+    `contains()` now runs a second pass routing embedded v4 through the v4
+    rules; mapped entries with prefix ≥ 96 are stored as their v4 equivalent
+    (`::ffff:a.b.c.d/120` → `a.b.c.d/24`).
+  - *Per-client policy table* (`rustydnsd`): on a dual-stack `[::]` listener,
+    v4 clients arrive as `::ffff:a.b.c.d`, so plain-v4 `[[policy]]` entries
+    silently missed — block windows, zone restrictions, and blocklist groups
+    all skipped for exactly those clients. Map keys and lookups both
+    normalise via `canonical_client_ip()`.
+  - *Rewrite address pins* (`rustydnsd`): `address = "::ffff:10.0.0.9"`
+    stored a V6 pin that answered only AAAA (mapped rdata) while every A
+    query got NODATA — contradicting the operator's plainly-v4 intent.
+  - *Metrics effective listen* (`rustydns-core`): `[::ffff:127.0.0.1]` was
+    treated as non-loopback V6 and re-bound to `[::1]` — a different socket
+    than written, invisible to overlap validation. Mapped loopback is now
+    recognised pre-check, and correctly collides with same-address DNS
+    listeners in `validate_config`.
 - **TLD guard extended to BLOCK entries.** The allowlist has always refused
   bare-TLD entries; the block side did not. A single `||com^` line from one
   compromised or buggy blocklist source blackholed every .com domain
