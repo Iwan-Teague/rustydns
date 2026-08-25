@@ -177,6 +177,7 @@ async fn handle_dns_message(
     if bytes.len() > MAX_DOH_MESSAGE_BYTES {
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header("Cache-Control", "no-store")
             .body(Body::from("DNS message too large"))
             .unwrap();
     }
@@ -216,6 +217,7 @@ async fn handle_dns_message(
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/dns-message")
+        .header("Cache-Control", "no-store")
         .body(Body::from(response_bytes))
         .unwrap()
 }
@@ -223,6 +225,7 @@ async fn handle_dns_message(
 fn bad_request(message: &'static str) -> Response {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
+        .header("Cache-Control", "no-store")
         .body(Body::from(message))
         .unwrap()
 }
@@ -230,6 +233,7 @@ fn bad_request(message: &'static str) -> Response {
 fn server_error(message: &'static str) -> Response {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header("Cache-Control", "no-store")
         .body(Body::from(message))
         .unwrap()
 }
@@ -499,6 +503,16 @@ mod tests {
                 .get("content-type")
                 .and_then(|v| v.to_str().ok()),
             Some("application/dns-message"),
+        );
+        // RFC 8484 §5.1 + supply-chain hygiene: responses must carry
+        // Cache-Control: no-store to prevent intermediate proxies from
+        // caching DNS data.
+        assert_eq!(
+            resp.headers()
+                .get("Cache-Control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "DoH responses must carry Cache-Control: no-store"
         );
         let body = resp.bytes().await.unwrap();
         let dns = Message::from_bytes(&body).unwrap();
