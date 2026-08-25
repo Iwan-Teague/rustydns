@@ -1248,3 +1248,61 @@ async fn binary_e2e_repeat_query_served_from_cache_without_upstream() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_any_qtype_refused_rfc8482() {
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // qtype ANY (255) is an amplification vector: must be REFUSED at the
+    // edge, never forwarded to the upstream.
+    let mut msg = Message::new(60, MessageType::Query, hickory_proto::op::OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query({
+        let mut q = hickory_proto::op::Query::new();
+        q.set_name(Name::from_ascii("any.test.").expect("name"));
+        q.set_query_type(RecordType::ANY);
+        q
+    });
+    sock.send(&msg.to_vec().expect("encode"))
+        .await
+        .expect("send");
+
+    let mut refused = false;
+    for _ in 0..10 {
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+            Err(_) => break,
+            Ok(Err(_)) => continue,
+            Ok(Ok((n, _))) => {
+                let Ok(reply) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                if reply.metadata.id != 60 {
+                    continue;
+                }
+                assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+                assert!(reply.answers.is_empty());
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused, "ANY query must be refused");
+    // And it never reached the upstream as a forwardable question.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
