@@ -516,3 +516,72 @@ async fn shipped_docker_template_stays_valid_with_privacy_posture() {
         "metrics stay loopback-only"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn print_config_stdout_is_pure_toml_that_round_trips() {
+    // UX contract: `--print-config > out.toml` must yield PURE parseable
+    // TOML on stdout even when startup warnings fire - logs belong on
+    // stderr. The dump must also keep secrets redacted AND re-validate.
+    let body = "[server]\n\
+                listen = [\"127.0.0.1:5399\"]\n\
+                mesh_zone = \"test.\"\n\n\
+                [upstream]\n\
+                protocol = \"doh\"\n\
+                resolvers = [\"https://user:supersecret@doh.example.com/dns-query\"]\n\
+                dnssec_validation = false\n\n\
+                [metrics]\n\
+                listen = \"127.0.0.1:19153\"\n";
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg = tmp.path().join("in.toml");
+    std::fs::write(&cfg, body).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let print = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--print-config")
+        .output()
+        .await
+        .expect("print-config run");
+    assert!(print.status.success());
+    let stdout = String::from_utf8_lossy(&print.stdout).to_string();
+
+    // Secrets redacted in the dump.
+    assert!(!stdout.contains("supersecret"), "password leaked to dump");
+    assert!(stdout.contains("<redacted>"), "placeholder missing");
+
+    // Warnings went to STDERR, not into the TOML stream.
+    let stderr = String::from_utf8_lossy(&print.stderr).to_string();
+    assert!(
+        stderr.contains("DNSSEC signatures will NOT be verified"),
+        "dnssec warning must still fire, on stderr"
+    );
+    assert!(
+        !stdout.contains("WARN"),
+        "log lines contaminated stdout TOML dump"
+    );
+
+    // THE CONTRACT: the dump re-validates as a config file.
+    let dump_path = tmp.path().join("dump.toml");
+    std::fs::write(&dump_path, stdout.as_bytes()).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dump_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let rt = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&dump_path)
+        .arg("--validate-config")
+        .output()
+        .await
+        .expect("round-trip validate");
+    assert!(
+        rt.status.success(),
+        "printed config failed re-validation:\n{}{}",
+        String::from_utf8_lossy(&rt.stdout),
+        String::from_utf8_lossy(&rt.stderr)
+    );
+}
