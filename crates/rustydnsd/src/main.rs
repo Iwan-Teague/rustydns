@@ -118,8 +118,12 @@ async fn main() -> Result<()> {
     check_config_permissions(&config_path)?;
 
     // Load and validate configuration.
-    let config =
-        rustydns_core::config::load_config(&config_path).context("failed to load configuration")?;
+    let config = rustydns_core::config::load_config(&config_path).with_context(|| {
+        format!(
+            "failed to load configuration file `{}` — pass --config <path> to choose another",
+            config_path.display()
+        )
+    })?;
 
     // Warn about privacy knobs that the operator may believe are
     // active but are not, because hickory 0.26's stub resolver
@@ -476,8 +480,12 @@ async fn main() -> Result<()> {
 #[cfg(unix)]
 fn check_config_permissions(path: &PathBuf) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("cannot stat config file: {}", path.display()))?;
+    let metadata = std::fs::metadata(path).with_context(|| {
+        format!(
+            "cannot read config file `{}` — does it exist? pass --config <path> to choose one",
+            path.display()
+        )
+    })?;
     let mode = metadata.permissions().mode();
     // 0o004 = other-read bit
     if mode & 0o004 != 0 {
@@ -2072,7 +2080,7 @@ mod tests {
         let err = check_config_permissions(&p).expect_err("missing file must error");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("cannot stat"),
+            msg.contains("cannot read config file"),
             "error must surface the stat failure: {msg}"
         );
     }

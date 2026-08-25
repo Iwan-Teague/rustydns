@@ -585,3 +585,29 @@ async fn print_config_stdout_is_pure_toml_that_round_trips() {
         String::from_utf8_lossy(&rt.stderr)
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_config_error_is_actionable() {
+    // Bare `rustydnsd` (or any --print-config/--validate-config) with a
+    // MISSING config file must produce an error that (a) names the path,
+    // (b) hints at --config — never a bare OS error string.
+    for args in [vec!["--print-config"], vec!["--validate-config"], vec![]] {
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+            .args(&args)
+            .output()
+            .await
+            .expect("run");
+        assert_eq!(out.status.code(), Some(1));
+        let combined = String::from_utf8_lossy(&out.stdout).to_string()
+            + "\n"
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(
+            combined.contains("rustydns.toml"),
+            "error must name the default path: {combined}"
+        );
+        assert!(
+            combined.contains("--config"),
+            "error must hint at --config: {combined}"
+        );
+    }
+}
