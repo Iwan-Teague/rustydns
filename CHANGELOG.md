@@ -198,6 +198,22 @@ See `docs/operator-endpoints.md` for the full reference.
     than written, invisible to overlap validation. Mapped loopback is now
     recognised pre-check, and correctly collides with same-address DNS
     listeners in `validate_config`.
+  - *Metrics bind + exposure warning* (follow-ups to the above): the
+    runtime bind choke point (`metrics_listen_addr`) and the
+    non-loopback exposure warning in `validate_config` both still used
+    raw `is_loopback`, so mapped spellings re-bound to `[::1]` at
+    runtime while validation cleared `127.0.0.1` — an overlap-validation
+    false-accept with a DNS listener on `[::1]:port`. All metrics
+    consumers now share one canonicalisation: validation, warning,
+    effective address, and actual bind agree for every spelling.
+- **Block-window wrap gap surfaced at compile time.** A single-day window
+  wrapping past midnight (`days = ["fri"]`, `22:00`–`06:00`) blocks only
+  Fri 22:00–24:00: the after-midnight half evaluates against Saturday's
+  unmasked day and stays open — silently, on exactly the hours such
+  windows target. Per-calendar-day attribution is deliberate documented
+  semantics; `BlockSchedule::compile` now warns naming each masked day
+  whose successor is unmasked, so the gap is operator-visible config
+  feedback instead of a silent fail-open.
 - **TLD guard extended to BLOCK entries.** The allowlist has always refused
   bare-TLD entries; the block side did not. A single `||com^` line from one
   compromised or buggy blocklist source blackholed every .com domain
@@ -401,7 +417,10 @@ See `docs/operator-endpoints.md` for the full reference.
   Bing, DuckDuckGo, YouTube to their safe-search endpoints.
 - **Scheduled block windows** (`[[policy]].block_windows`). Time-of-day
   restrictions per client; active windows refuse all queries before the
-  pipeline.
+  pipeline. `end` accepts the special value `"24:00"` as a midnight-
+  exclusive sentinel, so a block-until-midnight window has no reopen
+  minute before the day rolls over (the `23:59` spelling left the last
+  minute of every configured night open).
 - **Regex custom block rules** (`[[blocklist.regex_rules]]`). ReDoS-guarded
   via the `regex` crate (linear-time finite automata, no catastrophic
   backtracking).
