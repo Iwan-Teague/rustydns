@@ -75,6 +75,15 @@ impl RewriteMap {
         for rule in rules {
             let action = if let Some(addr) = &rule.address {
                 match addr.parse::<IpAddr>() {
+                    // Canonicalise IPv4-mapped spellings to native V4: an
+                    // operator writing `::ffff:10.0.0.9` means a v4 pin, and
+                    // storing it as V6 would answer only AAAA (A queries →
+                    // NODATA). Matches the per-client policy / rate-limiter
+                    // normalisation convention.
+                    Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+                        Some(v4) => Action::Address(IpAddr::V4(v4)),
+                        None => Action::Address(IpAddr::V6(v6)),
+                    },
                     Ok(ip) => Action::Address(ip),
                     Err(_) => continue,
                 }
@@ -233,6 +242,31 @@ mod tests {
         // A TXT query for a pinned name is also NODATA.
         assert!(matches!(
             map.lookup("pinned.example.com.", RecordType::TXT),
+            Some(RewriteDecision::NoData)
+        ));
+    }
+
+    #[test]
+    fn mapped_v4_address_rewrite_answers_native_a_queries() {
+        // `::ffff:10.0.0.9` means a v4 pin. Storing it as V6 would answer
+        // only AAAA with mapped rdata and NODATA every A query — the
+        // opposite of the written intent.
+        let map = RewriteMap::from_rules(&[rule(
+            "pinned.corp.example.com",
+            Some("::ffff:10.0.0.9"),
+            None,
+            false,
+        )]);
+        match map
+            .lookup("pinned.corp.example.com.", RecordType::A)
+            .unwrap()
+        {
+            RewriteDecision::Answer(recs) => assert_eq!(a_addr(&recs), "10.0.0.9"),
+            other => panic!("expected native-v4 Answer, got {other:?}"),
+        }
+        // And the AAAA query now correctly reports NODATA (v4 pin, v6 ask).
+        assert!(matches!(
+            map.lookup("pinned.corp.example.com.", RecordType::AAAA),
             Some(RewriteDecision::NoData)
         ));
     }
