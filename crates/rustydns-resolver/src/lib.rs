@@ -617,7 +617,7 @@ async fn build_resolver_arm(
     let mut prepared = (*tls_client_config).clone();
     prepared.alpn_protocols = match protocol {
         UpstreamProtocol::Doh => vec![b"h2".to_vec()],
-        UpstreamProtocol::Doq => Vec::new(), // MUTATION: doq alpn dropped
+        UpstreamProtocol::Doq => vec![b"doq".to_vec()],
         _ => Vec::new(),
     };
     let tls_client_config = Arc::new(prepared);
