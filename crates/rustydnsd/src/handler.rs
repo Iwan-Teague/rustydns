@@ -2813,6 +2813,30 @@ mod tests {
             "truncated reply must carry TC"
         );
 
+        // Surviving-answer ordering pin: the shed loop pops from the END,
+        // so the FIRST records in the original set must survive. All
+        // surviving A records must have distinct IPs matching the low end
+        // of the original range (10.9.0.0 onward), proving deterministic
+        // shed order.
+        let mut seen_ips = Vec::new();
+        for answer in &resp.answers {
+            if let hickory_proto::rr::RData::A(a) = &answer.data {
+                seen_ips.push(a.0);
+            }
+        }
+        assert!(!seen_ips.is_empty(), "at least one answer must survive");
+        seen_ips.sort();
+        seen_ips.dedup();
+        assert_eq!(
+            seen_ips.len(),
+            resp.answers.len(),
+            "no duplicate A records expected"
+        );
+        for ip in &seen_ips {
+            assert_eq!(ip.octets()[0], 10, "unexpected non-mesh IP: {ip}");
+            assert_eq!(ip.octets()[1], 9, "unexpected non-mesh IP: {ip}");
+        }
+
         // Leg B: advertise 4096 (our clamp) → reply stays within it.
         client
             .send_to(
