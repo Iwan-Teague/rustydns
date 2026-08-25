@@ -174,6 +174,18 @@ See `docs/operator-endpoints.md` for the full reference.
 
 ### Security
 
+- **Multi-provider query racing defeated upstream distribution.** hickory's
+  `num_concurrent_reqs` defaults to 2, racing every query to up to two
+  configured servers — so with the README-recommended two providers, BOTH
+  resolvers received EVERY query and each built a complete history,
+  silently defeating `privacy.randomize_upstream_selection`. When
+  randomization is enabled, dispatch is now forced serial
+  (`num_concurrent_reqs = 1`) so RoundRobin genuinely alternates providers
+  per query; wire-level e2e pins both the distribution (6 queries -> 6
+  datagrams across two stubs) and retained failover (dead first provider
+  still resolves via retry). Racing default is kept when randomization is
+  off.
+
 - **IPv4-mapped IPv6 canonicalisation across all address-handling surfaces.**
   Four surfaces accepted or keyed on `::ffff:a.b.c.d` spellings without
   normalising them, letting representation confusion change security

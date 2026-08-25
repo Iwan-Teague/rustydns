@@ -520,7 +520,11 @@ pub struct UpstreamConfig {
     ///
     /// With `privacy.randomize_upstream_selection = true` (the default),
     /// queries are distributed uniformly across these URLs so no single
-    /// resolver sees a complete query history.
+    /// resolver sees a complete query history. Implementation: dispatch is
+    /// forced serial (`num_concurrent_reqs = 1`) under randomization —
+    /// hickory's default of 2 would RACE every query to two providers,
+    /// giving both a full copy of the history. Trade-off: no parallel
+    /// answer race; failover still occurs via per-request retry.
     #[serde(default = "default_resolvers")]
     pub resolvers: Vec<String>,
 
