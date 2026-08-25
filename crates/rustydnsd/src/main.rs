@@ -2495,6 +2495,19 @@ mod tests {
 
     #[test]
     fn metrics_listen_bind_safety_forces_non_loopback_to_loopback() {
+        // An unparseable listen must be a hard ERROR, never a silent
+        // fallback to some default socket — a silent default could bind
+        // the unauthenticated endpoint somewhere unexpected.
+        let bad = rustydns_core::config::MetricsConfig {
+            listen: "not-a-socket".to_string(),
+            ..Default::default()
+        };
+        let err = metrics_listen_addr(&bad).expect_err("unparseable metrics.listen must fail");
+        assert!(
+            err.to_string().contains("not a valid socket address"),
+            "{err}"
+        );
+
         // The unauthenticated metrics endpoint is the bind-safety invariant
         // this daemon enforces: config warns on non-loopback, and the runtime
         // FORCES the address to loopback while preserving the operator's
