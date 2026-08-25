@@ -2854,6 +2854,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_in_zone_nodata_is_noerror_not_nxdomain() {
+        // Design decision pinned: an in-zone name WITHOUT matching records
+        // returns NoError + zero answers (NODATA), never NXDOMAIN.
+        //
+        // RFC 2308 §2.1 distinguishes NODATA ("name exists but not this
+        // type") from NXDOMAIN ("name does not exist"). These are cached
+        // differently by downstream stubs: NXDOMAIN triggers negative
+        // caching with SOA-minimum TTLs while NODATA uses shorter TTLs.
+        //
+        // For mesh zones where peers join/leave dynamically, returning
+        // NXDOMAIN for transient gaps would poison downstream caches and
+        // delay peer discovery after the record reappears. NODATA is the
+        // safer choice: it says "I'm authoritative, I processed your query,
+        // but no data right now" without asserting nonexistence.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+
+        // Query for a DIFFERENT in-zone name with no records configured.
+        let resp = query(harness.port, "ghost.mesh.", ProtoRecordType::A).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "in-zone miss must return NODATA (NoError), not NXDOMAIN"
+        );
+        assert!(
+            resp.answers.is_empty(),
+            "in-zone miss must return zero answers"
+        );
+        assert!(
+            resp.metadata.authoritative,
+            "authority hit must set AA flag even for NODATA"
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_inbound_datagram_is_never_processed() {
         // hickory's UDP listener reads into a bounded buffer
         // (MAX_RECEIVE_BUFFER_SIZE = 4096, or the advertised EDNS payload,
