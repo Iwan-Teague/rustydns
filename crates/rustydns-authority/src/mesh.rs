@@ -846,6 +846,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_verifier_keys() {
+        use super::MeshBundleError;
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let now = now();
+
+        // Empty key file.
+        let bundle_path = write_temp(
+            format!(
+                "version=1\nzone_name=mesh\nrecord_count=0\nsignature={}\n",
+                "0".repeat(128)
+            )
+            .as_bytes(),
+            "empty-key-bundle",
+        );
+        let key_path = write_temp(b"\n", "empty-key");
+        match load_mesh_bundle(&bundle_path, &key_path, "mesh.", 600) {
+            Err(MeshBundleError::InvalidVerifierKey(_)) => {}
+            other => panic!("empty key must yield InvalidVerifierKey, got {other:?}"),
+        }
+
+        // Non-hex content.
+        let key_path2 = write_temp(b"not hex at all\n", "nonhex-key");
+        match load_mesh_bundle(&bundle_path, &key_path2, "mesh.", 600) {
+            Err(MeshBundleError::InvalidVerifierKey(_)) => {}
+            other => panic!("non-hex key must yield InvalidVerifierKey, got {other:?}"),
+        }
+
+        // Wrong length (31 bytes = 62 hex chars).
+        let short_hex: String = signing.verifying_key().to_bytes()[..31]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let key_path3 = write_temp(short_hex.as_bytes(), "short-key");
+        match load_mesh_bundle(&bundle_path, &key_path3, "mesh.", 600) {
+            Err(MeshBundleError::InvalidVerifierKey(_)) => {}
+            other => panic!("short key must yield InvalidVerifierKey, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_oversized_bundle() {
         // Write a file with size > MAX_BUNDLE_BYTES.
         let huge = vec![b'A'; MAX_BUNDLE_BYTES + 1];
