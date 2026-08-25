@@ -820,6 +820,18 @@ fn build_tls_client_config(
         TlsVersion::Tls12 => &[&rustls::version::TLS13, &rustls::version::TLS12],
     };
 
+    // PRIVACY / FINGERPRINT POSTURE (audited): this is the ONLY place we
+    // touch the upstream TLS client, and we deliberately customize almost
+    // nothing - protocol versions (the documented TLS 1.3+ floor), roots
+    // (public Mozilla bundle via webpki-roots), and no client auth.
+    // ALPN is chosen by hickory per transport ("h2" for DoH, "doq" for
+    // DoQ), cipher order is rustls+ring's stock ordering, and HTTP/2
+    // settings are hyper/h2 defaults. An on-path observer therefore
+    // fingerprints a GENERIC rustls+ring+hickory client - nothing here
+    // identifies rustydns, this deployment, or any LAN client. SNI
+    // necessarily carries the upstream hostname only. Connection pooling
+    // aggregates the site's queries onto one stream but carries zero
+    // client-identifying data (clients are invisible upstream).
     let cfg = rustls::ClientConfig::builder_with_protocol_versions(versions)
         .with_root_certificates(roots)
         .with_no_client_auth();
