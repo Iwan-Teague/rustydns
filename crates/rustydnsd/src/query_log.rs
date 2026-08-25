@@ -346,6 +346,24 @@ mod tests {
     }
 
     #[test]
+    fn hash_unlinkable_across_instances() {
+        // Anonymity property (doc on `hash_keys`): hashes are keyed with
+        // per-instance OS entropy, so the same qname hashed by two QueryLog
+        // instances (i.e. across a daemon restart) must NOT collide — an
+        // operator correlating logs from two runs must not be able to
+        // track a domain across them. Within-process stability is pinned
+        // above; THIS pins the other half of the contract.
+        let log_a = QueryLog::new(4);
+        let log_b = QueryLog::new(4);
+        let qname = "tracker.example.com";
+        assert_ne!(
+            log_a.hash_qname(qname),
+            log_b.hash_qname(qname),
+            "same qname hashed identically across instances - keying is not per-instance"
+        );
+    }
+
+    #[test]
     fn capacity_evicts_oldest() {
         let log = QueryLog::new(3);
         for i in 0..5 {
