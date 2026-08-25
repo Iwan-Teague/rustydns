@@ -27,17 +27,29 @@ fn reserve_port() -> u16 {
 /// bit, sets RA, appends a single A answer (192.0.2.1) whose NAME is a
 /// compression pointer at offset 12 (the question), and echoes it back.
 /// Works for any single-question A query without touching hickory APIs.
-async fn spawn_stub_udp_dns(port: u16) -> tokio::task::JoinHandle<()> {
+/// The returned counter increments for every datagram received - lets
+/// tests prove which names DID reach the upstream.
+async fn spawn_stub_udp_dns(
+    port: u16,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_task = Arc::clone(&hits);
     let std_sock = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("stub bind");
     std_sock.set_nonblocking(true).expect("nonblocking");
     let sock = tokio::net::UdpSocket::from_std(std_sock).expect("stub into tokio");
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
         loop {
             let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
                 continue;
             };
+            hits_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n < 12 {
                 continue;
             }
@@ -54,7 +66,8 @@ async fn spawn_stub_udp_dns(port: u16) -> tokio::task::JoinHandle<()> {
             ]);
             let _ = sock.send_to(&out, peer).await;
         }
-    })
+    });
+    (handle, hits)
 }
 
 /// Build a well-formed A query for `name` with the given id.
@@ -71,63 +84,13 @@ fn build_query(id: u16, name: &str) -> Vec<u8> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn binary_end_to_end_resolves_a_query_over_real_udp() {
-    let dns_port = reserve_port();
-    let upstream_port = reserve_port();
-    let metrics_port = reserve_port();
-
-    let stub = spawn_stub_udp_dns(upstream_port).await;
-
-    // --- minimal config -----------------------------------------------------
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let cfg_path = tmp.path().join("rustydns.toml");
-    let config = format!(
-        "[server]\n\
-         listen = [\"127.0.0.1:{dns_port}\"]\n\
-         mesh_zone = \"test.\"\n\n\
-         [upstream]\n\
-         protocol = \"plain\"\n\
-         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
-         dnssec_validation = false\n\n\
-         [blocklist]\n\n\
-         [metrics]\n\
-         listen = \"127.0.0.1:{metrics_port}\"\n"
-    );
-    std::fs::write(&cfg_path, config).expect("write config");
-    // The daemon refuses world-readable configs — tighten before spawn.
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod config");
-    }
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
 
-    // --- spawn the real daemon ----------------------------------------------
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
-        .arg("--config")
-        .arg(&cfg_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn rustydnsd");
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
-    // --- readiness: TCP listener appears once bound -------------------------
-    let mut ready = false;
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
-            .await
-            .is_ok()
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !ready {
-        let _ = child.kill().await;
-        panic!("rustydnsd did not become ready on port {dns_port}");
-    }
-
-    // --- real UDP query round-trip ------------------------------------------
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("client bind");
@@ -181,4 +144,167 @@ async fn binary_end_to_end_resolves_a_query_over_real_udp() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
     stub.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_blocklist_blocks_domain_before_upstream() {
+    use std::sync::atomic::Ordering;
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(
+        tmp.path(),
+        dns_port,
+        upstream_port,
+        metrics_port,
+        Some("0.0.0.0 blocked.test\n"),
+    );
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Blocked name -> NXDOMAIN with zero answers.
+    sock.send(&build_query(10, "blocked.test."))
+        .await
+        .expect("send");
+    let mut saw_nxdomain = false;
+    for _ in 0..10 {
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+            Err(_) => break,
+            Ok(Err(_)) => continue,
+            Ok(Ok((n, _))) => {
+                let Ok(reply) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                if reply.metadata.id != 10 {
+                    continue;
+                }
+                assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+                assert!(reply.answers.is_empty());
+                saw_nxdomain = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_nxdomain, "blocked.test must be NXDOMAIN");
+
+    // Control: a different name still resolves through the stub.
+    let ok = resolve_a(&sock, 11, "fine.test.").await;
+    assert_eq!(ok.metadata.response_code, ResponseCode::NoError);
+
+    // The blocked query must NEVER have reached the upstream.
+    let upstream_hits = hits.load(Ordering::SeqCst);
+    assert_eq!(
+        upstream_hits, 1,
+        "only the control query may hit the upstream; blocked.test leaked"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
+
+// --- shared harness helpers (used by multiple e2e tests) -------------------
+
+fn pick_ports() -> (u16, u16, u16) {
+    (reserve_port(), reserve_port(), reserve_port())
+}
+
+/// Write a minimal daemon config; returns the path. `blocklist_hosts` is an
+/// optional hosts-format snippet written to a second temp file and wired as
+/// blocklist.local_files.
+fn write_daemon_config(
+    dir: &std::path::Path,
+    dns_port: u16,
+    upstream_port: u16,
+    metrics_port: u16,
+    blocklist_hosts: Option<&str>,
+) -> std::path::PathBuf {
+    let mut blocklist_section = String::from("[blocklist]\n");
+    if let Some(hosts) = blocklist_hosts {
+        let bl_path = dir.join("blocklist.hosts");
+        std::fs::write(&bl_path, hosts).expect("write blocklist file");
+        blocklist_section.push_str(&format!("local_files = [{}]\n", quote_path(&bl_path)));
+    }
+
+    let cfg_path = dir.join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         {blocklist_section}\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, config).expect("write config");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod config");
+    cfg_path
+}
+
+fn quote_path(p: &std::path::Path) -> String {
+    format!("\"{}\"", p.display())
+}
+
+async fn spawn_and_wait_ready(cfg_path: &std::path::Path, dns_port: u16) -> tokio::process::Child {
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(cfg_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rustydnsd");
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !ready {
+        let _ = child.kill().await;
+        panic!("rustydnsd did not become ready on port {dns_port}");
+    }
+    child
+}
+
+/// Send one A query and wait for the NOERROR answer carrying 192.0.2.1.
+async fn resolve_a(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> Message {
+    sock.send(&build_query(id, name)).await.expect("send query");
+    for _ in 0..20 {
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+            Err(_) => continue,
+            Ok(Err(_)) => continue,
+            Ok(Ok((n, _))) => {
+                let Ok(reply) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                if reply.metadata.id != id {
+                    continue;
+                }
+                assert_eq!(reply.metadata.message_type, MessageType::Response);
+                return reply;
+            }
+        }
+    }
+    panic!("no reply for {name}");
 }
