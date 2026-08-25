@@ -11,7 +11,7 @@
 //! instead of silently testing a fictional config.
 #![cfg(unix)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
@@ -34,16 +34,26 @@ fn reserve_port() -> u16 {
 
 /// Minimal raw-DNS stub upstream (same wire trick as e2e_binary.rs):
 /// QR/RA flip + pointer-compressed A 192.0.2.1 answer.
-async fn spawn_stub_udp_dns(port: u16) -> tokio::task::JoinHandle<()> {
+async fn spawn_stub_udp_dns(
+    port: u16,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let task_hits = Arc::clone(&hits);
     let std_sock = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("stub bind");
     std_sock.set_nonblocking(true).expect("nonblocking");
     let sock = tokio::net::UdpSocket::from_std(std_sock).expect("stub into tokio");
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
         loop {
             let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
                 continue;
             };
+            task_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n < 12 {
                 continue;
             }
@@ -58,7 +68,8 @@ async fn spawn_stub_udp_dns(port: u16) -> tokio::task::JoinHandle<()> {
             ]);
             let _ = sock.send_to(&out, peer).await;
         }
-    })
+    });
+    (handle, hits)
 }
 
 fn build_query(id: u16, name: &str) -> Vec<u8> {
@@ -173,7 +184,7 @@ async fn quickstart_example_config_verbatim_validates_and_resolves() {
         std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    let stub = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
         .arg("--config")
         .arg(&cfg_path)
@@ -244,4 +255,140 @@ async fn quickstart_example_config_verbatim_validates_and_resolves() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
     stub.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ad_block_out_of_the_box_doubleclick_blocked_google_resolves() {
+    use std::sync::atomic::Ordering;
+    let example_path = repo_root().join(EXAMPLE_REL);
+    let example = std::fs::read_to_string(&example_path).expect("shipped rustydns.example.toml");
+
+    let (dns_port, upstream_port, metrics_port) = (reserve_port(), reserve_port(), reserve_port());
+    let mut served = ci_substitutions(&example, dns_port, upstream_port, metrics_port);
+
+    // Operator journey: drop a Pi-hole-format blocklist next to the config
+    // and add ONE line to the shipped [blocklist] section.
+    let pihole_path = repo_root().join("target/journey-pihole.hosts");
+    std::fs::create_dir_all(pihole_path.parent().unwrap()).unwrap();
+    std::fs::write(&pihole_path, "0.0.0.0 doubleclick.net\n").expect("write pihole file");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pihole_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let anchor = "sources = []";
+    assert!(
+        served.contains(anchor),
+        "substituted example lost its (empty) sources anchor"
+    );
+    served = served.replace(
+        anchor,
+        &format!(
+            "sources = []\nlocal_files = [{}]",
+            quote_for_toml(&pihole_path)
+        ),
+    );
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("rustydns.toml");
+    std::fs::write(&cfg_path, &served).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rustydnsd");
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "daemon not ready");
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // 1) doubleclick.net -> blocked (default response_code = NXDOMAIN).
+    let mut blocked = false;
+    'b: for id in 200u16..210 {
+        sock.send(&build_query(id, "doubleclick.net."))
+            .await
+            .expect("send");
+        for _ in 0..6 {
+            let mut buf = vec![0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(400), sock.recv_from(&mut buf)).await {
+                Err(_) => break,
+                Ok(Err(_)) => continue,
+                Ok(Ok((n, _))) => {
+                    let Ok(reply) = Message::from_bytes(&buf[..n]) else {
+                        continue;
+                    };
+                    if reply.metadata.id != id {
+                        continue;
+                    }
+                    assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+                    assert!(reply.answers.is_empty());
+                    blocked = true;
+                    break 'b;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(blocked, "doubleclick.net was not blocked out of the box");
+
+    // 2) google.com still resolves normally.
+    let ok = resolve_via(&sock, 220, "google.com.").await;
+    assert_eq!(ok.metadata.response_code, ResponseCode::NoError);
+    assert!(ok.answers.iter().any(|r| matches!(&r.data,
+        hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
+
+    // 3) Only the allowed domain ever reached the upstream.
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
+
+async fn resolve_via(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> Message {
+    sock.send(&build_query(id, name)).await.expect("send");
+    for _ in 0..20 {
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+            Err(_) => continue,
+            Ok(Err(_)) => continue,
+            Ok(Ok((n, _))) => {
+                let Ok(reply) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                if reply.metadata.id == id {
+                    return reply;
+                }
+            }
+        }
+    }
+    panic!("no reply for {name}");
+}
+
+fn quote_for_toml(p: &Path) -> String {
+    format!("\"{}\"", p.display())
 }
