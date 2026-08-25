@@ -358,6 +358,38 @@ mod tests {
     }
 
     #[test]
+    fn longer_suffix_wins_over_shorter() {
+        // Both wildcards match x.lab.example.com; the LONGER suffix is the
+        // more specific rule and must win regardless of declaration order.
+        // Pins the longest-first sort: without it, whichever entry sorted
+        // first would silently shadow the operator's scoped exception.
+        let map = RewriteMap::from_rules(&[
+            rule("*.example.com", None, None, true), // broad block FIRST
+            rule("*.lab.example.com", Some("10.0.0.7"), None, false), // scoped pin
+        ]);
+        match map.lookup("x.lab.example.com.", RecordType::A).unwrap() {
+            RewriteDecision::Answer(recs) => assert_eq!(a_addr(&recs), "10.0.0.7"),
+            other => panic!("longer suffix must win, got {other:?}"),
+        }
+        // Outside the scoped subtree the broad block still applies.
+        assert!(matches!(
+            map.lookup("other.example.com.", RecordType::A),
+            Some(RewriteDecision::Nxdomain)
+        ));
+
+        // Same shape with reversed declaration order — precedence must come
+        // from suffix length, not config position.
+        let map = RewriteMap::from_rules(&[
+            rule("*.lab.example.com", Some("10.0.0.7"), None, false),
+            rule("*.example.com", None, None, true),
+        ]);
+        match map.lookup("x.lab.example.com.", RecordType::A).unwrap() {
+            RewriteDecision::Answer(recs) => assert_eq!(a_addr(&recs), "10.0.0.7"),
+            other => panic!("precedence must be length-based, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn no_match_returns_none() {
         let map =
             RewriteMap::from_rules(&[rule("pinned.example.com", Some("10.0.0.1"), None, false)]);
