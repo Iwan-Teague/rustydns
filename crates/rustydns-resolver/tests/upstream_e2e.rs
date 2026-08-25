@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::{A, NS};
+use hickory_proto::rr::rdata::{A, NS, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::net::UdpSocket;
