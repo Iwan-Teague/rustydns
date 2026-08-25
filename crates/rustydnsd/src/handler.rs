@@ -5364,6 +5364,49 @@ mod tests {
         assert!(handler.resolve_policy(mapped).blocklist_bypass);
     }
 
+    #[test]
+    fn policy_duplicate_across_spellings_collapses_later_wins() {
+        // Both spellings of ONE address configured as separate [[policy]]
+        // entries. Key-side canonicalisation collapses them onto the same
+        // map slot: exactly one entry survives, the LATER one wins (same
+        // semantics as an exact-text duplicate), so behavior stays
+        // deterministic instead of depending on which spelling a query's
+        // socket happened to present.
+        let policies = vec![
+            NodePolicy {
+                node_id: None,
+                client_ip: Some("::ffff:10.0.0.7".to_string()),
+                blocklist_bypass: true,
+                zones_allowed: vec![],
+                log_all_queries: false,
+                block_windows: Vec::new(),
+                blocklist_group: None,
+            },
+            NodePolicy {
+                node_id: None,
+                client_ip: Some("10.0.0.7".to_string()),
+                blocklist_bypass: false,
+                zones_allowed: vec![],
+                log_all_queries: false,
+                block_windows: Vec::new(),
+                blocklist_group: None,
+            },
+        ];
+        let map = build_policy_map(&policies);
+
+        let canon: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        let entry = map.get(&canon).expect("canonical entry must exist");
+        assert_eq!(
+            map.values().count(),
+            1,
+            "both spellings collapse to one slot"
+        );
+        assert!(
+            !entry.blocklist_bypass,
+            "the LATER entry must win the collapse"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn non_query_opcode_returns_notimp() {
         // We're a recursive resolver, not a master server. UPDATE etc.
