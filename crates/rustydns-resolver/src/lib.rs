@@ -610,6 +610,17 @@ async fn build_resolver_arm(
     tls_client_config: Arc<rustls::ClientConfig>,
     config: &DnsConfig,
 ) -> ResolverResult<ResolverArm> {
+    // RFC-mandated ALPN per transport (RFC 9250 §4.3 "doq"; h2 for DoH).
+    // hickory sets none itself and inherits whatever this ClientConfig
+    // carries - an empty list would make real-world DoQ upstreams reject
+    // the handshake outright.
+    let mut prepared = (*tls_client_config).clone();
+    prepared.alpn_protocols = match protocol {
+        UpstreamProtocol::Doh => vec![b"h2".to_vec()],
+        UpstreamProtocol::Doq => Vec::new(), // MUTATION: doq alpn dropped
+        _ => Vec::new(),
+    };
+    let tls_client_config = Arc::new(prepared);
     let mut name_servers: Vec<NameServerConfig> = Vec::new();
     let mut configured_any = false;
     for url in resolvers {
@@ -824,8 +835,9 @@ fn build_tls_client_config(
     // touch the upstream TLS client, and we deliberately customize almost
     // nothing - protocol versions (the documented TLS 1.3+ floor), roots
     // (public Mozilla bundle via webpki-roots), and no client auth.
-    // ALPN is chosen by hickory per transport ("h2" for DoH, "doq" for
-    // DoQ), cipher order is rustls+ring's stock ordering, and HTTP/2
+    // ALPN: WE set it per transport below-in-arm construction ("h2" DoH,
+    // "doq" DoQ - hickory sets none itself); cipher order is rustls+ring's
+    // stock ordering, and HTTP/2
     // settings are hyper/h2 defaults. An on-path observer therefore
     // fingerprints a GENERIC rustls+ring+hickory client - nothing here
     // identifies rustydns, this deployment, or any LAN client. SNI
