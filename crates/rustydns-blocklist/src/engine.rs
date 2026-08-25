@@ -455,6 +455,15 @@ mod tests {
             !e.is_blocked("example-ads.com"),
             "apex not blocked by wildcard-only entry"
         );
+        // Glue-label lookalikes are NOT swept up by the parent walk: the
+        // walk probes real parent labels only ("example-ads.com" itself is
+        // excluded above; "evilexample-ads.com" never produces it as a
+        // label suffix). Pin both directions so a substring-matching
+        // refactor fails here instead of silently widening the block.
+        assert!(
+            !e.is_blocked("evilexample-ads.com"),
+            "lookalike name without a label boundary must stay unblocked"
+        );
     }
 
     #[test]
