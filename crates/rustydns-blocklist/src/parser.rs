@@ -595,6 +595,25 @@ mod tests {
         assert!(parse_hosts("0.0.0.0 evil.com\n").contains(&exact("evil.com")));
     }
 
+    #[test]
+    fn plain_and_rpz_oversized_lines_are_skipped_wholesale() {
+        // Same bound for the other two formats, each with its own length
+        // gate: a comment-padded oversized line must yield nothing even
+        // though its stripped form would parse cleanly.
+        let plain = format!("evil.com # {}", "x".repeat(MAX_LINE_BYTES + 8));
+        assert!(parse_plain(&plain).is_empty());
+        assert!(parse_plain("evil.com\n").contains(&exact("evil.com")));
+
+        let rpz = format!("evil.com CNAME . ; {}", "x".repeat(MAX_LINE_BYTES + 8));
+        assert!(parse_rpz(&rpz).is_empty());
+        assert!(parse_rpz("evil.com CNAME .\n").contains(&exact("evil.com")));
+
+        // AdGuard shares the same invariant via its own gate.
+        let adg = format!("||evil.com^ ! {}", "x".repeat(MAX_LINE_BYTES + 8));
+        assert!(parse_adguard(&adg).is_empty());
+        assert!(parse_adguard("||evil.com^\n").contains(&exact("evil.com")));
+    }
+
     // --- RPZ ----------------------------------------------------------------
 
     #[test]
