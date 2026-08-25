@@ -1439,6 +1439,44 @@ mod tests {
             Duration::from_secs(60),
         )
     }
+    fn record_cname(name: &str, target: &str) -> DnsRecord {
+        DnsRecord::new(
+            name,
+            RecordData::Cname(target.to_string()),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn bailiwick_walk_terminates_on_cyclic_upstream_chain() {
+        // A hostile upstream can answer with CNAMEs forming a CYCLE inside
+        // the allowed set: victim -> a -> b -> a. The walk's termination
+        // argument is monotonic growth of the `allowed` set (each pass
+        // either adds a NEW distinct name or stops); this test pins that
+        // property by completing on cyclic input and asserting exact
+        // retention: the whole cycle stays (all names reachable), the
+        // terminal A at `a` survives, and the outsider is dropped.
+        let mut records = vec![
+            record_cname("victim.example.", "a.example."),
+            record_cname("a.example.", "b.example."),
+            record_cname("b.example.", "a.example."), // cycle back to a
+            record_a("a.example.", "1.2.3.4"),
+            record_a("outsider.example.", "9.9.9.9"),
+        ];
+        let dropped = filter_out_of_bailiwick(&mut records, "victim.example");
+        assert_eq!(dropped, 1, "only the outsider must be dropped");
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"victim.example."), "{names:?}");
+        assert!(names.contains(&"a.example."), "{names:?}");
+        assert!(names.contains(&"b.example."), "{names:?}");
+        assert!(!names.contains(&"outsider.example."));
+        // Terminal A survived the chain filter alongside the CNAME links.
+        assert!(
+            records.iter().any(|r| matches!(&r.data, RecordData::A(ip) if *ip == "1.2.3.4".parse::<std::net::Ipv4Addr>().unwrap())),
+            "terminal A inside the cycle must survive: {records:?}"
+        );
+    }
+
     fn record_aaaa(name: &str, ip: &str) -> DnsRecord {
         DnsRecord::new(
             name,
