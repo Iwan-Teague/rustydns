@@ -1555,8 +1555,22 @@ fn metrics_listen_addr(metrics: &MetricsConfig) -> Result<SocketAddr> {
         )
     })?;
 
-    if addr.ip().is_loopback() {
-        return Ok(addr);
+    // Canonicalise IPv4-mapped spellings BEFORE the loopback decision —
+    // the same rule as MetricsConfig::effective_listen in core. Binding
+    // must agree with what validate_config collision-checked: treating
+    // `::ffff:x.x.x.x` as V6 here would bind [::1] where validation
+    // cleared 127.0.0.1 (or vice versa), reopening a random-role overlap
+    // on SO_REUSEPORT sockets.
+    let ip = match addr.ip() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+
+    if ip.is_loopback() {
+        return Ok(SocketAddr::new(ip, addr.port()));
     }
 
     warn!(
@@ -1564,7 +1578,7 @@ fn metrics_listen_addr(metrics: &MetricsConfig) -> Result<SocketAddr> {
         "metrics.listen is not loopback; forcing loopback to avoid public exposure"
     );
 
-    let loopback_ip = match addr.ip() {
+    let loopback_ip = match ip {
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
     };
@@ -2365,16 +2379,29 @@ mod tests {
             "wildcard IPv6 metrics listen must be forced to ::1 on SIGHUP reload"
         );
 
-        // Leg 3: v4-mapped public IPv6 (the endrun form from the startup
-        // pin) — is_loopback() is false for it, so it must hit the forcing
-        // branch here too.
+        // Leg 3: v4-mapped public IPv6 — canonicalised to its embedded v4
+        // first (same rule as core's effective_listen), which is not
+        // loopback, so it hits the forcing branch: 127.0.0.1, matching what
+        // validate_config collision-checked.
         let mut cfg = base_config();
         cfg.metrics.listen = "[::ffff:203.0.113.9]:9209".to_string();
         al.reload_metrics_group(&cfg);
         assert_eq!(
             al.live_metrics,
-            Some("[::1]:9209".parse().unwrap()),
-            "v4-mapped metrics listen must be forced to ::1 on SIGHUP reload"
+            Some("127.0.0.1:9209".parse().unwrap()),
+            "v4-mapped metrics listen must canonicalise to v4 and force to 127.0.0.1"
+        );
+
+        // Leg 4: v4-mapped LOOPBACK spelling passes through as NATIVE V4 —
+        // no forcing branch, and the bound socket is the same one the core
+        // contract (effective_listen) promised, never a [::1] re-bind.
+        let mut cfg = base_config();
+        cfg.metrics.listen = "[::ffff:127.0.0.1]:9210".to_string();
+        al.reload_metrics_group(&cfg);
+        assert_eq!(
+            al.live_metrics,
+            Some("127.0.0.1:9210".parse().unwrap()),
+            "mapped loopback must bind native 127.0.0.1, not [::1]"
         );
     }
 
@@ -2512,10 +2539,12 @@ mod tests {
     #[test]
     fn metrics_listen_bind_safety_rejects_ipv4_mapped_v6_endruns() {
         // IPv4-mapped IPv6 literals are the classic bind-safety confusion
-        // vector: `is_loopback()` on `::ffff:a.b.c.d` is false even for the
-        // mapped loopback (`::ffff:127.0.0.1`), so BOTH forms must fall into
-        // the forcing path and land on `::1`. Pins that no mapped form can
-        // smuggle a non-loopback metrics bind past the V6 parser.
+        // vector. They are canonicalised to their embedded v4 first (same
+        // rule as core's effective_listen), then loopback-checked and
+        // forced — so NO mapped form can yield a non-loopback metrics bind,
+        // and mapped LOOPBACK binds natively as v4 instead of being re-bound
+        // to [::1] (which would diverge from what validate_config
+        // collision-checked).
         let mapped_loopback = rustydns_core::config::MetricsConfig {
             listen: "[::ffff:127.0.0.1]:9153".to_string(),
             ..Default::default()
@@ -2523,10 +2552,11 @@ mod tests {
         let forced = metrics_listen_addr(&mapped_loopback).expect("mapped loopback parse");
         assert_eq!(
             forced.ip(),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-            "even the mapped loopback must be normalised onto ::1"
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "mapped loopback must bind NATIVE 127.0.0.1, not [::1]"
         );
-        assert_eq!(forced.port(), 9153, "port preserved when forcing");
+        assert_eq!(forced.port(), 9153, "port preserved");
+        assert!(forced.ip().is_loopback());
 
         let mapped_public = rustydns_core::config::MetricsConfig {
             listen: "[::ffff:203.0.113.7]:9153".to_string(),
@@ -2534,9 +2564,9 @@ mod tests {
         };
         let forced_pub = metrics_listen_addr(&mapped_public).expect("mapped public parse");
         assert_eq!(
-            forced_pub.ip(),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-            "a v4-mapped public address must never survive unforced"
+            forced_pub,
+            "127.0.0.1:9153".parse().unwrap(),
+            "a v4-mapped public address must be canonicalised and FORCED to loopback"
         );
         assert!(forced_pub.ip().is_loopback());
     }
