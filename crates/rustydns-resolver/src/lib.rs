@@ -567,6 +567,16 @@ fn build_resolver_opts(config: &DnsConfig, protocol: UpstreamProtocol) -> Resolv
     // `ServerOrderingStrategy::RoundRobin` which distributes load
     // uniformly over time. When randomisation is off we fall back
     // to QueryStatistics so the healthiest provider gets preference.
+    // PRIVACY: hickory defaults num_concurrent_reqs to 2, RACING every
+    // query to up to 2 servers - both providers see EVERY query, which
+    // defeats the distribute-across-providers guarantee that
+    // privacy.randomize_upstream_selection exists for. With randomization
+    // on, force serial dispatch so RoundRobin genuinely alternates
+    // providers per query. Cost: no parallel race (failover still happens
+    // through retry on timeout/error).
+    if config.privacy.randomize_upstream_selection {
+        opts.num_concurrent_reqs = 1;
+    }
     opts.server_ordering_strategy = if config.privacy.randomize_upstream_selection {
         ServerOrderingStrategy::RoundRobin
     } else {

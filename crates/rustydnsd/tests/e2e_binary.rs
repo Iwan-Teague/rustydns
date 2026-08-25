@@ -1875,3 +1875,66 @@ async fn binary_e2e_negative_responses_are_cached_then_expire() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_multi_upstream_queries_distribute_across_providers() {
+    // PRIVACY FEATURE at the wire: randomize_upstream_selection (default
+    // on) distributes queries across configured providers so NO SINGLE
+    // upstream builds a complete query history. Two stubs, six distinct
+    // names: both stubs must see traffic and the total must be exact.
+    use std::sync::atomic::Ordering;
+    let (dns_port, metrics_port) = (reserve_port(), reserve_port());
+    let up1 = reserve_port();
+    let up2 = reserve_port();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{up1}\", \"127.0.0.1:{up2}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let (stub1, h1, _c1) = spawn_stub_udp_dns(up1).await;
+    let (stub2, h2, _c2) = spawn_stub_udp_dns(up2).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    for id in 300u16..306 {
+        let name = format!("provider-split-{id}.example.");
+        let reply = resolve_a(&sock, id, &name).await;
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    }
+
+    let c1 = h1.load(Ordering::SeqCst);
+    let c2 = h2.load(Ordering::SeqCst);
+    assert_eq!(c1 + c2, 6, "every query must reach exactly one provider");
+    assert!(c1 > 0, "provider 1 saw nothing - distribution broken");
+    assert!(
+        c2 > 0,
+        "provider 2 saw nothing - single-provider fallback leaks history"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub1.abort();
+    stub2.abort();
+}
