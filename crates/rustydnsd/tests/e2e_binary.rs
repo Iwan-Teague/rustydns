@@ -1484,3 +1484,99 @@ async fn binary_e2e_upstream_privacy_no_ecs_no_identity_exact_qname() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+/// Adversarial stub: answers EVERY query with the correct A rdata but a
+/// DELIBERATELY wrong-cased QNAME echo (all-lowercase), modelling a
+/// spoofing/hijacking upstream. Pairs with the daemon's 0x20 verification
+/// (opts.case_randomization on plain): responses whose question case does
+/// not match the randomized probe MUST be rejected, never served.
+async fn spawn_case_spoofing_stub(
+    port: u16,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let task_hits = Arc::clone(&hits);
+    let std_sock = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("stub bind");
+    std_sock.set_nonblocking(true).expect("nonblocking");
+    let sock = tokio::net::UdpSocket::from_std(std_sock).expect("stub into tokio");
+
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                continue;
+            };
+            task_hits.fetch_add(1, Ordering::SeqCst);
+            if n < 12 {
+                continue;
+            }
+            // Lowercase every byte of the QUESTION NAME region (offset 12
+            // until first zero byte) - guaranteed mismatch whenever the
+            // daemon's probe used any uppercase byte (0x20 encoding).
+            let mut out = buf[..n].to_vec();
+            let mut i = 12;
+            while i < out.len() && out[i] != 0 {
+                if out[i].is_ascii_uppercase() {
+                    out[i] += 32;
+                }
+                i += 1;
+            }
+            out[2] |= 0x80;
+            out[3] |= 0x80;
+            out[6] = 0;
+            out[7] = 1;
+            out.extend_from_slice(&[
+                0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04, 192, 0, 2,
+                1,
+            ]);
+            let _ = sock.send_to(&out, peer).await;
+        }
+    });
+    (handle, hits)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_spoofed_case_responses_fail_closed() {
+    use std::sync::atomic::Ordering;
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits) = spawn_case_spoofing_stub(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Two probes: both carry 0x20-randomized QNAMEs upstream; the spoofer
+    // mangles case on every reply, so BOTH must fail closed (SERVFAIL).
+    // The spoofed A record must NEVER surface to the client.
+    for id in [400u16, 401] {
+        let reply = resolve_a(&sock, id, "hijack-target.example.").await;
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::ServFail,
+            "case-mismatched upstream response must fail closed, got {reply:?}"
+        );
+        assert!(
+            reply.answers.is_empty(),
+            "spoofed answer leaked to client: {:?}",
+            reply.answers
+        );
+    }
+
+    // Both probes genuinely traversed to the upstream (rejection happens
+    // AFTER receipt, so two datagrams must have been exchanged).
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
