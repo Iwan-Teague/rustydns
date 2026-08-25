@@ -849,7 +849,6 @@ mod tests {
     fn rejects_malformed_verifier_keys() {
         use super::MeshBundleError;
         let signing = SigningKey::from_bytes(&[9u8; 32]);
-        let now = now();
 
         // Empty key file.
         let bundle_path = write_temp(
