@@ -387,6 +387,7 @@ impl SafeSearchConfig {
 
 /// Network listener configuration.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// UDP and TCP listen addresses.
     ///
@@ -513,6 +514,7 @@ pub enum TlsVersion {
 
 /// Upstream resolver configuration.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     /// Upstream DoH/DoQ resolver URLs. All must use `https://`.
     ///
@@ -694,6 +696,7 @@ pub struct UpstreamRoute {
 /// hex-encoded on a single line. If `mesh_zone_bundle_path` is unset,
 /// the authority serves static records only.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityConfig {
     /// Path to the signed dns-zone bundle file written by `rustynetd`.
     ///
@@ -754,6 +757,7 @@ impl Default for AuthorityConfig {
 
 /// A static DNS record declared directly in `rustydns.toml`.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct StaticRecord {
     /// Fully-qualified domain name (trailing dot is optional — normalised at load time).
     pub name: String,
@@ -791,6 +795,7 @@ pub enum BlockResponse {
 
 /// Blocklist engine configuration.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct BlocklistConfig {
     /// Remote blocklist source URLs. **Must use `https://`.**
     ///
@@ -983,6 +988,7 @@ impl Default for BlocklistConfig {
 /// Every option is documented with what it protects against.
 /// To reduce privacy, you must explicitly opt out — nothing degrades silently.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PrivacyConfig {
     /// RFC 7816 — Query Name Minimisation.
     ///
@@ -1099,6 +1105,7 @@ impl Default for PrivacyConfig {
 
 /// Prometheus metrics endpoint configuration.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Listen address. **Bind to `127.0.0.1` only** unless behind an
     /// authenticated reverse proxy. Metrics are unauthenticated and expose
@@ -1228,6 +1235,7 @@ impl Default for RateLimitConfig {
 /// zones_allowed = ["mesh."]
 /// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct NodePolicy {
     /// Rustynet node ID (`ed25519:<base64-pubkey>`).
     ///
