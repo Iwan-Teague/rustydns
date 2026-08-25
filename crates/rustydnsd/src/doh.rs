@@ -807,6 +807,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn doh_rejects_empty_post_body() {
+        // Zero-length body gets its OWN attribution ("empty DNS message"),
+        // distinct from the malformed-wire path - keeps the two rejection
+        // layers distinguishable in client-facing errors.
+        let handler = build_handler(
+            vec![],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        let (base, shutdown) = spawn_doh(handler).await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .post(format!("{base}/dns-query"))
+            .header("content-type", "application/dns-message")
+            .body(Vec::new())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = resp.text().await.expect("body text");
+        assert!(
+            body.contains("empty DNS message"),
+            "empty-body errors must be attributed as such, got: {body}"
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn doh_rejects_oversized_post_body() {
         let handler = build_handler(
             vec![],
