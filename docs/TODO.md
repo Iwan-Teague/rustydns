@@ -391,8 +391,31 @@ blocklist groups shipped — `[[blocklist.groups]]` named sets + a
   extended (URL fragments, presign/OAuth param names, upstream-error log
   arm); SIGHUP fetch-round minimum spacing (CDN hammering); authority field
   changes flagged restart-required; CLI contract pinned.
-- **Corrected on the record:** 935536a's "anchored regex rules silently
-  dead" claim was FALSE — is_blocked strips the trailing dot at entry for
+- **Continuation round 2 (post-d0ec18e) — shipped:** EDNS BADVERS gate
+  added (RFC 6891 §6.1.3 conformance; our listener stack bypasses hickory
+  Catalog); listener-role overlap validation generalized to ALL TCP roles
+  (DoH, metrics) and wildcard-vs-specific addresses via addrs_compete()
+  predicate; TLD guard extended to BLOCK entries (one compromised source
+  line blackholed a whole TLD fleet-wide); mesh freshness fails closed on
+  untrusted clocks (pre-epoch now=0 passed every expiry check); block
+  windows fail CLOSED on pre-epoch clocks (conservative enforcement);
+  SIGHUP fetch-round minimum spacing (60s); authority fields flagged
+  restart-required; DoH deadline derived from upstream timeout; SIGHUP DoH
+  rebind tracks timeout-only changes; socket-activation fall-through warn;
+  installer CWD-independent asset resolution; compose mount/artifact names
+  aligned with example config; /health sample output corrected;
+  deployment-docker wget commands replaced with bash /dev/tcp probes.
+- **Continuation round 2 — corrected on record:** 552d9ee's blanket
+  rejection of poll_interval_secs=0 broke the documented SIGHUP-only mode;
+  fixed by gating the reload loop spawn instead (29c110f). Changelog entry
+  corrected (6f2556f).
+- **Continuation round 2 — verified clean:** install.sh idempotency and
+  directory modes; dependency supply chain (zero git deps, crates.io only);
+  README quick-start commands; sinkhole family-mismatch arms; rate limiter
+  GC/eviction interplay with refused clients; systemd unit directive
+  compatibility with validate-config ExecStartPre.
+- **Re-verified the upstream-blocked items (1.1/1.2/2.1) against hickory
+  0.26.1:** — is_blocked strips the trailing dot at entry for
   every matcher; the strip added there was redundant and has been removed,
   while the regression test remains as a pin on that trim. See 66b3c29.
 - **Verified-clean this pass:** install.sh idempotency and modes; compose
