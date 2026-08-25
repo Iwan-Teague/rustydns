@@ -950,6 +950,7 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[tokio::test(flavor = "current_thread")]
     async fn doh_get_without_dns_param_is_rejected() {
         // axum 0.7→0.8 migration pin (d097ffe): the Query<DohQuery>
         // extractor must still reject a parameter-less GET with 400 before
