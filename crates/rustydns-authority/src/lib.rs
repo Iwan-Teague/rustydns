@@ -1185,6 +1185,42 @@ mod tests {
     }
 
     #[test]
+    fn static_and_mesh_records_for_same_name_coexist() {
+        // Precedence contract: when the operator's static TOML AND the
+        // signed mesh bundle both define a name, the snapshot UNIONS them
+        // (both answers served, static first). Neither source silently
+        // overrides the other — an override would either drop signed mesh
+        // data on a stale static entry or drop explicit operator intent on
+        // a bundle update. Trade-off (stale static ghost answers until the
+        // operator cleans up) is documented here deliberately.
+        let (bundle_path, key_path) = make_bundle(&[("router", "100.64.0.1")], "mesh");
+
+        let mut sr = vec![a("router.mesh", "10.0.0.1")];
+        let config = AuthorityConfig {
+            mesh_zone_bundle_path: Some(bundle_path),
+            mesh_zone_verifier_key_path: Some(key_path),
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records: std::mem::take(&mut sr),
+            poll_interval_secs: 30,
+        };
+        let auth = Authority::new(config).unwrap();
+
+        let result = auth.lookup("router.mesh", "A").expect("in zone");
+        let ips: Vec<String> = result
+            .iter()
+            .filter_map(|r| match &r.data {
+                RecordData::A(ip) => Some(ip.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ips.contains(&"10.0.0.1".to_string()) && ips.contains(&"100.64.0.1".to_string()),
+            "both static and mesh A records must be served, got {ips:?}"
+        );
+    }
+
+    #[test]
     fn authority_reload_mesh_picks_up_new_bundle() {
         let (bundle_path, key_path) = make_bundle(&[("router", "100.64.0.1")], "mesh");
 
