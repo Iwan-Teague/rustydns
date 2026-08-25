@@ -6,6 +6,8 @@
 //! Teardown kills the daemon child and aborts the stub task.
 #![cfg(unix)]
 
+mod test_certs;
+
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -722,6 +724,109 @@ async fn binary_e2e_doh_get_resolves_via_base64url_param() {
     assert!(reply.answers.iter().any(|r| matches!(&r.data,
         hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_dot_tls_handshake_and_resolution() {
+    use std::sync::atomic::Ordering;
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    use tokio_rustls::rustls::{
+        ClientConfig, RootCertStore,
+        pki_types::{CertificateDer, ServerName},
+    };
+
+    // Integration tests are a separate crate: install the ring provider
+    // exactly like the daemon's own DoT tests do.
+    let _ = tokio_rustls::rustls::crypto::CryptoProvider::install_default(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    );
+
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let dot_port = reserve_port();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    // Write cert/key files for the daemon's DoT listener.
+    let cert_path = tmp.path().join("leaf-cert.pem");
+    let key_path = tmp.path().join("leaf-key.pem");
+    std::fs::write(&cert_path, test_certs::TEST_LEAF_CERT_PEM).expect("write cert");
+    std::fs::write(&key_path, test_certs::TEST_LEAF_KEY_PEM).expect("write key");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\
+         dot_listen = \"127.0.0.1:{dot_port}\"\n\
+         tls_cert_path = \"{}\"\n\
+         tls_key_path = \"{}\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n",
+        cert_path.display(),
+        key_path.display()
+    );
+    std::fs::write(&cfg_path, config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    // TLS client trusting ONLY the embedded test CA; dial by leaf SAN.
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(test_certs::TEST_CA_PEM.as_bytes()) {
+        roots.add(cert.expect("ca cert")).expect("add ca");
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(std::sync::Arc::new(config));
+
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", dot_port))
+        .await
+        .expect("tcp connect to DoT");
+    let server_name = ServerName::try_from(test_certs::TEST_CERT_CN.to_string()).expect("san name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls handshake");
+
+    // RFC 1035 framing inside the TLS stream.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let query = build_query(15, "dot.test.");
+    let mut framed = Vec::with_capacity(query.len() + 2);
+    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&query);
+    tls.write_all(&framed).await.expect("write framed DoT");
+
+    let mut len_buf = [0u8; 2];
+    tls.read_exact(&mut len_buf).await.expect("reply length");
+    let reply_len = u16::from_be_bytes(len_buf) as usize;
+    assert!(
+        reply_len > 12 && reply_len <= 4096,
+        "implausible {reply_len}"
+    );
+    let mut reply_buf = vec![0u8; reply_len];
+    tls.read_exact(&mut reply_buf).await.expect("reply body");
+
+    let reply = Message::from_bytes(&reply_buf).expect("decode DoT reply");
+    assert_eq!(reply.metadata.id, 15);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.answers.iter().any(|r| matches!(&r.data,
+        hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
