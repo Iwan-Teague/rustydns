@@ -2652,6 +2652,28 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                 "rewrite[{idx}].target is empty"
             )));
         }
+        // A self-referential rewrite (`name == target`) creates an infinite
+        // CNAME loop: every query for the name returns a CNAME pointing back
+        // at itself, which client resolvers chase until their own depth
+        // limit. Reject at validation rather than serving broken answers.
+        let norm_name = format!(
+            "{}.",
+            rule.name.trim().trim_end_matches('.').to_ascii_lowercase()
+        );
+        let norm_target = format!(
+            "{}.",
+            rule.target
+                .as_ref()
+                .map(|t| t.trim().trim_end_matches('.').to_ascii_lowercase())
+                .unwrap_or_default()
+        );
+        if rule.address.is_none() && norm_name == norm_target {
+            return Err(crate::RustyDnsError::Config(format!(
+                "rewrite[{idx}] (`{}`): name and target must differ — a self-referential \
+                 rewrite creates an infinite CNAME loop",
+                rule.name.trim()
+            )));
+        }
 
         // A wildcard rewrite must keep at least two labels so it can't hijack
         // an entire TLD (e.g. `*.com`) — same guard as the allowlist.
@@ -3712,6 +3734,20 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn rewrite_self_referential_target_rejected() {
+        // A CNAME rewrite whose target equals its own name creates an
+        // infinite CNAME loop served to clients. Reject at validation.
+        let mut cfg = baseline();
+        cfg.rewrite.push(crate::config::RewriteRule {
+            name: "loop.example.com".to_string(),
+            address: None,
+            target: Some("loop.example.com".to_string()),
+            block: false,
+        });
+        assert_config_err(validate_config(&cfg), "self-referential");
+    }
+
     fn rewrite_bad_address_rejected() {
         let mut cfg = baseline();
         cfg.rewrite = vec![rewrite("svc.example.com", Some("not-an-ip"), None, false)];
