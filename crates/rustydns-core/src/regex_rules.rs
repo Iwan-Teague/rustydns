@@ -139,6 +139,16 @@ mod tests {
     }
 
     #[test]
+    fn unicode_class_rejected_at_compile() {
+        // The builder sets unicode(false): domains are ASCII/punycode and
+        // the dependency is built without Unicode tables. A pattern using
+        // a Unicode class must ERROR at compile (surfaced by validate_config)
+        // rather than compile with silently-different semantics.
+        let err = RegexRules::compile(&[r"^\p{L}+".to_string()]).unwrap_err();
+        assert!(err.contains("invalid regex rule"), "{err}");
+    }
+
+    #[test]
     fn overlong_pattern_rejected() {
         let long = "a".repeat(MAX_REGEX_PATTERN_LEN + 1);
         let err = RegexRules::compile(&[long]).unwrap_err();
