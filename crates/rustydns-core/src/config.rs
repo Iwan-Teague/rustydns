@@ -1336,7 +1336,10 @@ pub struct BlockWindow {
     pub start: Option<String>,
 
     /// Window end `"HH:MM"` (24-hour, exclusive). If `end <= start` the window
-    /// wraps past midnight (e.g. `22:00`–`07:00`).
+    /// wraps past midnight (e.g. `22:00`–`07:00`). The special value `24:00`
+    /// is accepted as an end-only sentinel for midnight-exclusive, so a
+    /// "block until midnight" window has no reopen minute before the day
+    /// rolls over.
     #[serde(default)]
     pub end: Option<String>,
 
