@@ -847,6 +847,20 @@ mod tests {
     }
 
     #[test]
+    fn name_within_zone_requires_label_boundary() {
+        use super::name_within_zone;
+        // Exact and subdomain matches.
+        assert!(name_within_zone("mesh.", "mesh."));
+        assert!(name_within_zone("router.mesh.", "mesh."));
+        // Glue-label lookalikes must NOT count: "evilmesh." ends with
+        // "mesh." as a raw string but has no label boundary before it.
+        assert!(!name_within_zone("evilmesh.", "mesh."));
+        assert!(!name_within_zone("xmesh.", "mesh."));
+        // Different zone entirely.
+        assert!(!name_within_zone("host.example.com.", "mesh."));
+    }
+
+    #[test]
     fn name_normalisation_trailing_dot_and_case() {
         let auth = Authority::new(cfg(vec![a("Host.Lab.Example.COM", "10.0.0.5")])).unwrap();
 
