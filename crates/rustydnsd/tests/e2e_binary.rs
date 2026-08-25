@@ -832,3 +832,113 @@ async fn binary_e2e_dot_tls_handshake_and_resolution() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_doq_quic_stream_resolution_with_ca_trust() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
+
+    let _ = tokio_rustls::rustls::crypto::CryptoProvider::install_default(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    );
+
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let doq_port = reserve_port();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cert_path = tmp.path().join("leaf-cert.pem");
+    let key_path = tmp.path().join("leaf-key.pem");
+    std::fs::write(&cert_path, test_certs::TEST_LEAF_CERT_PEM).expect("write cert");
+    std::fs::write(&key_path, test_certs::TEST_LEAF_KEY_PEM).expect("write key");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\
+         doq_listen = \"127.0.0.1:{doq_port}\"\n\
+         tls_cert_path = \"{}\"\n\
+         tls_key_path = \"{}\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n",
+        cert_path.display(),
+        key_path.display()
+    );
+    std::fs::write(&cfg_path, config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    // Quinn client trusting ONLY the embedded test CA; ALPN exactly "doq".
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(test_certs::TEST_CA_PEM.as_bytes()) {
+        roots.add(cert.expect("ca cert")).expect("add ca");
+    }
+    let mut crypto = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"doq".to_vec()];
+    let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic cfg");
+    let mut endpoint =
+        quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into()).expect("endpoint");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(qcc)));
+
+    let connecting = endpoint
+        .connect(
+            (std::net::Ipv4Addr::LOCALHOST, doq_port).into(),
+            test_certs::TEST_CERT_CN,
+        )
+        .expect("connect");
+    let conn = tokio::time::timeout(Duration::from_secs(5), connecting)
+        .await
+        .expect("quinn connect timeout")
+        .expect("quinn handshake");
+
+    // RFC 9250 §4.2: one query per bidirectional stream, 2-byte length
+    // prefix, DNS message id MUST be 0.
+    let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+    let mut msg = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query({
+        let mut q = hickory_proto::op::Query::new();
+        q.set_name(Name::from_ascii("doq.test.").expect("name"));
+        q.set_query_type(RecordType::A);
+        q
+    });
+    let wire = msg.to_vec().expect("encode");
+    send.write_all(&(wire.len() as u16).to_be_bytes())
+        .await
+        .expect("len");
+    send.write_all(&wire).await.expect("query");
+    send.finish().expect("finish stream");
+
+    let resp = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(65_535))
+        .await
+        .expect("read timeout")
+        .expect("read reply");
+    assert!(resp.len() >= 2, "reply too short: {resp:?}");
+    let rlen = u16::from_be_bytes([resp[0], resp[1]]) as usize;
+    assert_eq!(resp.len(), rlen + 2, "framing mismatch");
+    let reply = Message::from_bytes(&resp[2..]).expect("decode DoQ reply");
+    assert_eq!(reply.metadata.id, 0);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.answers.iter().any(|r| matches!(&r.data,
+        hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
