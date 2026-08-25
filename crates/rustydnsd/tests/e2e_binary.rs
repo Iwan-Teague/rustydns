@@ -558,3 +558,48 @@ async fn binary_e2e_operator_endpoints_health_metrics_queries() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_resolves_over_tcp_with_length_framing() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    // RFC 1035 4.2.2 framing: 2-byte big-endian length prefix per message.
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+        .await
+        .expect("tcp connect");
+    let query = build_query(7, "tcp.test.");
+    let mut framed = Vec::with_capacity(query.len() + 2);
+    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&query);
+    stream.write_all(&framed).await.expect("write framed query");
+
+    // Read the reply prefix, then exactly that many bytes.
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await.expect("reply length");
+    let reply_len = u16::from_be_bytes(len_buf) as usize;
+    assert!(
+        reply_len > 12 && reply_len <= 4096,
+        "implausible reply length {reply_len}"
+    );
+    let mut reply_buf = vec![0u8; reply_len];
+    stream.read_exact(&mut reply_buf).await.expect("reply body");
+
+    let reply = Message::from_bytes(&reply_buf).expect("decode tcp reply");
+    assert_eq!(reply.metadata.id, 7);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        reply.answers.iter().any(|r| matches!(&r.data,
+            hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")),
+        "expected A answer over TCP, got {:?}",
+        reply.answers
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
