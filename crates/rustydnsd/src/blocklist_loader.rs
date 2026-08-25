@@ -128,7 +128,12 @@ impl BlocklistLoader {
             }
             let grefs: Vec<(&str, BlocklistSource)> =
                 gsrc.iter().map(|(s, t)| (s.as_str(), *t)).collect();
-            engine.load_group(&group.name, &grefs, &group.allowlist);
+            // Merge the GLOBAL allowlist into each group so "never block"
+            // decisions apply universally. Without this, a group's own
+            // sources could override the operator's global exemptions.
+            let mut group_allow = self.config.allowlist.clone();
+            group_allow.extend(group.allowlist.iter().cloned());
+            engine.load_group(&group.name, &grefs, &group_allow);
             info!(
                 group = %group.name,
                 loaded = gsrc.len(),
