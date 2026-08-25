@@ -259,7 +259,6 @@ async fn quickstart_example_config_verbatim_validates_and_resolves() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn ad_block_out_of_the_box_doubleclick_blocked_google_resolves() {
-    use std::sync::atomic::Ordering;
     let example_path = repo_root().join(EXAMPLE_REL);
     let example = std::fs::read_to_string(&example_path).expect("shipped rustydns.example.toml");
 
@@ -362,7 +361,7 @@ async fn ad_block_out_of_the_box_doubleclick_blocked_google_resolves() {
         hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
 
     // 3) Only the allowed domain ever reached the upstream.
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // 4) Ring attribution: the operator surface must distinguish the
     // BLOCKLIST rejection from ordinary resolver answers - a refactor
@@ -668,4 +667,138 @@ async fn invalid_existing_config_error_names_file_and_hints() {
         combined.contains("server.listen entries are parseable"),
         "inner cause must survive wrapping: {combined}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocklist_partial_failure_retains_last_good_entries() {
+    // FAIL-CLOSED refresh contract, driven through the real binary:
+    // two local hosts-files seed blocks for alpha.test / beta.test.
+    // File B is then DELETED and the daemon SIGHUPs. The refreshed list
+    // must retain beta's block (loader last-good fallback) - if the
+    // source were silently dropped, beta queries would FORWARD to the
+    // stub upstream and return NOERROR instead of NXDOMAIN. We probe
+    // continuously across the reload window and require EVERY beta
+    // response to stay NXDOMAIN; the stub hit-counter must stay ZERO
+    // because neither name is ever legitimately forwarded (both are in
+    // the shipped-style local files).
+    let (dns_port, upstream_port, metrics_port) = (reserve_port(), reserve_port(), reserve_port());
+    let dir = tempfile::TempDir::new().unwrap();
+    let file_a = dir.path().join("a.hosts");
+    let file_b = dir.path().join("b.hosts");
+    std::fs::write(&file_a, "0.0.0.0 alpha.test\n").unwrap();
+    std::fs::write(&file_b, "0.0.0.0 beta.test\n").unwrap();
+
+    let cfg_path = dir.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\
+         timeout_ms = 1200\n\n\
+         [blocklist]\n\
+         local_files = [\"{a}\", \"{b}\"]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n",
+        a = file_a.display(),
+        b = file_b.display()
+    );
+    std::fs::write(&cfg_path, &config).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rustydnsd");
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "daemon not ready");
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.connect(("127.0.0.1", dns_port)).await.unwrap();
+
+    // Baseline: both blocked before any failure.
+    async fn expect_nx(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> bool {
+        sock.send(&build_query(id, name)).await.unwrap();
+        for _ in 0..10 {
+            let mut buf = vec![0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(400), sock.recv_from(&mut buf)).await {
+                Err(_) => continue,
+                Ok(Err(_)) => continue,
+                Ok(Ok((n, _))) => {
+                    if let Ok(m) = Message::from_bytes(&buf[..n])
+                        && m.metadata.id == id
+                    {
+                        return m.metadata.response_code == ResponseCode::NXDomain
+                            && m.answers.is_empty();
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    assert!(expect_nx(&sock, 300, "alpha.test.").await, "alpha blocked");
+    assert!(expect_nx(&sock, 301, "beta.test.").await, "beta blocked");
+
+    // DELETE file B, then SIGHUP: the refresh now loses that source.
+    std::fs::remove_file(&file_b).unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id().expect("pid") as i32),
+        nix::sys::signal::Signal::SIGHUP,
+    )
+    .unwrap();
+
+    // Continuous probes spanning the reload window: EVERY beta response
+    // must remain NXDOMAIN (last-good retention keeps it blocked) and the
+    // stub must NEVER see either name forwarded.
+    let mut saw_nx_after_reload = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut probe_id = 310u16;
+    while std::time::Instant::now() < deadline {
+        if expect_nx(&sock, probe_id, "beta.test.").await {
+            if probe_id > 320 {
+                saw_nx_after_reload = true; // well past reload window
+            }
+        } else {
+            panic!("beta.test unblocked after SIGHUP - last-good retention failed");
+        }
+        probe_id += 1;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    assert!(
+        saw_nx_after_reload,
+        "probe window too short to cross reload"
+    );
+
+    // Upstream isolation: zero forwards across baseline + reload window.
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing may leak upstream"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
 }

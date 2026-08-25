@@ -29,6 +29,11 @@ pub struct LoadSummary {
 pub struct BlocklistLoader {
     config: Arc<BlocklistConfig>,
     client: Client,
+    /// Last successfully-read content per source (url or path), retained so
+    /// a FAILED refresh falls back to it instead of silently dropping that
+    /// source's entries from the active list. Bounded: one entry per
+    /// configured source, each capped by `max_fetch_bytes`.
+    last_good: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl BlocklistLoader {
@@ -68,7 +73,11 @@ impl BlocklistLoader {
             .build()
             .map_err(|e| RustyDnsError::Blocklist(format!("failed to build HTTP client: {e}")))?;
 
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            last_good: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        })
     }
 
     /// Reload all configured sources. Leaves existing state untouched if
@@ -158,10 +167,23 @@ impl BlocklistLoader {
 
         for path in local_files {
             match self.read_local(path).await {
-                Ok(content) => sources.push((content, BlocklistSource::Trusted)),
+                Ok(content) => {
+                    self.remember_last_good(&path.display().to_string(), &content);
+                    sources.push((content, BlocklistSource::Trusted));
+                }
                 Err(e) => {
-                    failed += 1;
-                    warn!(path = %path.display(), error = %e, "failed to read local blocklist");
+                    // FAIL-CLOSED per source: a vanished/unreadable file
+                    // falls back to its LAST GOOD content so previously
+                    // blocked domains stay blocked. Only a source with no
+                    // history is dropped.
+                    if let Some(last) = self.take_last_good(&path.display().to_string()) {
+                        warn!(path = %path.display(), error = %e,
+                              "local blocklist unreadable - using last good content");
+                        sources.push((last, BlocklistSource::Trusted));
+                    } else {
+                        failed += 1;
+                        warn!(path = %path.display(), error = %e, "failed to read local blocklist");
+                    }
                 }
             }
         }
@@ -202,20 +224,54 @@ impl BlocklistLoader {
 
         for (_, url, trust, res) in &results {
             match res {
-                Ok(content) => sources.push((content.clone(), *trust)),
+                Ok(content) => {
+                    self.remember_last_good(url, content);
+                    sources.push((content.clone(), *trust));
+                }
                 Err(e) => {
-                    failed += 1;
-                    // PRIVACY: source URLs may embed tokens; the error text
-                    // already carries a redacted form of the URL.
-                    warn!(
-                        url = %redact_url_credentials(url),
-                        error = %e,
-                        "failed to fetch blocklist source"
-                    );
+                    // FAIL-CLOSED per source: a failed fetch falls back to
+                    // this URL's LAST GOOD content so its entries remain
+                    // actively blocked instead of silently vanishing from
+                    // the rebuilt list.
+                    if let Some(last) = self.take_last_good(url) {
+                        warn!(
+                            url = %redact_url_credentials(url),
+                            error = %e,
+                            "blocklist fetch failed - using last good content"
+                        );
+                        sources.push((last, *trust));
+                    } else {
+                        failed += 1;
+                        // PRIVACY: source URLs may embed tokens; the error text
+                        // already carries a redacted form of the URL.
+                        warn!(
+                            url = %redact_url_credentials(url),
+                            error = %e,
+                            "failed to fetch blocklist source"
+                        );
+                    }
                 }
             }
         }
         (sources, failed)
+    }
+
+    /// Store/refresh the last good content for a source key.
+    fn remember_last_good(&self, key: &str, content: &str) {
+        self.last_good
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.to_string(), content.to_string());
+    }
+
+    /// Take (remove) the retained content for a source. Removal keeps the
+    /// map from growing unboundedly across many failed rounds when the
+    /// source is permanently gone; the next success re-seeds it.
+    fn take_last_good(&self, key: &str) -> Option<String> {
+        self.last_good
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(key)
     }
 
     async fn read_local(&self, path: &Path) -> Result<String, RustyDnsError> {
