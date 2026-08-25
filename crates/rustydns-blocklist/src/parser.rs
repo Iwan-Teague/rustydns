@@ -598,6 +598,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn passthru_single_label_tld_entries_skipped_in_both_formats() {
+        // The allow-side TLD guard at the PARSER layer (the engine-level
+        // pin exercises a different consequence): an RPZ passthru or
+        // AdGuard @@ entry for a bare TLD must be dropped before it ever
+        // becomes a ParsedEntry::Allow. A suffix-form TLD allow would
+        // whitelist every domain under it; this keeps the rejection as
+        // early and as format-independent as possible.
+        assert!(parse_rpz("com CNAME rpz-passthru.\n").is_empty());
+        assert!(parse_adguard("@@||com^\n").is_empty());
+        // Multi-label entries still pass through both formats.
+        assert!(parse_rpz("safe.example.com CNAME rpz-passthru.\n").len() == 1);
+        assert!(parse_adguard("@@||safe.example.com^\n").len() == 1);
+    }
+
     // --- AdGuard ------------------------------------------------------------
 
     #[test]
