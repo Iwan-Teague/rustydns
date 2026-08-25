@@ -578,6 +578,23 @@ mod tests {
         let _ = parse_hosts(&line);
     }
 
+    #[test]
+    fn hosts_oversized_line_is_skipped_wholesale() {
+        // Resource bound: the length gate fires BEFORE comment stripping,
+        // so a line padded past MAX_LINE_BYTES is dropped whole — its
+        // embedded entries must NOT be parsed. Pins the skip semantics
+        // (the older pin only asserted no-panic) so a refactor that
+        // trims/strips first and bounds later cannot silently start
+        // accepting attacker-inflated lines.
+        let padded = format!("0.0.0.0 evil.com # {}", "x".repeat(MAX_LINE_BYTES + 8));
+        assert!(
+            parse_hosts(&padded).is_empty(),
+            "oversized line must be skipped, not partially parsed"
+        );
+        // Control: the identical entry on a short line parses fine.
+        assert!(parse_hosts("0.0.0.0 evil.com\n").contains(&exact("evil.com")));
+    }
+
     // --- RPZ ----------------------------------------------------------------
 
     #[test]
