@@ -2522,7 +2522,17 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
 
     match cfg.metrics.listen.parse::<SocketAddr>() {
         Ok(addr) => {
-            if !addr.ip().is_loopback() {
+            // Canonicalise mapped-V6 spellings first (::ffff:127.0.0.1 IS
+            // loopback) — same rule as MetricsConfig::effective_listen, so
+            // the exposure warning and the runtime bind agree on family.
+            let ip = match addr.ip() {
+                std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => std::net::IpAddr::V4(v4),
+                    None => std::net::IpAddr::V6(v6),
+                },
+                v4 => v4,
+            };
+            if !ip.is_loopback() {
                 tracing::warn!(
                     listen = %cfg.metrics.listen,
                     "metrics.listen is not loopback — metrics are unauthenticated and must not be exposed"
@@ -2942,6 +2952,28 @@ mod tests {
         let mut cfg = baseline();
         cfg.server.listen = vec!["0.0.0.0:53".to_string(), "127.0.0.1:53".to_string()];
         validate_config(&cfg).expect("same-role plain entries must be allowed");
+    }
+
+    #[test]
+    fn effective_listen_contract_pins_mapped_and_native_forms() {
+        // Direct contract test on the normalisation itself (the collision
+        // test observes it only through validate_config's outcome).
+        // Mapped-V6 loopback must resolve to the NATIVE v4 socket...
+        let mut cfg = baseline();
+        cfg.metrics.listen = "[::ffff:127.0.0.1]:9153".to_string();
+        assert_eq!(
+            cfg.metrics.effective_listen().unwrap(),
+            "127.0.0.1:9153".parse::<std::net::SocketAddr>().unwrap(),
+            "mapped loopback spelling must canonicalise to native V4"
+        );
+        // ...while a genuine non-mapped V6 address keeps its family (and is
+        // forced to [::1] because it isn't loopback).
+        let mut cfg = baseline();
+        cfg.metrics.listen = "[2001:db8::1]:9153".to_string();
+        assert_eq!(
+            cfg.metrics.effective_listen().unwrap(),
+            "[::1]:9153".parse::<std::net::SocketAddr>().unwrap()
+        );
     }
 
     #[test]
