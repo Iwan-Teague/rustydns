@@ -10,7 +10,11 @@
 #     by design; scrape from a sidecar if you need it externally)
 #
 # Usage:
-#   1. Copy rustydns.example.toml to ./rustydns.toml and edit it.
+#   1. Copy rustydns.docker.toml to ./rustydns.toml and edit it.
+#      (NOT rustydns.example.toml — that template binds 127.0.0.1, which is
+#      unreachable through Docker's published ports. The .docker template
+#      binds 0.0.0.0 for the container; exposure stays governed by what
+#      you publish under `ports:` below.)
 #   2. If you use the Rustynet mesh feature, drop the signed
 #      `dns-zone.bundle` and its hex-encoded ed25519 verifier key
 #      `dns-zone-verifier.key` into ./mesh/ — these are the artifact names

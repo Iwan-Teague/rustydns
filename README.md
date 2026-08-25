@@ -52,7 +52,7 @@ trade-offs — performance, convenience, feature completeness — are secondary.
 ```sh
 git clone https://github.com/Iwan-Teague/rustydns.git
 cd rustydns
-cp rustydns.example.toml rustydns.toml
+cp rustydns.docker.toml rustydns.toml   # container template: binds 0.0.0.0
 $EDITOR rustydns.toml
 docker compose up -d
 ```
@@ -86,7 +86,11 @@ The install script:
 ### Configure
 
 The shipped [`rustydns.example.toml`](rustydns.example.toml) is a fully
-annotated configuration with every option documented inline. Most operators
+annotated configuration with every option documented inline. For Docker
+deployments start from [`rustydns.docker.toml`](rustydns.docker.toml)
+instead — inside a container, loopback listener binds are unreachable
+through published ports, so the container template binds `0.0.0.0` and
+leaves exposure governed by compose's `ports:` mappings. Most operators
 only need to change the listener and (optionally) add or remove blocklist
 sources. The minimum bits that matter:
 
@@ -295,7 +299,8 @@ Read the full threat model and deployment checklist in [`docs/security.md`](docs
 rustydns/
 ├── Cargo.toml                    # Workspace root (MSRV 1.88)
 ├── Cargo.lock                    # Reproducible builds
-├── rustydns.example.toml         # Annotated example configuration
+├── rustydns.example.toml         # Annotated example configuration (bare-metal)
+├── rustydns.docker.toml          # Container/compose configuration template
 ├── AGENTS.md                     # Coding-agent invariants
 ├── deny.toml                     # cargo-deny: advisories + bans + licenses + sources
 ├── Dockerfile                    # Multi-stage production image
