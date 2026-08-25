@@ -1638,3 +1638,88 @@ async fn binary_e2e_doh_wrong_content_type_is_415() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+/// Stub answering with a configurable TTL - lets tests observe cache
+/// EXPIRY without waiting minutes.
+async fn spawn_short_ttl_stub(
+    port: u16,
+    ttl: u32,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let task_hits = Arc::clone(&hits);
+    let std_sock = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("stub bind");
+    std_sock.set_nonblocking(true).expect("nonblocking");
+    let sock = tokio::net::UdpSocket::from_std(std_sock).expect("stub into tokio");
+
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                continue;
+            };
+            task_hits.fetch_add(1, Ordering::SeqCst);
+            if n < 12 {
+                continue;
+            }
+            let mut out = buf[..n].to_vec();
+            out[2] |= 0x80;
+            out[3] |= 0x80;
+            out[6] = 0;
+            out[7] = 1;
+            let ttl_be = ttl.to_be_bytes();
+            out.extend_from_slice(&[
+                0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, ttl_be[0], ttl_be[1], ttl_be[2], ttl_be[3],
+                0x00, 0x04, 192, 0, 2, 1,
+            ]);
+            let _ = sock.send_to(&out, peer).await;
+        }
+    });
+    (handle, hits)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_cache_entry_expires_and_reforwards() {
+    use std::sync::atomic::Ordering;
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits) = spawn_short_ttl_stub(upstream_port, 1).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // First query: MISS -> forwarded (TTL=1s cached).
+    let r1 = resolve_a(&sock, 60, "expiring.test.").await;
+    assert_eq!(r1.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // Wait past expiry. NOTE: the resolver enforces a deliberate cache
+    // FLOOR of MIN_POSITIVE_CACHE_TTL_SECS = 2s (anti-requery-storm
+    // defense: a hostile upstream cannot force a lookup per request with
+    // 0-second records), so our TTL=1 stub entry is clamped UP to 2s and
+    // only expires after that floor. Sleeping 2.6s clears it with margin.
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+
+    // Second query after expiry: MUST re-forward (hits == 2).
+    let r2 = resolve_a(&sock, 61, "expiring.test.").await;
+    assert_eq!(r2.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "expired entry must be re-fetched from upstream"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
