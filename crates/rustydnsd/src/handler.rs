@@ -130,12 +130,32 @@ pub struct DnsHandler {
 ///
 /// `validate_config` already rejected unparseable `client_ip` values, so
 /// the parse cannot fail in practice — we log and skip if it somehow does.
+/// Canonicalise a client/policy address for per-client keying: IPv4-mapped
+/// V6 forms collapse to native V4 so policy lookup and map keys agree no
+/// matter which socket family delivered the packet. Mirrors the rate
+/// limiter's bucket-key normalisation.
+fn canonical_client_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
 fn build_policy_map(policies: &[NodePolicy]) -> HashMap<IpAddr, CompiledPolicy> {
     let mut policy_by_ip: HashMap<IpAddr, CompiledPolicy> = HashMap::new();
     for policy in policies {
         if let Some(ip_str) = &policy.client_ip {
             match ip_str.parse::<IpAddr>() {
                 Ok(ip) => {
+                    // Canonicalise IPv4-mapped V6 spellings to native V4 so
+                    // entries match clients regardless of whether the socket
+                    // delivered the source as `192.168.1.55` (v4-native) or
+                    // `::ffff:192.168.1.55` (dual-stack v6 listener). Without
+                    // this, a mapped-form client silently misses its policy.
+                    let ip = canonical_client_ip(ip);
                     let compiled = CompiledPolicy {
                         blocklist_bypass: policy.blocklist_bypass,
                         zones_allowed: Arc::from(policy.zones_allowed.as_slice()),
@@ -241,6 +261,10 @@ impl DnsHandler {
     /// Resolve the per-query policy for `src_ip`. Returns the default
     /// (no restrictions) when no `[[policy]]` entry matches.
     fn resolve_policy(&self, src_ip: IpAddr) -> PolicyDecision {
+        // Same canonicalisation as build_policy_map: a dual-stack v6
+        // listener delivers v4 peers as ::ffff:a.b.c.d; the map is keyed on
+        // native V4, so normalise before lookup or the entry silently misses.
+        let src_ip = canonical_client_ip(src_ip);
         match self.policy_by_ip.load().get(&src_ip) {
             Some(p) => PolicyDecision {
                 blocklist_bypass: p.blocklist_bypass,
@@ -5307,6 +5331,37 @@ mod tests {
             !map.contains_key(&rotated),
             "prefix fallback would over-apply blocklist_bypass to the whole link"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_matches_across_ipv4_mapped_forms() {
+        // A dual-stack [::] listener delivers v4 peers as ::ffff:a.b.c.d;
+        // the policy map is canonicalised to native V4. Both written forms
+        // of the SAME address must resolve to one entry, and a mapped-form
+        // client must not silently miss its policy.
+        let policies = vec![NodePolicy {
+            node_id: None,
+            client_ip: Some("::ffff:192.168.1.55".to_string()),
+            blocklist_bypass: true,
+            zones_allowed: vec![],
+            log_all_queries: false,
+            block_windows: Vec::new(),
+            blocklist_group: None,
+        }];
+        let map = build_policy_map(&policies);
+
+        let native_v4: std::net::IpAddr = "192.168.1.55".parse().unwrap();
+        assert!(
+            map.contains_key(&native_v4),
+            "mapped-form entry must be stored under native V4"
+        );
+
+        // Lookup path: resolve_policy normalises src_ip, so both
+        // presentations of the same client resolve to the same decision.
+        let handler = bare_handler(policies).await;
+        let mapped: std::net::IpAddr = "::ffff:192.168.1.55".parse().unwrap();
+        assert!(handler.resolve_policy(native_v4).blocklist_bypass);
+        assert!(handler.resolve_policy(mapped).blocklist_bypass);
     }
 
     #[tokio::test(flavor = "current_thread")]
