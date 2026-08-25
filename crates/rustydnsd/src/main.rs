@@ -1911,6 +1911,13 @@ mod tests {
             &["hickory_proto".to_string()],
             "hickory_server"
         ));
+        // A strict-PREFIX target ("hickory") must not stand down the clamp
+        // for "hickory_server": only naming a crate exactly counts, else
+        // one broad RUST_LOG target would unclamp all three crates at once.
+        assert!(!hickory_clamp_overridden(
+            &["hickory".to_string()],
+            "hickory_server"
+        ));
     }
 
     #[test]
