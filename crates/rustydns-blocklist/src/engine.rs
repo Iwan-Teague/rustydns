@@ -538,6 +538,32 @@ mod tests {
     }
 
     #[test]
+    fn trusted_wildcard_passthru_stays_exact_never_becomes_suffix() {
+        // `Allowlist::from_entries` treats a "*."-prefixed entry as a
+        // SUFFIX rule — correct for operator-authored config, catastrophic
+        // for remote content: one trusted-source line (`*.com CNAME
+        // rpz-passthru.`) would whitelist an entire TLD. The engine defuses
+        // this by routing ALL trusted passthru entries through
+        // `extend_exact` (exact-only). This pin holds that boundary: if a
+        // refactor ever makes extend_exact suffix-aware (or swaps it for
+        // from_entries), blocked .com domains must start failing here.
+        let e = engine();
+        e.load_many_with_trust(&[
+            ("0.0.0.0 evil.com\n", BlocklistSource::Untrusted),
+            ("0.0.0.0 victim-cdn.com\n", BlocklistSource::Untrusted),
+            ("*.com CNAME rpz-passthru.\n", BlocklistSource::Trusted),
+        ]);
+        assert!(
+            e.is_blocked("evil.com"),
+            "exact entry under the wildcard TLD must stay blocked"
+        );
+        assert!(
+            e.is_blocked("victim-cdn.com"),
+            "*.com passthru must NOT have become a .com suffix exemption"
+        );
+    }
+
+    #[test]
     fn bare_tld_allow_entry_cannot_unblock_its_subdomains() {
         // The TLD guard: even a TRUSTED source may not carry an allowlist
         // entry for a bare TLD — suffix matching would whitelist every
