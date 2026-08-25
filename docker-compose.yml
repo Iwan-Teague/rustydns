@@ -71,11 +71,12 @@ services:
     # because rustydns never writes to it (rustynetd publishes out of band).
     # Mounted at /var/lib/rustynet — the same paths the example config's
     # mesh_zone_bundle_path / mesh_zone_verifier_key_path point to.
-    # /var/lib/rustydns is a tiny tmpfs in case the daemon ever needs a
-    # writable working dir — currently unused.
+    # ./blocklists backs the local_files entries in rustydns.docker.toml;
+    # drop the mount if you use only remote sources.
     volumes:
       - ./rustydns.toml:/etc/rustydns/rustydns.toml:ro
       - ./mesh:/var/lib/rustynet:ro
+      - ./blocklists:/var/lib/rustydns/blocklists:ro
 
     # Compose-level healthcheck mirrors the one baked into the image so
     # `docker compose ps` shows accurate state. Override here if you've
