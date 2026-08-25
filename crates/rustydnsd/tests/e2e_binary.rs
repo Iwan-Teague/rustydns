@@ -1893,6 +1893,12 @@ async fn binary_e2e_multi_upstream_queries_distribute_across_providers() {
     // on) distributes queries across configured providers so NO SINGLE
     // upstream builds a complete query history. Two stubs, six distinct
     // names: both stubs must see traffic and the total must be exact.
+    //
+    // ATTRIBUTION (mutation #106): the distribution is carried by SERIAL
+    // DISPATCH (num_concurrent_reqs = 1 in build_resolver_arm), NOT by
+    // ServerOrderingStrategy - swapping RoundRobin/QueryStatistics leaves
+    // both-stubs>0 intact. A refactor that removes the serial dispatch is
+    // what this total==queries assertion exists to catch.
     use std::sync::atomic::Ordering;
     let (dns_port, metrics_port) = (reserve_port(), reserve_port());
     let up1 = reserve_port();
