@@ -3343,6 +3343,16 @@ mod tests {
     }
 
     #[test]
+    fn blocklist_fetch_zero_timeout_rejected() {
+        // AGENTS "blocklist fetch must be bounded": a zero fetch timeout
+        // disables the slow-source guard entirely (or errors every fetch,
+        // depending on the client) — either way it is a config error.
+        let mut cfg = baseline();
+        cfg.blocklist.fetch_timeout_ms = 0;
+        assert_config_err(validate_config(&cfg), "fetch_timeout_ms = 0");
+    }
+
+    #[test]
     fn excessive_cache_size_rejected() {
         let mut cfg = baseline();
         cfg.upstream.max_cache_entries = 500_001;
