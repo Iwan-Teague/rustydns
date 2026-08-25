@@ -1306,3 +1306,75 @@ async fn binary_e2e_any_qtype_refused_rfc8482() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_edns_version_mismatch_answers_badvers() {
+    // RFC 6891 §6.1.3: an OPT advertising version > ours MUST get BADVERS
+    // (extended rcode 16) plus a reply OPT advertising version 0.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    use hickory_proto::op::{Edns, OpCode};
+    let mut msg = Message::new(77, MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query({
+        let mut q = hickory_proto::op::Query::new();
+        q.set_name(Name::from_ascii("edns.test.").expect("name"));
+        q.set_query_type(RecordType::A);
+        q
+    });
+    let mut opt = Edns::default();
+    opt.set_version(1);
+    opt.set_max_payload(1232);
+    msg.set_edns(opt);
+    let query = msg.to_vec().expect("encode");
+    sock.send(&query).await.expect("send");
+
+    let mut saw_badvers = false;
+    for _ in 0..10 {
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+            Err(_) => break,
+            Ok(Err(_)) => continue,
+            Ok(Ok((n, _))) => {
+                let Ok(reply) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                if reply.metadata.id != 77 {
+                    continue;
+                }
+                // RFC 6891 wire truth: BADVERS = ext-rcode-high 1 with
+                // header nibble 0 (hickory's decoder mislabels this
+                // combination BADSIG, so assert on the fields themselves).
+                let opt = reply.edns.as_ref().expect("reply must carry an OPT");
+                assert_eq!(opt.rcode_high(), 1, "ext-rcode-high must encode BADVERS");
+                assert_eq!(
+                    buf[3] & 0x0F,
+                    0,
+                    "header rcode nibble must be zero for extended codes"
+                );
+                assert_eq!(opt.version(), 0, "reply OPT must advertise version 0");
+                assert!(reply.answers.is_empty());
+                saw_badvers = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_badvers);
+    // The probe never reached upstream resolution.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
