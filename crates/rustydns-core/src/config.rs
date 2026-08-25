@@ -3353,6 +3353,19 @@ mod tests {
     }
 
     #[test]
+    fn blocklist_max_fetch_bytes_bounds_enforced() {
+        // AGENTS "Blocklist fetch must be bounded": both edges of the
+        // max_fetch_bytes window are config errors.
+        let mut cfg = baseline();
+        cfg.blocklist.max_fetch_bytes = 0;
+        assert_config_err(validate_config(&cfg), "max_fetch_bytes = 0");
+
+        let mut cfg = baseline();
+        cfg.blocklist.max_fetch_bytes = 100 * 1024 * 1024 + 1;
+        assert_config_err(validate_config(&cfg), "exceeds the maximum");
+    }
+
+    #[test]
     fn excessive_cache_size_rejected() {
         let mut cfg = baseline();
         cfg.upstream.max_cache_entries = 500_001;
