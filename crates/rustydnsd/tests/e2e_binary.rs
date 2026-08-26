@@ -3443,3 +3443,101 @@ async fn binary_e2e_authority_precedes_blocklist_for_same_name() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_authority_serves_txt_records() {
+    // TXT RECORDS: SPF/DKIM/service-discovery data stored as static
+    // authority records must be served correctly over UDP.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"mesh.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"spf.mesh.\"\n\
+         type = \"TXT\"\n\
+         target = \"v=spf1 ip4:10.0.0.0/8 -all\"\n\
+         ttl = 300\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // TXT query for spf.mesh.
+    let mut msg = Message::new(97, MessageType::Query, hickory_proto::op::OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query({
+        let mut q = hickory_proto::op::Query::new();
+        q.set_name(Name::from_ascii("spf.mesh.").expect("name"));
+        q.set_query_type(RecordType::TXT);
+        q
+    });
+    sock.send(&msg.to_vec().unwrap()).await.expect("send");
+
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("reply")
+        .expect("recv");
+    let reply = Message::from_bytes(&buf[..n]).expect("decode");
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.metadata.authoritative);
+    assert_eq!(reply.answers.len(), 1);
+    match &reply.answers[0].data {
+        hickory_proto::rr::RData::TXT(txt) => {
+            let text: Vec<String> = txt
+                .txt_data
+                .iter()
+                .map(|d| String::from_utf8_lossy(d).to_string())
+                .collect();
+            assert!(
+                text.iter().any(|t| t.contains("v=spf1")),
+                "SPF content must be preserved: {text:?}"
+            );
+        }
+        other => panic!("expected TXT record, got {other:?}"),
+    }
+
+    // A query for router.mesh. still works (different static record).
+    sock.send(&build_query(98, "router.mesh."))
+        .await
+        .expect("send");
+    let mut a_buf = vec![0u8; 4096];
+    let (an, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut a_buf))
+        .await
+        .expect("reply")
+        .expect("recv");
+    let a_reply = Message::from_bytes(&a_buf[..an]).expect("decode");
+    assert_eq!(a_reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(a_reply.answers.len(), 1);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+}
