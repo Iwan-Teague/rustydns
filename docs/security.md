@@ -99,9 +99,16 @@ believe padding is active. Encrypted query sizes still leak the queried domain.
 
 ### Randomised Upstream Selection
 
-When multiple upstream resolvers are configured, RustyDNS selects among them randomly
-per query. No single resolver builds a complete query history. Operators should configure
-resolvers from different jurisdictions and operators.
+When multiple upstream resolvers are configured and
+`privacy.randomize_upstream_selection = true` (the default), RustyDNS alternates
+among them per query using serial dispatch (`num_concurrent_reqs = 1`). No single
+resolver builds a complete query history. Operators should configure resolvers
+from different jurisdictions and operators.
+
+Trade-off: serial dispatch eliminates hickory's default parallel racing (which
+sent every query to two servers simultaneously — giving both a full copy of the
+history). Failover to the next provider still occurs via per-request retry on
+timeout or error.
 
 ### Oblivious DoH (ODoH, RFC 9230) — implemented
 
