@@ -526,7 +526,14 @@ pub const MIN_POSITIVE_CACHE_TTL_SECS: u64 = 2;
 /// Mirror of the cache floor: an upstream cannot wedge an entry in the
 /// cache forever by advertising absurd TTLs — entries are clamped down to
 /// this ceiling so stale answers age out within a bounded window.
-const MAX_POSITIVE_CACHE_TTL_SECS: u64 = 86400;
+///
+/// Also shared with `rustydnsd`'s answer path, which clamps the TTL it
+/// puts on CLIENT-facing records to the same window: hickory's
+/// `positive_max_ttl` bounds only our own cache retention, not the wire
+/// TTL handed downstream, so an unclamped reply would let a hostile
+/// upstream pin a poisoned answer in every stub cache (browser, OS) for
+/// the advertised duration — far outliving any operator-side fix.
+pub const MAX_POSITIVE_CACHE_TTL_SECS: u64 = 86400;
 
 fn build_resolver_opts(config: &DnsConfig, protocol: UpstreamProtocol) -> ResolverOpts {
     let mut opts = ResolverOpts::default();

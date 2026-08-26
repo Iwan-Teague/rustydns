@@ -25,7 +25,7 @@ use rustydns_core::RustyDnsError;
 use rustydns_core::client::ClientId;
 use rustydns_core::config::{BlockResponse, NodePolicy, RewriteRule};
 use rustydns_core::record::{DnsRecord, RecordData};
-use rustydns_resolver::Resolver;
+use rustydns_resolver::{MAX_POSITIVE_CACHE_TTL_SECS, MIN_POSITIVE_CACHE_TTL_SECS, Resolver};
 
 use crate::metrics::Metrics;
 use crate::query_log::{QueryLog, ServedBy};
@@ -1042,7 +1042,20 @@ fn canonical_qname(name: &str) -> Cow<'_, str> {
 
 fn dns_record_to_rr(rec: &DnsRecord) -> Option<Record> {
     let name = Name::from_str(&rec.name).ok()?;
-    let ttl = u64::min(rec.ttl.as_secs(), u64::from(u32::MAX)) as u32;
+    // CLIENT-FACING TTL CLAMP: the resolver clamps its own hickory cache
+    // (positive_min/max_ttl), but `lookup.answers()` still carries the
+    // upstream's WIRE TTL, and this is the value we hand to downstream stub
+    // caches. Forwarding it verbatim lets a hostile upstream pin a poisoned
+    // answer in every client cache for the advertised duration (u32::MAX
+    // secs ≈ 68 years — outliving any operator fix), or with TTL=0 force a
+    // re-query per lookup (cache-bypass amplification against us). Clamp to
+    // the same floor/ceiling window as our own cache so both sides age out
+    // together.
+    let ttl = rec
+        .ttl
+        .as_secs()
+        .clamp(MIN_POSITIVE_CACHE_TTL_SECS, MAX_POSITIVE_CACHE_TTL_SECS)
+        .min(u64::from(u32::MAX)) as u32;
 
     let rdata = match &rec.data {
         RecordData::A(ip) => RData::A(A(*ip)),
@@ -4709,6 +4722,51 @@ mod tests {
             Cow::Owned(s) => assert_eq!(s, "ads.example.com."),
             Cow::Borrowed(_) => panic!("mixed-case input must be owned + lowercased"),
         }
+    }
+
+    #[test]
+    fn client_facing_record_ttl_is_clamped_to_cache_window() {
+        use super::{MAX_POSITIVE_CACHE_TTL_SECS, MIN_POSITIVE_CACHE_TTL_SECS, dns_record_to_rr};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record};
+        use rustydns_core::record::{DnsRecord, RecordData};
+        use std::net::Ipv4Addr;
+        use std::time::Duration;
+
+        let make = |ttl: Duration| -> Option<Record> {
+            let rec = DnsRecord::new(
+                "host.example.org.",
+                RecordData::A(Ipv4Addr::new(203, 0, 113, 9)),
+                ttl,
+            );
+            dns_record_to_rr(&rec)
+        };
+
+        // Hostile ceiling: ~68-year TTL must come down to the 24h cache
+        // ceiling so a poisoned answer ages out of downstream stub caches.
+        let pinned = make(Duration::from_secs(u64::from(u32::MAX))).expect("record converts");
+        assert_eq!(
+            u64::from(pinned.ttl),
+            MAX_POSITIVE_CACHE_TTL_SECS,
+            "absurd upstream TTL must be clamped to the client-facing ceiling"
+        );
+
+        // Hostile floor: TTL=0 forces a re-query per lookup (cache-bypass
+        // amplification) — floored like our own cache.
+        let zero = make(Duration::from_secs(0)).expect("record converts");
+        assert_eq!(
+            u64::from(zero.ttl),
+            MIN_POSITIVE_CACHE_TTL_SECS,
+            "zero upstream TTL must be lifted to the client-facing floor"
+        );
+
+        // Legitimate mid-range TTL passes through untouched.
+        let normal = make(Duration::from_secs(300)).expect("record converts");
+        assert_eq!(normal.ttl, 300, "legitimate TTL must not be altered");
+
+        // Sanity: the record is otherwise intact.
+        assert_eq!(pinned.name.to_utf8(), "host.example.org.");
+        assert!(matches!(pinned.data, RData::A(A(_))));
     }
 
     #[test]
