@@ -19,7 +19,7 @@
 //! tests in `lib.rs` (zone matching, rdata classification, filter
 //! semantics) cover those at a finer grain.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -203,6 +203,14 @@ fn plain_config(upstream_addr: &str) -> DnsConfig {
 
 fn a_record(name: &Name, ip: Ipv4Addr, ttl: u32) -> Record {
     Record::from_rdata(name.clone(), ttl, RData::A(A(ip)))
+}
+
+fn aaaa_record(name: &Name, ip: Ipv6Addr, ttl: u32) -> Record {
+    Record::from_rdata(
+        name.clone(),
+        ttl,
+        RData::AAAA(hickory_proto::rr::rdata::AAAA(ip)),
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -669,19 +677,28 @@ async fn plain_upstream_0x20_rejection_is_caused_by_case_mismatch_alone() {
     );
 }
 
+#[derive(Clone, Copy)]
+#[allow(clippy::enum_variant_names)]
+enum SpoofMode {
+    WrongName,
+    WrongType,
+    WrongClass,
+}
+
 #[tokio::test]
 async fn mismatched_question_section_is_rejected_as_spoofed() {
     // Bailiwick / question-match check at our seam: a reply whose QUESTION
     // section does not match the query that was sent must never be surfaced
     // as an answer, even when the id matches and the rcode is clean. Two
-    // dedicated mocks, one per mismatch flavour:
+    // dedicated mocks, one per mismatch flavour (the id always matches):
     //  - wrong NAME: replies to anything with a question for other.example.
     //  - wrong TYPE: keeps the name but answers AAAA to an A query.
+    //  - wrong CLASS: echoes name+type but stamps CHAOS on the question.
     // hickory's exchange validates the response question against the
     // outstanding query; a mismatch aborts the exchange and the resolver
     // must fail closed rather than accept cross-named/cross-typed data.
 
-    async fn spoofing_mock(wrong_type: bool) -> (std::net::SocketAddr, CancellationToken) {
+    async fn spoofing_mock(mode: SpoofMode) -> (std::net::SocketAddr, CancellationToken) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
         let addr = socket.local_addr().expect("local_addr");
         let shutdown = CancellationToken::new();
@@ -704,12 +721,12 @@ async fn mismatched_question_section_is_rejected_as_spoofed() {
                         };
                         let wrong_name =
                             Name::from_ascii("other.example.").expect("static name");
-                        let qname = if wrong_type {
+                        let qname = if matches!(mode, SpoofMode::WrongType) {
                             question.name().clone()
                         } else {
                             wrong_name.clone()
                         };
-                        let qtype = if wrong_type {
+                        let qtype = if matches!(mode, SpoofMode::WrongType) {
                             RecordType::AAAA
                         } else {
                             question.query_type()
@@ -721,7 +738,15 @@ async fn mismatched_question_section_is_rejected_as_spoofed() {
                         );
                         resp.metadata.recursion_available = true;
                         resp.metadata.response_code = ResponseCode::NoError;
-                        resp.add_query(hickory_proto::op::Query::query(qname, qtype));
+                        let mut forged_question =
+                            hickory_proto::op::Query::query(qname, qtype);
+                        if matches!(mode, SpoofMode::WrongClass) {
+                            // Name and type echo the query; only the class
+                            // lies (CHAOS instead of IN).
+                            forged_question
+                                .set_query_class(hickory_proto::rr::DNSClass::CH);
+                        }
+                        resp.add_query(forged_question);
                         if let Ok(bytes) = resp.to_bytes() {
                             let _ = socket.send_to(&bytes, src).await;
                         }
@@ -733,7 +758,7 @@ async fn mismatched_question_section_is_rejected_as_spoofed() {
     }
 
     // Leg A — wrong NAME in the question section: rejected.
-    let (addr_a, shut_a) = spoofing_mock(false).await;
+    let (addr_a, shut_a) = spoofing_mock(SpoofMode::WrongName).await;
     let resolver_a = Resolver::new(plain_config(&addr_a.to_string()))
         .await
         .expect("resolver init");
@@ -748,7 +773,7 @@ async fn mismatched_question_section_is_rejected_as_spoofed() {
     shut_a.cancel();
 
     // Leg B — right NAME, wrong TYPE (AAAA to an A query): rejected too.
-    let (addr_b, shut_b) = spoofing_mock(true).await;
+    let (addr_b, shut_b) = spoofing_mock(SpoofMode::WrongType).await;
     let resolver_b = Resolver::new(plain_config(&addr_b.to_string()))
         .await
         .expect("resolver init");
@@ -761,6 +786,21 @@ async fn mismatched_question_section_is_rejected_as_spoofed() {
         "wrong-type reply must fail closed, got {err:?}"
     );
     shut_b.cancel();
+
+    // Leg C — right NAME, right TYPE, wrong CLASS (CHAOS): rejected too.
+    let (addr_c, shut_c) = spoofing_mock(SpoofMode::WrongClass).await;
+    let resolver_c = Resolver::new(plain_config(&addr_c.to_string()))
+        .await
+        .expect("resolver init");
+    let err = resolver_c
+        .resolve("classed.example.org.", "A")
+        .await
+        .expect_err("a reply with a mismatched question class must be rejected");
+    assert!(
+        matches!(err, RustyDnsError::AllUpstreamsFailed),
+        "wrong-class reply must fail closed, got {err:?}"
+    );
+    shut_c.cancel();
 }
 
 #[tokio::test]
@@ -2506,6 +2546,79 @@ async fn rebinding_defence_disabled_lets_private_through() {
         other => panic!("expected unfiltered private A, got {other:?}"),
     }
     assert_eq!(out.private_rdata_dropped, 0);
+}
+
+#[tokio::test]
+async fn rebinding_defence_filters_loopback_link_local_and_private_v6() {
+    // The defence is IP-class-based, not RFC1918-only: loopback,
+    // link-local, and IPv6 ULA/link-local rdata are exactly as dangerous
+    // to an internal network when served for a PUBLIC name. Mock hands
+    // back one public address mixed with three hostile classes per family;
+    // with block_private_rdata on, only the public answer survives.
+    let mock = MockUpstream::new(|name, qtype| {
+        if matches!(qtype, RecordType::AAAA) {
+            vec![
+                aaaa_record(
+                    name,
+                    "2606:4700:4700::1111".parse().expect("global v6"),
+                    300,
+                ),
+                aaaa_record(name, "fd00::1".parse().expect("ula"), 300),
+                aaaa_record(name, "fe80::1".parse().expect("link-local v6"), 300),
+            ]
+        } else {
+            vec![
+                a_record(name, Ipv4Addr::new(93, 184, 216, 34), 300),
+                a_record(name, Ipv4Addr::new(127, 0, 0, 1), 300),
+                a_record(name, Ipv4Addr::new(169, 254, 9, 9), 300),
+            ]
+        }
+    })
+    .await;
+
+    let mut cfg = plain_config(&mock.addr_string());
+    cfg.upstream.block_private_rdata = true;
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    // v4 leg: loopback + link-local dropped, public kept.
+    let out4 = resolver
+        .resolve("mixed4.example.", "A")
+        .await
+        .expect("resolve A");
+    assert_eq!(
+        out4.records.len(),
+        1,
+        "only the public v4 answer may survive"
+    );
+    match &out4.records[0].data {
+        RecordData::A(ip) => assert_eq!(*ip, Ipv4Addr::new(93, 184, 216, 34)),
+        other => panic!("expected public A, got {other:?}"),
+    }
+    assert_eq!(
+        out4.private_rdata_dropped, 2,
+        "loopback + link-local must count as dropped"
+    );
+
+    // v6 leg: ULA + link-local dropped, global kept.
+    let out6 = resolver
+        .resolve("mixed6.example.", "AAAA")
+        .await
+        .expect("resolve AAAA");
+    assert_eq!(
+        out6.records.len(),
+        1,
+        "only the global v6 answer may survive"
+    );
+    match &out6.records[0].data {
+        RecordData::Aaaa(ip) => {
+            assert_eq!(*ip, "2606:4700:4700::1111".parse::<Ipv6Addr>().expect("v6"))
+        }
+        other => panic!("expected global AAAA, got {other:?}"),
+    }
+    assert_eq!(
+        out6.private_rdata_dropped, 2,
+        "ULA + link-local v6 must count as dropped"
+    );
 }
 
 #[tokio::test]
