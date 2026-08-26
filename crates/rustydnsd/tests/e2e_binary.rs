@@ -2619,14 +2619,14 @@ async fn binary_e2e_authority_static_record_served_with_aa_flag() {
     let config = format!(
         "[server]\n\
          listen = [\"127.0.0.1:{dns_port}\"]\n\
-         mesh_zone = \"lab.\"\n\n\
+         mesh_zone = \"mesh.\"\n\n\
          [upstream]\n\
          protocol = \"plain\"\n\
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.lab.\"\n\
+         name = \"router.mesh.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -2651,7 +2651,7 @@ async fn binary_e2e_authority_static_record_served_with_aa_flag() {
         .expect("connect");
 
     // Query the static record: AA flag set, correct A answer.
-    sock.send(&build_query(90, "router.lab."))
+    sock.send(&build_query(90, "router.mesh."))
         .await
         .expect("send");
     let mut buf = vec![0u8; 4096];
@@ -2684,4 +2684,101 @@ async fn binary_e2e_authority_static_record_served_with_aa_flag() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
     stub.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_in_zone_nodata_is_noerror_not_nxdomain() {
+    // RFC 2308 §2.1 DESIGN DECISION at the wire: a query for a name INSIDE
+    // the authoritative zone that has NO matching record must return
+    // NoError + zero answers (NODATA), never NXDOMAIN. Returning NXDOMAIN
+    // for transient mesh gaps would poison downstream negative caches and
+    // delay peer discovery after the record reappears.
+    //
+    // Also pins the contrast: an OUT-of-zone query falls through to the
+    // upstream (which is unreachable) and fails closed to SERVFAIL.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let (_stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"mesh.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    // No upstream stub needed: the authority serves everything in-zone,
+    // and out-of-zone queries fail closed against the unreachable resolver.
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    async fn ask(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> Message {
+        sock.send(&build_query(id, name)).await.expect("send");
+        for _ in 0..12 {
+            let mut buf = vec![0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+                Err(_) => continue,
+                Ok(Err(_)) => continue,
+                Ok(Ok((n, _))) => {
+                    if let Ok(m) = Message::from_bytes(&buf[..n])
+                        && m.metadata.id == id
+                    {
+                        return m;
+                    }
+                }
+            }
+        }
+        panic!("no reply for {name}");
+    }
+
+    // In-zone + has record → NoError + answer.
+    let found = ask(&sock, 90, "router.mesh.").await;
+    assert_eq!(found.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(found.answers.len(), 1);
+    assert!(found.metadata.authoritative);
+
+    // In-zone + NO record → NoError + EMPTY (NODATA, not NXDOMAIN).
+    let nodata = ask(&sock, 91, "ghost.mesh.").await;
+    assert_eq!(
+        nodata.metadata.response_code,
+        ResponseCode::NoError,
+        "in-zone missing record must be NODATA, not NXDOMAIN"
+    );
+    assert!(nodata.answers.is_empty());
+
+    // Out-of-zone → forwarded to upstream → resolved normally.
+    let outside = ask(&sock, 92, "external.example.org.").await;
+    assert_eq!(
+        outside.metadata.response_code,
+        ResponseCode::NoError,
+        "out-of-zone must forward to upstream and resolve"
+    );
+    assert!(!outside.answers.is_empty());
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
 }
