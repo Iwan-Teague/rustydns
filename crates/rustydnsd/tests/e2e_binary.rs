@@ -2522,3 +2522,85 @@ async fn binary_e2e_safesearch_rewrites_google_over_udp() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_longest_prefix_route_wins_regardless_of_declaration_order() {
+    // ROUTE PRIORITY: when two routes overlap (one zone is a suffix of
+    // the other), the MORE SPECIFIC route must win regardless of
+    // declaration order. Before this was fixed, first-match-wins meant
+    // declaration order determined routing - an operator listing
+    // `test.` before `corp.test.` would send corp queries to the wrong
+    // upstream.
+    let (dns_port, metrics_port) = (reserve_port(), reserve_port());
+    let up_broad = reserve_port();
+    let up_narrow = reserve_port();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    // TWO overlapping routes, BROAD ZONE FIRST — old code matched it.
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{up_broad}\"]\n\
+         dnssec_validation = false\n\n\
+         [[upstream.routes]]\n\
+         zone = \"test.\"\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{up_broad}\"]\n\n\
+         [[upstream.routes]]\n\
+         zone = \"corp.test.\"\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{up_narrow}\"]\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub_broad, hits_broad, _cb) = spawn_stub_udp_dns(up_broad).await;
+    let (stub_narrow, hits_narrow, _cn) = spawn_stub_udp_dns(up_narrow).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Narrow-zone query: must go to the NARROW route's upstream.
+    let r1 = resolve_a(&sock, 800, "db.corp.test.").await;
+    assert_eq!(r1.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        hits_narrow.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "corp.test. query must reach the narrow route"
+    );
+    assert_eq!(
+        hits_broad.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "corp.test. query must NOT leak to the default/broad upstream"
+    );
+
+    // Non-overlapping query: goes to the default upstream.
+    let r2 = resolve_a(&sock, 801, "web.example.com.").await;
+    assert_eq!(r2.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        hits_broad.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "non-route query must use the default upstream"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub_broad.abort();
+    stub_narrow.abort();
+}

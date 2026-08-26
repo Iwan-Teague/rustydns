@@ -481,6 +481,11 @@ impl Resolver {
         if !lower.ends_with('.') {
             lower.push('.');
         }
+        // LONGEST-PREFIX WINS: sort by descending zone length so
+        // `corp.test.` always beats `test.` regardless of declaration
+        // order in the config file.
+        // Routes were sorted longest-first at construction time, so a
+        // simple scan finds the most-specific match first.
         self.routes
             .iter()
             .find(|r| lower == r.zone_with_dot || lower.ends_with(&r.dotted_suffix))
