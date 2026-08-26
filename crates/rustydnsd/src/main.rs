@@ -1429,6 +1429,17 @@ fn validate_metrics_path(path: &str) -> Result<()> {
             "metrics.path `{path}` is reserved by the daemon's own endpoints ({RESERVED:?}); pick another path"
         );
     }
+    // axum routes through matchit, where `{...}` is a parameter capture
+    // and `{*...}` a tail wildcard. A configured path carrying those
+    // characters would register a capture-all route — widening the reach
+    // of the UNAUTHENTICATED metrics endpoint to arbitrary paths — or be
+    // rejected by matchit at insert time, panicking inside the spawned
+    // server task and silently killing the listener. Reject up front.
+    if path.contains('{') || path.contains('}') || path.contains('*') {
+        anyhow::bail!(
+            "metrics.path `{path}` contains router metacharacters (`{{`, `}}`, `*`) that axum/matchit would interpret as parameter or wildcard captures; use a plain literal path"
+        );
+    }
     Ok(())
 }
 
@@ -1723,6 +1734,26 @@ mod tests {
             "/health/",
         ] {
             validate_metrics_path(good).expect("non-reserved path must be accepted");
+        }
+    }
+
+    #[test]
+    fn metrics_path_router_metacharacters_are_rejected() {
+        // axum/matchit treat `{...}` as a parameter capture and `{*...}`
+        // as a tail wildcard. A configured metrics.path carrying them
+        // would either register a capture-all route for the UNAUTHENTICATED
+        // metrics endpoint or panic at insert inside the spawned server
+        // task. Both spellings must be rejected with a metacharacter error.
+        for bad in [
+            "/{p}",       // single-segment capture-all
+            "/{*rest}",   // tail wildcard
+            "/met{rics}", // embedded brace, still matchit syntax
+            "/*",         // bare star rejected conservatively
+        ] {
+            let err = validate_metrics_path(bad)
+                .expect_err("metacharacter path must be rejected");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("metacharacters"), "msg = {msg}");
         }
     }
 
