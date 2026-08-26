@@ -439,6 +439,35 @@ async fn config_error_ux_names_the_offender_and_exits_nonzero() {
         (out.status.code(), combined)
     }
 
+    // Case A0: typoed key inside [upstream].
+    let typo_upstream_body = "[server]\nlisten = [\"127.0.0.1:5399\"]\nmesh_zone = \"test.\"\n\
+                              [upstream]\nresolverss = [\"127.0.0.1:5300\"]\nprotocol = \"plain\"\n\
+                              dnssec_validation = false\n";
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = tmp.path().join("rustydns.toml");
+        std::fs::write(&cfg, typo_upstream_body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+            .arg("--config")
+            .arg(&cfg)
+            .arg("--validate-config")
+            .output()
+            .await
+            .expect("run");
+        assert_eq!(out.status.code(), Some(1));
+        let combined = String::from_utf8_lossy(&out.stdout).to_string()
+            + "\n"
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(
+            combined.contains("unknown field `resolverss`"),
+            "must name the typoed key: {combined}"
+        );
+    }
+
     // Case A: typoed key inside [server].
     let typo_body = "[server]\nlistenn = [\"127.0.0.1:53\"]\nmesh_zone = \"test.\"\n\
                      [upstream]\nprotocol = \"plain\"\nresolvers = [\"127.0.0.1:5300\"]\n\
