@@ -1103,3 +1103,124 @@ async fn minimal_viable_config_validates_and_serves() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn sighup_picks_up_policy_changes_live() {
+    // POLICY HOT-RELOAD journey: start without any [[policy]] entries,
+    // then add one restricting 127.0.0.1 to an internal-only allowlist.
+    // After SIGHUP, external queries must be REFUSED while internal ones
+    // still resolve. Then REMOVE the restriction and verify access is
+    // restored - both directions prove the reload is bidirectional.
+    let (dns_port, upstream_port, metrics_port) = (reserve_port(), reserve_port(), reserve_port());
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let cfg_path = dir.path().join("rustydns.toml");
+    let open_config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &open_config).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rustydnsd");
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready);
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.connect(("127.0.0.1", dns_port)).await.unwrap();
+
+    async fn ask(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> ResponseCode {
+        sock.send(&build_query(id, name)).await.unwrap();
+        for _ in 0..12 {
+            let mut buf = vec![0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(400), sock.recv_from(&mut buf)).await {
+                Err(_) => continue,
+                Ok(Err(_)) => continue,
+                Ok(Ok((n, _))) => {
+                    if let Ok(m) = Message::from_bytes(&buf[..n])
+                        && m.metadata.id == id
+                    {
+                        return m.metadata.response_code;
+                    }
+                }
+            }
+        }
+        panic!("no reply for {name}");
+    }
+
+    // Pre-policy: external domain resolves.
+    assert_eq!(
+        ask(&sock, 500, "before-restriction.example.").await,
+        ResponseCode::NoError,
+        "pre-policy queries must resolve normally"
+    );
+
+    // Write RESTRICTED config and SIGHUP.
+    let restricted_config = format!(
+        "{}\n[[policy]]\nclient_ip = \"127.0.0.1\"\nzones_allowed = [\"internal.lan.\"]\n",
+        open_config
+    );
+    std::fs::write(&cfg_path, &restricted_config).unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id().unwrap() as i32),
+        nix::sys::signal::Signal::SIGHUP,
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Post-policy: external query refused.
+    assert_eq!(
+        ask(&sock, 501, "external.example.org.").await,
+        ResponseCode::Refused,
+        "post-policy external queries must be REFUSED"
+    );
+
+    // Restore open config and SIGHUP again.
+    std::fs::write(&cfg_path, &open_config).unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id().unwrap() as i32),
+        nix::sys::signal::Signal::SIGHUP,
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Access restored.
+    assert_eq!(
+        ask(&sock, 502, "restored.example.org.").await,
+        ResponseCode::NoError,
+        "removing the policy must restore normal resolution"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
