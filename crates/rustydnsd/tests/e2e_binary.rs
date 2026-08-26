@@ -2429,6 +2429,63 @@ async fn binary_e2e_conditional_forwarding_routes_by_zone() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_regex_blocklist_blocks_matching_domains() {
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("rustydns.toml");
+    // The regex pattern uses \\ for escaped dots (valid in TOML basic
+    // strings, producing \. in the regex which matches literal dots).
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\
+         block_response = \"refused\"\n\
+         regex_rules = [\"tracking\"]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Matching domains: REFUSED by regex substring.
+    for (id, name) in [(500u16, "cdn-tracking.net."), (501, "pixel-tracking.io.")] {
+        let reply = resolve_a(&sock, id, name).await;
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::Refused,
+            "{name} must be REFUSED by regex rule"
+        );
+    }
+
+    // Non-matching domain: resolve normally through stub.
+    let ok = resolve_a(&sock, 502, "content.test.").await;
+    assert_eq!(ok.metadata.response_code, ResponseCode::NoError);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn binary_e2e_sinkhole_mode_serves_operator_ip_for_blocked_domains() {
     // SINKHOLE journey: block_response = "sinkhole" turns every blocked
     // domain into an A record pointing at the operator's chosen IP -
