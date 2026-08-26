@@ -409,9 +409,7 @@ impl DnsHandler {
             };
             if measure(&answers, false, metadata).is_none_or(|n| n > cap) {
                 metadata.truncation = true;
-                let shed = shed_beyond_cap(&mut answers, cap, |ans, tc| {
-                    measure(ans, tc, metadata)
-                });
+                let shed = shed_beyond_cap(&mut answers, cap, |ans, tc| measure(ans, tc, metadata));
                 // One warning per truncated reply, not one per shed record.
                 warn!(
                     shed_records = shed,
@@ -2797,7 +2795,10 @@ mod tests {
                 _ => None,
             })
             .expect("A record");
-        assert_eq!(first_ip, "10.11.0.0", "kept records must be the head, not scattered");
+        assert_eq!(
+            first_ip, "10.11.0.0",
+            "kept records must be the head, not scattered"
+        );
     }
 
     #[test]
@@ -2817,11 +2818,8 @@ mod tests {
         // empty the answer set and return — never spin or panic — and the
         // count must cover every record (reply goes out TC + no answers).
         for n in [1usize, 2, 7] {
-            let mut answers: Vec<Record> =
-                (0..n as u8).map(|i| wire_a(i)).collect();
-            let shed = shed_beyond_cap(&mut answers, 512, |ans, _tc| {
-                Some(ans.len() * 100 + 600)
-            });
+            let mut answers: Vec<Record> = (0..n as u8).map(|i| wire_a(i)).collect();
+            let shed = shed_beyond_cap(&mut answers, 512, |ans, _tc| Some(ans.len() * 100 + 600));
             assert_eq!(shed, n, "every record must be shed when none can fit");
             assert!(answers.is_empty());
         }
@@ -4683,8 +4681,10 @@ mod tests {
         pointer_loop.extend_from_slice(&1u16.to_be_bytes()); // qtype
         pointer_loop.extend_from_slice(&1u16.to_be_bytes()); // qclass
 
-        for (label, wire) in [("truncated-label", &truncated_label), ("pointer-loop", &pointer_loop)]
-        {
+        for (label, wire) in [
+            ("truncated-label", &truncated_label),
+            ("pointer-loop", &pointer_loop),
+        ] {
             let started = std::time::Instant::now();
             let decoded = Message::from_bytes(wire);
             let elapsed = started.elapsed();

@@ -1440,6 +1440,19 @@ fn validate_metrics_path(path: &str) -> Result<()> {
             "metrics.path `{path}` contains router metacharacters (`{{`, `}}`, `*`) that axum/matchit would interpret as parameter or wildcard captures; use a plain literal path"
         );
     }
+    // RFC 3986 §3.3 dot-segments. Our router matches the RAW configured
+    // bytes, but clients and intermediaries (browsers, reverse proxies,
+    // gateways) normalise `.` / `..` segments before forwarding — so a
+    // path like `/./health` serves metrics at this address while looking
+    // like `/health` to every hop in front of the daemon. That mismatch
+    // is an easy way to park the unauthenticated metrics endpoint on a
+    // path that monitoring and ACLs believe is the health check. Reject
+    // rather than silently rewriting operator config.
+    if path.split('/').any(|seg| seg == "." || seg == "..") {
+        anyhow::bail!(
+            "metrics.path `{path}` contains RFC 3986 dot-segments (`.` or `..`) that clients and proxies may normalise onto a different route than this daemon serves; use a plain literal path"
+        );
+    }
     Ok(())
 }
 
@@ -1720,8 +1733,8 @@ mod tests {
         // Validation must reject both verbatim and padded spellings.
         for bad in ["/health", "/queries", " /health ", "  /queries"] {
             let normalized = normalize_metrics_path(bad);
-            let err = validate_metrics_path(&normalized)
-                .expect_err("reserved path must be rejected");
+            let err =
+                validate_metrics_path(&normalized).expect_err("reserved path must be rejected");
             let msg = format!("{err:#}");
             assert!(msg.contains("reserved"), "msg = {msg}");
         }
@@ -1750,10 +1763,38 @@ mod tests {
             "/met{rics}", // embedded brace, still matchit syntax
             "/*",         // bare star rejected conservatively
         ] {
-            let err = validate_metrics_path(bad)
-                .expect_err("metacharacter path must be rejected");
+            let err = validate_metrics_path(bad).expect_err("metacharacter path must be rejected");
             let msg = format!("{err:#}");
             assert!(msg.contains("metacharacters"), "msg = {msg}");
+        }
+    }
+
+    #[test]
+    fn metrics_path_dot_segments_are_rejected() {
+        // RFC 3986 §3.3 dot-segments split the address space: this daemon's
+        // router matches raw configured bytes, while browsers and reverse
+        // proxies normalise `.`/`..` before forwarding — so `/./health`
+        // would park the UNAUTHENTICATED metrics endpoint on a path every
+        // intermediary treats as the health route. Every dot-segment
+        // spelling must be rejected with a dot-segment error, including
+        // after whitespace trim (the operator may write " ./health ").
+        for bad in [
+            "./health",     // no leading slash: normalize prepends one
+            "/./health",    // the /health shadow
+            "/health/.",    // trailing dot-segment
+            "/../metrics",  // parent escape
+            "/a/./b",       // embedded mid-path
+            "/././metrics", // repeated
+        ] {
+            let normalized = normalize_metrics_path(bad);
+            let err =
+                validate_metrics_path(&normalized).expect_err("dot-segment path must be rejected");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("dot-segments"), "msg = {msg}");
+        }
+        // Dot-free paths that merely CONTAIN dots inside labels stay legal.
+        for good in ["/metrics", "/m.etrics", "/v1.2/metrics"] {
+            validate_metrics_path(good).expect("dot-in-label path must be accepted");
         }
     }
 
