@@ -525,6 +525,23 @@ fn hickory_clamp_overridden(targets: &[String], crate_name: &str) -> bool {
     targets.iter().any(|t| t == crate_name)
 }
 
+/// Directives clamping every qname-bearing hickory crate to `warn`,
+/// minus any the operator overrode by exact name. Pure => unit-testable;
+/// the crate LIST is the security surface (see hickory-net audit).
+fn hickory_clamp_directives(targets: &[String]) -> Vec<String> {
+    const QNAME_BEARING_CRATES: [&str; 4] = [
+        "hickory_server",
+        "hickory_proto",
+        "hickory_resolver",
+        "hickory_net",
+    ];
+    QNAME_BEARING_CRATES
+        .iter()
+        .filter(|c| !hickory_clamp_overridden(targets, c))
+        .map(|c| format!("{c}=warn"))
+        .collect()
+}
+
 /// Reads `RUST_LOG` for the log filter (default: `info`).
 /// Uses JSON format in release builds (machine-readable for log aggregation)
 /// and pretty format in debug builds.
@@ -562,17 +579,10 @@ fn init_tracing() {
             filter = filter.add_directive(d);
         }
     }
-    // hickory-net 0.26 (transports moved here in the 0.26 split) logs the
-    // FULL ENCODED QUERY at debug level ("final message") - clamp it too.
-    for crate_name in [
-        "hickory_server",
-        "hickory_proto",
-        "hickory_resolver",
-        "hickory_net",
-    ] {
-        if !hickory_clamp_overridden(&targets, crate_name) {
-            filter = filter.add_directive(format!("{crate_name}=warn").parse().unwrap());
-        }
+    // Clamp every qname-bearing hickory crate unless the operator named it
+    // exactly. Pure helper => the wiring itself is unit-testable.
+    for directive in hickory_clamp_directives(&targets) {
+        filter = filter.add_directive(directive.parse().unwrap());
     }
 
     // LOGS GO TO STDERR. stdout is reserved for data (--print-config's
@@ -1936,22 +1946,54 @@ mod tests {
             &["hickory".to_string()],
             "hickory_server"
         ));
-        // BARE-LEVEL directive (RUST_LOG=debug, no `target=` form): the
-        // directive text lands in the targets list as the literal "debug",
-        // which matches no hickory crate name - so the clamp MUST stay
-        // engaged for all four. Pins that a plain level bump cannot
-        // silently unclamp hickory's qname-bearing internals. hickory-net
-        // 0.26 (transports moved here in the 0.26 split) logs the FULL
-        // ENCODED QUERY at debug level ("final message") - clamp it too.
-        for crate_name in [
+    }
+
+    #[test]
+    fn hickory_clamp_directives_cover_all_four_crates() {
+        use super::hickory_clamp_directives;
+        // Empty targets (default startup): ALL four crates clamped.
+        let d = hickory_clamp_directives(&[]);
+        assert_eq!(d.len(), 4, "all four crates must be clamped: {d:?}");
+        for c in [
             "hickory_server",
             "hickory_proto",
             "hickory_resolver",
             "hickory_net",
         ] {
             assert!(
-                !hickory_clamp_overridden(&["debug".to_string()], crate_name),
-                "bare RUST_LOG=debug must not stand down the clamp for {crate_name}"
+                d.contains(&format!("{c}=warn")),
+                "missing clamp directive for {c}: {d:?}"
+            );
+        }
+        // Exact override of one crate drops only its directive.
+        let d = hickory_clamp_directives(&["hickory_net".to_string()]);
+        assert_eq!(d.len(), 3, "overridden crate must be dropped: {d:?}");
+        assert!(!d.iter().any(|x| x.contains("hickory_net")));
+    }
+
+    // BARE-LEVEL directive (RUST_LOG=debug, no `target=` form): the
+    // directive text lands in the targets list as the literal "debug",
+    // which matches no hickory crate name - so the clamp MUST stay
+    // engaged for all four. Pins that a plain level bump cannot
+    // silently unclamp hickory's qname-bearing internals.
+    #[test]
+    fn bare_level_directive_does_not_override_hickory_clamp() {
+        let targets: Vec<String> = ["debug".to_string()].to_vec();
+        let directives = hickory_clamp_directives(&targets);
+        assert_eq!(
+            directives.len(),
+            4,
+            "all four crates clamped: {directives:?}"
+        );
+        for c in [
+            "hickory_server",
+            "hickory_proto",
+            "hickory_resolver",
+            "hickory_net",
+        ] {
+            assert!(
+                directives.contains(&format!("{c}=warn")),
+                "missing clamp directive for {c}: {directives:?}"
             );
         }
     }
