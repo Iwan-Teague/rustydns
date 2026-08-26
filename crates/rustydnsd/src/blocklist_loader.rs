@@ -449,6 +449,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_fallback_serves_retained_content_when_fetch_fails() {
+        // Remote-arm teeth for the retention mechanism: seed last-good
+        // directly (simulating a prior successful fetch), make the URL
+        // unreachable (nothing listens on :1), and assert gather still
+        // returns the retained content as a Trusted-source entry.
+        let loader = loader_with_cap(1024 * 1024);
+        let url = "https://127.0.0.1:1/hosts"; // port 1: instant refusal
+        loader.remember_last_good(url, "remote-blocked.test\n");
+
+        let (sources, failed) = loader.gather(&[], &[url.to_string()], &[]).await;
+
+        assert_eq!(failed, 0, "fallback must not count as a hard failure");
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].0.contains("remote-blocked.test"));
+        match sources[0].1 {
+            BlocklistSource::Untrusted => {}
+            other => panic!("trust must be preserved through fallback: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn read_local_accepts_file_under_cap() {
         let dir = std::env::temp_dir().join(format!("rustydns-bl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tempdir");
