@@ -668,18 +668,38 @@ fn parse_upstream_url(url: &str, protocol: UpstreamProtocol) -> ResolverResult<P
         )));
     }
 
-    let (host, port) = if let Some(idx) = host_port.rfind(':') {
-        // Avoid matching colons inside an IPv6 literal `[::1]:443`.
-        let after_bracket = host_port.starts_with('[') && host_port.contains(']');
-        if after_bracket {
-            let close = host_port.find(']').unwrap();
-            let host = host_port[1..close].to_string();
-            let port_part = host_port.get(close + 2..).unwrap_or("");
-            let port = port_part
+    let (host, port) = if let Some(inner) = host_port.strip_prefix('[') {
+        // RFC 3986 IP-literal form: `[<ipv6>][:port]`. Everything up to
+        // the closing `]` is the literal; after it only `:port` or
+        // nothing (scheme default) is legal. Anything else is a config
+        // error — never a silently shifted port.
+        let Some(close) = inner.find(']') else {
+            return Err(RustyDnsError::Config(format!(
+                "upstream `{url}` has an unterminated `[` IPv6 literal (missing `]`)"
+            )));
+        };
+        let host = inner[..close].to_string();
+        if host.parse::<std::net::IpAddr>().is_err() {
+            return Err(RustyDnsError::Config(format!(
+                "upstream `{url}` has an invalid or empty IP literal `[{host}]`"
+            )));
+        }
+        let after = &inner[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => p
                 .parse::<u16>()
-                .map_err(|_| RustyDnsError::Config(format!("upstream `{url}` has invalid port")))?;
-            (host, port)
-        } else if host_port[idx + 1..].chars().all(|c| c.is_ascii_digit()) {
+                .map_err(|_| RustyDnsError::Config(format!("upstream `{url}` has invalid port")))?,
+            None if after.is_empty() => default_port(&scheme, protocol),
+            None => {
+                return Err(RustyDnsError::Config(format!(
+                    "upstream `{url}` has unexpected characters after `]` (expected `:port`)"
+                )))
+            }
+        };
+        (host, port)
+    } else if let Some(idx) = host_port.rfind(':') {
+        // Bare host (or v4): a trailing all-digit segment is the port.
+        if host_port[idx + 1..].chars().all(|c| c.is_ascii_digit()) {
             let port = host_port[idx + 1..]
                 .parse::<u16>()
                 .map_err(|_| RustyDnsError::Config(format!("upstream `{url}` has invalid port")))?;
@@ -1542,6 +1562,38 @@ mod tests {
         .unwrap();
         assert_eq!(p.host, "2606:4700::1111");
         assert_eq!(p.port, 443);
+    }
+
+    #[test]
+    fn parse_upstream_url_ipv6_literal_defaults_port() {
+        // A bracketed IPv6 literal without `:port` must fall back to the
+        // scheme's default port, exactly like a bare v4 host does.
+        let p = parse_upstream_url(
+            "https://[2606:4700::1111]/dns-query",
+            UpstreamProtocol::Doh,
+        )
+        .unwrap();
+        assert_eq!(p.host, "2606:4700::1111");
+        assert_eq!(p.port, 443);
+
+        let p = parse_upstream_url("[2001:db8::1]", UpstreamProtocol::Plain).unwrap();
+        assert_eq!(p.host, "2001:db8::1");
+        assert_eq!(p.port, 53);
+    }
+
+    #[test]
+    fn parse_upstream_url_rejects_malformed_ipv6_literals() {
+        // `[::1]9153` used to parse as host `::1` port **153** (the
+        // port window was shifted one byte past `]`), silently pointing
+        // the upstream at the wrong port. Unterminated literals used to
+        // yield nonsense hosts like `[::`. Both are config errors now.
+        for bad in ["[::1]9153", "[::1:x]", "https://[2606:4700::1"] {
+            let err = parse_upstream_url(bad, UpstreamProtocol::Plain).unwrap_err();
+            match err {
+                RustyDnsError::Config(msg) => assert!(!msg.is_empty(), "{bad}"),
+                other => panic!("expected Config for {bad}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
