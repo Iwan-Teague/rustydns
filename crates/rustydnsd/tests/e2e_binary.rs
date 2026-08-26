@@ -3586,3 +3586,45 @@ async fn binary_e2e_zero_question_count_gets_formerr() {
 
     child.kill().await.expect("kill daemon");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_max_label_length_resolves() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    let max_label = "a".repeat(63);
+    let name = format!("{max_label}.test.");
+    sock.send(&build_query(810, &name)).await.expect("send");
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("reply")
+        .expect("recv");
+
+    let reply = Message::from_bytes(&buf[..n]).expect("decode");
+    assert_eq!(reply.metadata.id, 810);
+    assert_eq!(
+        reply.metadata.response_code,
+        ResponseCode::NoError,
+        "63-char label query must resolve"
+    );
+    let echoed = reply.queries.first().expect("question").name().to_string();
+    assert_eq!(
+        echoed.trim_end_matches('.'),
+        name.trim_end_matches('.'),
+        "63-char label must survive round-trip"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+}
