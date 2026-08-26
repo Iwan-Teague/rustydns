@@ -1046,6 +1046,37 @@ async fn binary_e2e_doq_quic_stream_resolution_with_ca_trust() {
         hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
+    // CONNECTION REUSE (RFC 9250 §4.2.1): a SECOND query on a NEW
+    // bidirectional stream of the SAME QUIC connection must also resolve.
+    let (mut send2, mut recv2) = conn.open_bi().await.expect("open second bi");
+    let mut msg2 = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+    msg2.metadata.recursion_desired = true;
+    msg2.add_query({
+        let mut q = hickory_proto::op::Query::new();
+        q.set_name(Name::from_ascii("second.doq.test.").expect("name"));
+        q.set_query_type(RecordType::A);
+        q
+    });
+    let wire2 = msg2.to_vec().expect("encode");
+    send2
+        .write_all(&(wire2.len() as u16).to_be_bytes())
+        .await
+        .expect("len");
+    send2.write_all(&wire2).await.expect("query");
+    send2.finish().expect("finish");
+
+    let resp2 = tokio::time::timeout(Duration::from_secs(5), recv2.read_to_end(65_535))
+        .await
+        .expect("read timeout")
+        .expect("read reply");
+    assert!(resp2.len() >= 2);
+    let r2 = Message::from_bytes(&resp2[2..]).expect("decode second reply");
+    assert_eq!(r2.metadata.id, 0);
+    assert_eq!(r2.metadata.response_code, ResponseCode::NoError);
+    assert!(r2.answers.iter().any(|a| matches!(&a.data,
+        hickory_proto::rr::RData::A(ip) if ip.0.to_string() == "192.0.2.1")));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
     stub.abort();
