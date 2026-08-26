@@ -3627,3 +3627,37 @@ async fn binary_e2e_max_label_length_resolves() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_underscore_labels_forward_to_upstream() {
+    // UNDERSCORE LABELS: names like `_dmarc.example.org` are valid DNS
+    // labels (RFC 1035 allows any octet). They must pass through the
+    // pipeline without being dropped by validation or encoding paths.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (_stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    for (id, name) in [
+        (600u16, "_dmarc.example.org."),
+        (601u16, "_acme-challenge.example.net."),
+    ] {
+        sock.send(&build_query(id, name)).await.expect("send");
+        let mut buf = vec![0u8; 4096];
+        tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+            .await
+            .expect("reply within timeout")
+            .expect("recv success");
+    }
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+}
