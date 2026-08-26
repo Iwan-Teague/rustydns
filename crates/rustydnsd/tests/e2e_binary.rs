@@ -3361,3 +3361,85 @@ async fn binary_e2e_authority_cname_chain_resolution() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_authority_precedes_blocklist_for_same_name() {
+    // AGENTS.md INVARIANT at the wire: "Authority answers before blocklist."
+    // When a name appears in BOTH [[authority.static_records]] AND the
+    // blocklist, the AUTHORITY answer must win — the blocklist must never
+    // override signed mesh data. Pins pipeline ordering end-to-end.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let bl_path = tmp.path().join("conflict.blocklist");
+    std::fs::write(&bl_path, "0.0.0.0 conflict.mesh.\n").expect("write blocklist");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"mesh.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\
+         local_files = [\"{}\"]\n\n\
+         [[authority.static_records]]\n\
+         name = \"conflict.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n",
+        bl_path.display()
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Query the conflicting name: MUST get the authority answer (10.0.0.1),
+    // NOT the blocklist response.
+    sock.send(&build_query(96, "conflict.mesh."))
+        .await
+        .expect("send");
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("reply")
+        .expect("recv");
+
+    let reply = Message::from_bytes(&buf[..n]).expect("decode");
+    assert_eq!(reply.metadata.id, 96);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        reply.metadata.authoritative,
+        "authority answer must carry AA flag"
+    );
+    assert_eq!(reply.answers.len(), 1);
+    match &reply.answers[0].data {
+        hickory_proto::rr::RData::A(ip) => {
+            assert_eq!(
+                ip.0.to_string(),
+                "10.0.0.1",
+                "AUTHORITY must win over blocklist for the same name"
+            );
+        }
+        other => panic!("expected A record, got {other:?}"),
+    }
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+}
