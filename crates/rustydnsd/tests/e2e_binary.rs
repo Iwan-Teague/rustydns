@@ -3589,11 +3589,10 @@ async fn binary_e2e_zero_question_count_gets_formerr() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn binary_e2e_max_label_length_resolves() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let (dns_port, upstream_port, metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
-    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let (_stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
