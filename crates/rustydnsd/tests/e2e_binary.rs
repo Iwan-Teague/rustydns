@@ -3541,3 +3541,48 @@ async fn binary_e2e_authority_serves_txt_records() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_zero_question_count_gets_formerr() {
+    // RFC 1035 §4.1.1: QDCOUNT specifies the number of entries in the
+    // question section. A query with QDCOUNT=0 carries no question —
+    // hickory-server should reject it before our handler sees it, or our
+    // gate should return FORMERR.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Build a header-only DNS message: QDCOUNT=0, ANCOUNT=0, etc.
+    let mut empty_query = vec![0u8; 12];
+    empty_query[0] = 0x30; // id high byte
+    empty_query[1] = 0x31; // id low byte
+    empty_query[2] = 0x01; // RD=1, QR=0
+    // bytes 4..12 default to zero counts
+    sock.send(&empty_query).await.expect("send");
+
+    let mut buf = vec![0u8; 4096];
+    let result = tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf)).await;
+    match result {
+        Err(_) => panic!("daemon hung on QDCOUNT=0 query"),
+        Ok(Err(_)) => {} // send error / ICMP unreachable: acceptable
+        Ok(Ok((n, _))) => {
+            let reply = Message::from_bytes(&buf[..n]).expect("decode");
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::FormErr,
+                "QDCOUNT=0 must yield FORMERR, got {:?}",
+                reply.metadata.response_code
+            );
+        }
+    }
+
+    child.kill().await.expect("kill daemon");
+}
