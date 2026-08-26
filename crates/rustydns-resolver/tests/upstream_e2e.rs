@@ -764,6 +764,91 @@ async fn mismatched_question_section_is_rejected_as_spoofed() {
 }
 
 #[tokio::test]
+async fn plain_upstream_varies_query_id_and_source_port_per_query() {
+    // Entropy half of off-path spoofing resistance, pinned at our seam:
+    // every plain-UDP query must carry a fresh transaction ID AND leave from
+    // a fresh source port. A resolver that reused one id or one socket would
+    // let an off-path attacker blind-inject a forged reply after observing a
+    // single exchange; hickory's per-exchange sockets + random ids are what
+    // make the 0x20 defence's 32+16 bits of guesswork matter.
+    //
+    // The mock echoes each question back EXACTLY as received (legitimate
+    // case-preserving server, so 0x20 passes) and records the wire
+    // transaction id plus the client source port it was sent from.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = socket.local_addr().expect("local_addr");
+    let shutdown = CancellationToken::new();
+    let sh = shutdown.clone();
+    let seen: Arc<std::sync::Mutex<Vec<(u16, u16)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_inner = seen.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            tokio::select! {
+                _ = sh.cancelled() => break,
+                res = socket.recv_from(&mut buf) => {
+                    let (n, src) = match res {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                        continue;
+                    };
+                    let Some(question) = query.queries.first() else {
+                        continue;
+                    };
+                    seen_inner
+                        .lock()
+                        .unwrap()
+                        .push((query.metadata.id, src.port()));
+                    let mut resp =
+                        Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.recursion_available = true;
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    resp.add_query(hickory_proto::op::Query::query(
+                        question.name().clone(),
+                        question.query_type(),
+                    ));
+                    resp.add_answer(a_record(question.name(), Ipv4Addr::new(1, 2, 3, 4), 300));
+                    if let Ok(bytes) = resp.to_bytes() {
+                        let _ = socket.send_to(&bytes, src).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let cfg = plain_config(&addr.to_string());
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    const ROUNDS: usize = 6;
+    for round in 0..ROUNDS {
+        let name = format!("freshness-round-{round}.example.org.");
+        let out = resolver.resolve(&name, "A").await.expect("resolve");
+        assert_eq!(out.records.len(), 1, "round {round} must be answered");
+    }
+
+    let obs = seen.lock().unwrap();
+    assert_eq!(
+        obs.len(),
+        ROUNDS,
+        "every query reached the wire exactly once"
+    );
+
+    let distinct_ids: std::collections::HashSet<u16> = obs.iter().map(|(id, _)| *id).collect();
+    assert!(
+        distinct_ids.len() >= ROUNDS - 1,
+        "transaction IDs must vary per query (got {distinct_ids:?} over {obs:?})"
+    );
+
+    let distinct_ports: std::collections::HashSet<u16> = obs.iter().map(|(_, p)| *p).collect();
+    assert!(
+        distinct_ports.len() >= 2,
+        "source ports must not be pinned to one socket across queries (got {obs:?})"
+    );
+}
+
+#[tokio::test]
 async fn compression_pointer_loop_fails_closed() {
     // A hostile upstream sends a response whose answer NAME is a compression
     // pointer pointing at ITSELF (0xC0|self-offset). hickory's decoder
