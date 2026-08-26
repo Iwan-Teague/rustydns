@@ -868,9 +868,9 @@ async fn binary_e2e_dot_tls_handshake_and_resolution() {
         .await
         .expect("tcp connect to DoT");
     let server_name = ServerName::try_from(test_certs::TEST_CERT_CN.to_string()).expect("san name");
-    let mut tls = connector
-        .connect(server_name, tcp)
+    let mut tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name, tcp))
         .await
+        .expect("tls handshake timeout")
         .expect("tls handshake");
 
     // RFC 1035 framing inside the TLS stream.
