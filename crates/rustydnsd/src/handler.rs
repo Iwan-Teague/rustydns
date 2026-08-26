@@ -589,6 +589,10 @@ impl DnsHandler {
         // metadata (the `op_code()` accessor was dropped).
         if request.metadata.op_code != OpCode::Query {
             Some(Reply::reject(ResponseCode::NotImp))
+        } else if request.metadata.message_type != hickory_proto::op::MessageType::Query {
+            // RFC 1035 §4.1.1: QR must be 0 in queries. A response sent to
+            // our listening port is either spoofed or misrouted.
+            Some(Reply::reject(ResponseCode::Refused))
         } else {
             None
         }
