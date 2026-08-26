@@ -698,6 +698,11 @@ async fn binary_e2e_doh_post_resolves_over_http_seam() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n"
     );
@@ -763,6 +768,11 @@ async fn binary_e2e_doh_get_resolves_via_base64url_param() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n"
     );
@@ -847,6 +857,11 @@ async fn binary_e2e_dot_tls_handshake_and_resolution() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n",
         cert_path.display(),
@@ -974,6 +989,11 @@ async fn binary_e2e_doq_quic_stream_resolution_with_ca_trust() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n",
         cert_path.display(),
@@ -1120,6 +1140,11 @@ async fn binary_e2e_dot_rejects_wrong_san_dial() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n",
         cert_path.display(),
@@ -1743,6 +1768,11 @@ async fn binary_e2e_doh_wrong_content_type_is_415() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n"
     );
@@ -2049,6 +2079,11 @@ async fn binary_e2e_multi_upstream_queries_distribute_across_providers() {
          resolvers = [\"127.0.0.1:{up1}\", \"127.0.0.1:{up2}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n"
     );
@@ -2112,6 +2147,11 @@ async fn binary_e2e_serial_dispatch_still_fails_over_to_live_provider() {
          dnssec_validation = false\n\
          timeout_ms = 1200\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n"
     );
@@ -2314,6 +2354,11 @@ async fn binary_e2e_conditional_forwarding_routes_by_zone() {
          protocol = \"plain\"\n\
          resolvers = [\"127.0.0.1:{up_route}\"]\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n"
     );
@@ -2555,6 +2600,11 @@ async fn binary_e2e_longest_prefix_route_wins_regardless_of_declaration_order() 
          protocol = \"plain\"\n\
          resolvers = [\"127.0.0.1:{up_narrow}\"]\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n"
     );
@@ -2959,6 +3009,11 @@ async fn binary_e2e_zone_apex_infrastructure_queries() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n"
     );
@@ -3073,4 +3128,92 @@ async fn binary_e2e_maximum_length_domain_name_resolves() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
     stub.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_authority_serves_over_doh_transport() {
+    // TRANSPORT COVERAGE: all existing authority pins use UDP; this proves
+    // the authority arm serves mesh-zone records over DoH transport too.
+    // The stub upstream must receive ZERO datagrams (authority short-
+    // circuits before resolver per pipeline order).
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let doh_port = reserve_port();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"mesh.\"\n\
+         doh_listen = \"127.0.0.1:{doh_port}\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    // Write a static record file and reference it from the config.
+    let sr_path = tmp.path().join("static.toml");
+    std::fs::write(
+        &sr_path,
+        "[[authority.static_records]]\nname = \"router.mesh.\"\ntype = \"A\"\naddress = \"10.0.0.1\"\nttl = 300\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sr_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // RFC 8484 POST: query router.mesh. via DoH.
+    let resp = client
+        .post(format!("http://127.0.0.1:{doh_port}/dns-query"))
+        .header("content-type", "application/dns-message")
+        .body(build_query(90, "router.mesh."))
+        .send()
+        .await
+        .expect("DoH POST");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/dns-message")
+    );
+    let wire = resp.bytes().await.expect("body");
+    let reply = Message::from_bytes(&wire).expect("decode DoH reply");
+    assert_eq!(reply.metadata.id, 90);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        reply.metadata.authoritative,
+        "mesh-zone query must carry AA flag"
+    );
+    assert!(
+        reply.answers.iter().any(|r| matches!(&r.data,
+            hickory_proto::rr::RData::A(a) if a.0.to_string() == "10.0.0.1")),
+        "must serve static record address over DoH"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
 }
