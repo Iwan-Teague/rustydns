@@ -2094,11 +2094,21 @@ async fn spawn_poisoning_stub(
     std_sock.set_nonblocking(true).expect("nonblocking");
     let sock = tokio::net::UdpSocket::from_std(std_sock).expect("stub into tokio");
 
-    // evil.other.test. IN A 192.0.2.1 - explicit labels (no compression),
+    // evil.other.test. IN A 6.6.6.6 - explicit labels (no compression),
     // so the answer name differs from any echoed question.
+    const EVIL_NAME: &[u8] = &[
+        4, b'e', b'v', b'i', b'l', 5, b'o', b't', b'h', b'e', b'r', 4, b't', b'e', b's', b't', 0,
+    ];
+    // victim CNAME -> evil.other.test. Answer name is compression pointer
+    // @12 (the echoed question); RDLEN covers "evil.other.test." (17 bytes).
+    const CNAME_ANSWER: &[u8] = &[
+        0xC0, 0x0C, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x11, 4, b'e', b'v',
+        b'i', b'l', 5, b'o', b't', b'h', b'e', b'r', 4, b't', b'e', b's', b't', 0,
+    ];
+    // evil.other.test. IN A 6.6.6.6 - explicit labels.
     const EVIL_ANSWER: &[u8] = &[
         4, b'e', b'v', b'i', b'l', 5, b'o', b't', b'h', b'e', b'r', 4, b't', b'e', b's', b't', 0,
-        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04, 192, 0, 2, 1,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04, 6, 6, 6, 6,
     ];
 
     let handle = tokio::spawn(async move {
@@ -2138,17 +2148,17 @@ async fn spawn_poisoning_stub(
                     qend += 1;
                 }
                 qend += 1; // include root label
-                // Reply = header + original question + EVIL answer (explicit name).
+                // Reply = header + original question + CNAME-RIDING POISON:
+                // victim CNAME -> evil.other.test, then evil.other.test
+                // A 6.6.6.6. hickory validates the question and cleans
+                // non-matching answer names itself; our bailiwick filter is
+                // defense-in-depth behind that.
                 let mut resp: Vec<u8> = out[..qend].to_vec();
+                resp.extend_from_slice(CNAME_ANSWER);
                 resp.extend_from_slice(EVIL_ANSWER);
-                // Fix counts: QD=1, AN=1, NS=0, AR=0 (strip any OPT echo to
-                // keep the packet self-consistent for the parser).
-                resp[10..12].copy_from_slice(&1u16.to_be_bytes());
-                resp[12..14].copy_from_slice(&0u16.to_be_bytes()); // placeholder fix below
-                // Recompute: header is 12 bytes; QD=1 at [4..6], AN=[6..8],
-                // NS=[8..10], AR=[10..12].
+                // Header counts: QD=1, AN=2, NS=0, AR=0.
                 resp[4..6].copy_from_slice(&1u16.to_be_bytes());
-                resp[6..8].copy_from_slice(&1u16.to_be_bytes());
+                resp[6..8].copy_from_slice(&2u16.to_be_bytes());
                 resp[8..10].copy_from_slice(&0u16.to_be_bytes());
                 resp[10..12].copy_from_slice(&0u16.to_be_bytes());
                 let _ = sock.send_to(&resp, peer).await;
