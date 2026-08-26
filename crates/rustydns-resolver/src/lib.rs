@@ -1316,6 +1316,7 @@ mod tests {
         assert!(build_resolver_opts(&cfg, UpstreamProtocol::Plain).case_randomization);
         assert!(!build_resolver_opts(&cfg, UpstreamProtocol::Doh).case_randomization);
         assert!(!build_resolver_opts(&cfg, UpstreamProtocol::Doq).case_randomization);
+        assert!(!build_resolver_opts(&cfg, UpstreamProtocol::Odoh).case_randomization);
     }
 
     #[test]
