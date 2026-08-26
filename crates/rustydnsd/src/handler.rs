@@ -4558,4 +4558,50 @@ mod tests {
         let resp = Message::from_bytes(&buf[..n]).unwrap();
         assert_eq!(resp.metadata.response_code, ResponseCode::NotImp);
     }
+
+    /// Malformed wire names from untrusted clients must be rejected by the
+    /// daemon's decode boundary (`Message::from_bytes`) as `Err` in bounded
+    /// work — never a hang, panic, or out-of-range read. Pins two hostile
+    /// encodings: a label-length byte claiming more payload than the packet
+    /// holds, and a compression pointer that points at itself (offset N -> N).
+    /// hickory owns wire decoding; this test fails loudly if a dependency
+    /// bump or future custom parser regresses either property.
+    #[test]
+    fn malformed_wire_names_are_rejected_bounded_not_hung() {
+        fn header_with_qdcount_one() -> Vec<u8> {
+            let mut b = Vec::with_capacity(12);
+            b.extend_from_slice(&0x1234u16.to_be_bytes()); // id
+            b.extend_from_slice(&0x0100u16.to_be_bytes()); // RD set
+            b.extend_from_slice(&1u16.to_be_bytes()); // qdcount = 1
+            b.extend_from_slice(&[0u8; 6]); // an/ns/ar counts zero
+            b
+        }
+
+        // Case A: label-length byte claims 63 octets; the packet ends long
+        // before that — must be rejected as malformed, not read out of range.
+        let mut truncated_label = header_with_qdcount_one();
+        truncated_label.push(0x3F); // label length 63...
+        truncated_label.extend_from_slice(b"abcd"); // ...only 4 present
+        truncated_label.extend_from_slice(&1u16.to_be_bytes()); // qtype
+        truncated_label.extend_from_slice(&1u16.to_be_bytes()); // qclass
+
+        // Case B: compression pointer at offset 12 pointing back at offset 12.
+        let mut pointer_loop = header_with_qdcount_one();
+        pointer_loop.push(0xC0);
+        pointer_loop.push(0x0C); // jump target == the pointer itself
+        pointer_loop.extend_from_slice(&1u16.to_be_bytes()); // qtype
+        pointer_loop.extend_from_slice(&1u16.to_be_bytes()); // qclass
+
+        for (label, wire) in [("truncated-label", &truncated_label), ("pointer-loop", &pointer_loop)]
+        {
+            let started = std::time::Instant::now();
+            let decoded = Message::from_bytes(wire);
+            let elapsed = started.elapsed();
+            assert!(decoded.is_err(), "{label} must be rejected as malformed");
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "{label} rejection took {elapsed:?}; unbounded decompression work"
+            );
+        }
+    }
 }
