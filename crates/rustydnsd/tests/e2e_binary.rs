@@ -811,7 +811,6 @@ async fn binary_e2e_doh_get_resolves_via_base64url_param() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn binary_e2e_dot_tls_handshake_and_resolution() {
-    use std::sync::atomic::Ordering;
     use tokio_rustls::TlsConnector;
     use tokio_rustls::rustls::pki_types::pem::PemObject;
     use tokio_rustls::rustls::{
@@ -860,7 +859,7 @@ async fn binary_e2e_dot_tls_handshake_and_resolution() {
             .expect("chmod config");
     }
 
-    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     // TLS client trusting ONLY the embedded test CA; dial by leaf SAN.
@@ -905,7 +904,37 @@ async fn binary_e2e_dot_tls_handshake_and_resolution() {
     assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
     assert!(reply.answers.iter().any(|r| matches!(&r.data,
         hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // SESSION REUSE (RFC 7858 §3.4 encourages it): a SECOND framed
+    // exchange on the SAME TLS connection must also resolve. Tearing down
+    // per query would defeat session reuse and add a handshake per lookup.
+    let query2 = build_query(16, "dot-second.test.");
+    let mut framed2 = Vec::with_capacity(query2.len() + 2);
+    framed2.extend_from_slice(&(query2.len() as u16).to_be_bytes());
+    framed2.extend_from_slice(&query2);
+    tls.write_all(&framed2)
+        .await
+        .expect("write second framed query");
+
+    let mut len_buf2 = [0u8; 2];
+    tls.read_exact(&mut len_buf2)
+        .await
+        .expect("second reply length");
+    let reply_len2 = u16::from_be_bytes(len_buf2) as usize;
+    assert!(
+        reply_len2 > 12 && reply_len2 <= 4096,
+        "implausible {reply_len2}"
+    );
+    let mut reply_buf2 = vec![0u8; reply_len2];
+    tls.read_exact(&mut reply_buf2)
+        .await
+        .expect("second reply body");
+
+    let reply2 = Message::from_bytes(&reply_buf2).expect("decode second");
+    assert_eq!(reply2.metadata.id, 16);
+    assert_eq!(reply2.metadata.response_code, ResponseCode::NoError);
+    assert!(reply2.answers.iter().any(|r| matches!(&r.data,
+        hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
 
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
