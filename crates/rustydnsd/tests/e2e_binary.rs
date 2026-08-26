@@ -2382,3 +2382,80 @@ async fn binary_e2e_conditional_forwarding_routes_by_zone() {
     stub_default.abort();
     stub_route.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_sinkhole_mode_serves_operator_ip_for_blocked_domains() {
+    // SINKHOLE journey: block_response = "sinkhole" turns every blocked
+    // domain into an A record pointing at the operator's chosen IP -
+    // useful for LAN-wide block pages. Pins that (a) the sinkhole IP is
+    // served INSTEAD of any upstream answer, (b) non-blocked domains are
+    // untouched, and (c) the distinction is wire-visible (two different
+    // A addresses from the same daemon in one session).
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let bl_path = tmp.path().join("sinkhole.blocklist");
+    std::fs::write(&bl_path, "0.0.0.0 ads.test\n").expect("write blocklist");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\
+         local_files = [\"{}\"]\n\
+         block_response = \"sinkhole\"\n\
+         sinkhole_ip = \"192.0.2.99\"\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n",
+        bl_path.display()
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Blocked domain: sinkhole A answer, NOT the stub's 192.0.2.1.
+    let reply = resolve_a(&sock, 500, "ads.test.").await;
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(reply.answers.len(), 1);
+    match &reply.answers[0].data {
+        hickory_proto::rr::RData::A(ip) => {
+            assert_eq!(
+                ip.0.to_string(),
+                "192.0.2.99",
+                "must be the OPERATOR's sinkhole IP"
+            );
+        }
+        other => panic!("expected sinkhole A record, got {other:?}"),
+    }
+
+    // Unblocked domain still resolves through the stub normally.
+    let ok = resolve_a(&sock, 501, "clean.test.").await;
+    assert_eq!(ok.metadata.response_code, ResponseCode::NoError);
+    assert!(ok.answers.iter().any(|r| matches!(&r.data,
+        hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")));
+
+    // Upstream saw exactly one query: only clean.test was forwarded.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
