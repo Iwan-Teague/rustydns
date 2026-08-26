@@ -407,6 +407,19 @@ mod tests {
             .gather(&[file_a.clone(), file_b.clone()], &[], &[])
             .await;
         assert_eq!(failed1, 0);
+        // SEED pin: successful rounds must populate retention for BOTH
+        // sources - without this, the later failure fallback has nothing
+        // to fall back TO.
+        {
+            let map = loader.last_good.lock().unwrap();
+            assert_eq!(
+                map.len(),
+                2,
+                "both sources must be seeded after a clean round: {map:?}"
+            );
+            assert!(map.contains_key(file_a.to_string_lossy().as_ref()));
+            assert!(map.contains_key(file_b.to_string_lossy().as_ref()));
+        }
         let n1 = names(&r1);
         assert!(n1.iter().any(|c| c.contains("alpha-from-a")));
         assert!(n1.iter().any(|c| c.contains("beta-from-b")));
