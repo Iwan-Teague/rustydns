@@ -2938,3 +2938,82 @@ async fn binary_e2e_multiple_static_records_and_nodata() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_zone_apex_infrastructure_queries() {
+    // Zone-infrastructure queries (SOA, NS for the zone apex) are common
+    // from monitoring systems. These must never crash the daemon or leak
+    // internal data. The authority has no SOA/NS records configured, so
+    // all such queries should return NoError + empty (NODATA).
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("rustydns.toml");
+
+    // One static A record so the authority zone exists.
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"mesh.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Infrastructure queries against the zone apex: no SOA/NS records
+    // exist, so these return NoError + empty answers (NODATA).
+    for (id, qtype, label) in [
+        (90u16, RecordType::SOA, "SOA"),
+        (91, RecordType::NS, "NS"),
+        (92, RecordType::A, "A"),
+    ] {
+        let mut msg = Message::new(id, MessageType::Query, hickory_proto::op::OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query({
+            let mut q = hickory_proto::op::Query::new();
+            q.set_name(Name::from_ascii("mesh.").expect("name"));
+            q.set_query_type(qtype);
+            q
+        });
+        sock.send(&msg.to_vec().unwrap()).await.expect("send");
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+            .await
+            .expect("reply")
+            .expect("recv");
+        let reply = Message::from_bytes(&buf[..n]).expect("decode");
+        assert_eq!(reply.metadata.id, id);
+        // Authoritative NODATA is correct: we ARE the authority for this
+        // zone, we just don't have {label} records at the apex.
+        assert!(
+            reply.metadata.authoritative,
+            "{label} apex query should carry AA flag from the authority"
+        );
+        assert!(
+            reply.answers.is_empty(),
+            "{label} apex must have no answers"
+        );
+    }
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+}
