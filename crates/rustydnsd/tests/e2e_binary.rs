@@ -3274,3 +3274,90 @@ async fn binary_e2e_authority_serves_over_doh_transport() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_authority_cname_chain_resolution() {
+    // CNAME CHASE at the wire: alias.mesh. CNAME target.mesh. must be
+    // chased to target.mesh.'s A record in a single response containing
+    // BOTH the CNAME and the terminal A record. Pins the authority's
+    // intra-zone chain-following (RFC 1034 §3.6.2) through the real
+    // binary.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"mesh.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"alias.mesh.\"\n\
+         type = \"CNAME\"\n\
+         target = \"target.mesh.\"\n\
+         ttl = 300\n\n\
+         [[authority.static_records]]\n\
+         name = \"target.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Query A for alias.mesh.: expect NoError + [CNAME + A].
+    sock.send(&build_query(95, "alias.mesh."))
+        .await
+        .expect("send");
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("reply")
+        .expect("recv");
+
+    let reply = Message::from_bytes(&buf[..n]).expect("decode");
+    assert_eq!(reply.metadata.id, 95);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.metadata.authoritative);
+    assert_eq!(reply.answers.len(), 2, "chain must surface both records");
+
+    // First answer: CNAME alias.mesh. -> target.mesh.
+    assert_eq!(reply.answers[0].record_type(), RecordType::CNAME);
+    match &reply.answers[0].data {
+        hickory_proto::rr::RData::CNAME(t) => {
+            assert_eq!(t.to_string(), "target.mesh.");
+        }
+        other => panic!("expected CNAME, got {other:?}"),
+    }
+
+    // Second answer: A target.mesh. -> 10.0.0.1.
+    assert_eq!(reply.answers[1].record_type(), RecordType::A);
+    match &reply.answers[1].data {
+        hickory_proto::rr::RData::A(ip) => {
+            assert_eq!(ip.0.to_string(), "10.0.0.1");
+        }
+        other => panic!("expected A record, got {other:?}"),
+    }
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+}
