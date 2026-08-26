@@ -2216,3 +2216,83 @@ async fn binary_e2e_out_of_bailiwick_answer_is_dropped_not_served() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_conditional_forwarding_routes_by_zone() {
+    // CONDITIONAL FORWARDING at the wire: queries under corp.test. must
+    // reach the ROUTE upstream; everything else the DEFAULT upstream.
+    // Per-stub counters prove the split - a route-table regression that
+    // sends zone queries to the default arm (or vice versa) fails here.
+    let (dns_port, metrics_port) = (reserve_port(), reserve_port());
+    let up_default = reserve_port();
+    let up_route = reserve_port();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{up_default}\"]\n\
+         dnssec_validation = false\n\n\
+         [[upstream.routes]]\n\
+         zone = \"corp.test.\"\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{up_route}\"]\n\n\
+         [blocklist]\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub_default, hits_default, _cd) = spawn_stub_udp_dns(up_default).await;
+    let (stub_route, hits_route, _cr) = spawn_stub_udp_dns(up_route).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Zone-matched: must hit the ROUTE stub only.
+    for id in 700u16..703 {
+        let reply = resolve_a(&sock, id, &format!("db{idx}.corp.test.", idx = id - 700)).await;
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    }
+    assert_eq!(
+        hits_route.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "zone queries must go to the routed upstream"
+    );
+    assert_eq!(
+        hits_default.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "zone queries must NOT leak to the default upstream"
+    );
+
+    // Non-zone: must hit the DEFAULT stub only.
+    for id in 710u16..712 {
+        let reply = resolve_a(&sock, id, &format!("web{idx}.example.com.", idx = id - 710)).await;
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    }
+    assert_eq!(
+        hits_route.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "non-zone queries must not touch the routed upstream"
+    );
+    assert_eq!(hits_default.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub_default.abort();
+    stub_route.abort();
+}
