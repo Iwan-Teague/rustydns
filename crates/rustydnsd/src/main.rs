@@ -1929,6 +1929,17 @@ mod tests {
             &["hickory".to_string()],
             "hickory_server"
         ));
+        // BARE-LEVEL directive (RUST_LOG=debug, no `target=` form): the
+        // directive text lands in the targets list as the literal "debug",
+        // which matches no hickory crate name - so the clamp MUST stay
+        // engaged for all three. Pins that a plain level bump cannot
+        // silently unclamp hickory's qname-bearing internals.
+        for crate_name in ["hickory_server", "hickory_proto", "hickory_resolver"] {
+            assert!(
+                !hickory_clamp_overridden(&["debug".to_string()], crate_name),
+                "bare RUST_LOG=debug must not stand down the clamp for {crate_name}"
+            );
+        }
     }
 
     #[test]
