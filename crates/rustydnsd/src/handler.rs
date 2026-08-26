@@ -2863,6 +2863,76 @@ mod tests {
     }
 
     #[test]
+    fn shed_beyond_cap_variable_size_txt_records_terminate_and_respect_cap() {
+        use crate::handler::shed_beyond_cap;
+        use hickory_proto::rr::rdata::TXT;
+        use hickory_proto::rr::{RData, Record};
+
+        // Amplification shape the fixed-size A probes can't cover: records
+        // whose encoded size varies wildly (multi-string TXT, ~2.5 KB each).
+        // The measure closure must reflect REAL per-record cost or the shed
+        // loop either over-sheds (answer starvation) or under-sheds (a reply
+        // that busts the UDP cap). Real encoding is used as the probe.
+        let wire_txt = |i: usize| {
+            Record::from_rdata(
+                ProtoName::from_ascii(format!("t{i}.txtflood.mesh.")).expect("name"),
+                300,
+                RData::TXT(TXT::new(vec![vec![b'x'; 250]; 10])),
+            )
+        };
+        // Same probe shape as the production reply path: build a
+        // MessageResponse over the candidate answers and REALLY encode it.
+        let measure = |ans: &[Record], _tc: bool| -> Option<usize> {
+            use hickory_proto::op::{Message, MessageType, MessageType as MT, OpCode};
+            use hickory_proto::op::Message as M;
+            let mut msg = Message::new();
+            msg.set_message_type(MessageType::Response);
+            msg.set_op_code(OpCode::Query);
+            msg.insert_answers(ans.to_vec());
+            msg.to_bytes().ok().map(|b| b.len())
+        };
+        let _ = M::query; = |ans: &[Record]| -> Option<usize> {
+            use hickory_proto::op::{Message, MessageType, OpCode};
+            let mut msg = Message::query();
+            msg.set_message_type(MessageType::Response);
+            msg.set_op_code(OpCode::Query);
+            msg.insert_answers(ans.to_vec());
+            msg.to_bytes().ok().map(|b| b.len())
+        };
+        // Cap smaller than ONE record: everything must be shed and the loop
+        // must terminate rather than spin popping from an empty vec.
+        let mut none_fit: Vec<Record> = (0..7usize).map(wire_txt).collect();
+        let shed_all = shed_beyond_cap(&mut none_fit, 512, measure);
+        assert_eq!(shed_all, 7, "no TXT record can fit a 512-byte cap");
+        assert!(none_fit.is_empty(), "table must drain fully");
+
+        // Realistic EDNS cap: enough room for several records; shedding must
+        // stop exactly when the REAL encoding fits, never exceed the cap.
+        let mut mixed: Vec<Record> = (0..40usize).map(wire_txt).collect();
+        const CAP: usize = 1232;
+        let shed_some = shed_beyond_cap(&mut mixed, CAP, measure);
+        assert!(
+            shed_some > 0 && shed_some < 40,
+            "some but not all records must survive, got shed={shed_some}"
+        );
+        assert_eq!(mixed.len(), 40 - shed_some);
+        let final_len = measure(&mixed).expect("final answer must encode");
+        assert!(
+            final_len <= CAP,
+            "shed loop must respect the cap: final={final_len} cap={CAP}"
+        );
+        // And one more record would NOT have fit — proving we stopped at the
+        // exact boundary instead of over-shedding.
+        let mut one_more = mixed.clone();
+        one_more.push(wire_txt(999));
+        let greedy_len = measure(&one_more).expect("greedy answer must encode");
+        assert!(
+            greedy_len > CAP,
+            "boundary check: adding a record back must exceed the cap"
+        );
+    }
+
+    #[test]
     fn shed_beyond_cap_single_record_that_cannot_fit_sheds_all_and_terminates() {
         use crate::handler::shed_beyond_cap;
         use hickory_proto::rr::rdata::A;
