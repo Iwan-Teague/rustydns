@@ -3017,3 +3017,60 @@ async fn binary_e2e_zone_apex_infrastructure_queries() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_maximum_length_domain_name_resolves() {
+    // WIRE LIMIT: a domain name approaching the 253-byte presentation
+    // limit must resolve correctly through the full pipeline. Tests that
+    // the wire encoder/decoder handles multi-label names near the
+    // protocol maximum without truncation or corruption.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Build a ~250-byte name from 50-char labels.
+    let l1 = "a".repeat(50);
+    let l2 = "b".repeat(50);
+    let l3 = "c".repeat(50);
+    let l4 = "d".repeat(50);
+    let name = format!("{l1}.{l2}.{l3}.{l4}.example.");
+    let total = name.len();
+    assert!(
+        total > 200 && total <= 253,
+        "test name must be near but within the 253-byte limit, got {total}"
+    );
+
+    sock.send(&build_query(800, &name)).await.expect("send");
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("reply")
+        .expect("recv");
+
+    let reply = Message::from_bytes(&buf[..n]).expect("decode");
+    assert_eq!(reply.metadata.id, 800);
+    // The stub answers everything NoError; the key assertion is that the
+    // daemon didn't corrupt or truncate the name during forwarding.
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+
+    // Verify the question section preserved the original name exactly.
+    let echoed = reply.queries.first().expect("question").name().to_string();
+    assert_eq!(
+        echoed.trim_end_matches('.'),
+        name.trim_end_matches('.'),
+        "long QNAME must survive the round-trip unchanged"
+    );
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
