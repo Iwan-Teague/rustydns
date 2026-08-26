@@ -86,7 +86,10 @@ fn bucket_key(ip: IpAddr) -> IpAddr {
 /// [`bucket_key`] and collapse **all** v4 clients into one shared `::` bucket
 /// (one chatty device exhausts burst for the whole v4 population), while also
 /// hiding mapped loopback from the exemption below.
-fn normalise_mapped(ip: IpAddr) -> IpAddr {
+///
+/// Shared with `handler.rs` so per-client policy lookups key and match on the
+/// same canonical address space as the limiter.
+pub(crate) fn normalise_mapped(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),

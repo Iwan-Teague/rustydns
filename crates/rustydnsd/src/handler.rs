@@ -29,7 +29,7 @@ use rustydns_resolver::Resolver;
 
 use crate::metrics::Metrics;
 use crate::query_log::{QueryLog, ServedBy};
-use crate::rate_limiter::{LimitDecision, RateLimiter};
+use crate::rate_limiter::{normalise_mapped, LimitDecision, RateLimiter};
 use crate::rewrite::{RewriteDecision, RewriteMap};
 
 use std::collections::HashMap;
@@ -136,6 +136,10 @@ fn build_policy_map(policies: &[NodePolicy]) -> HashMap<IpAddr, CompiledPolicy> 
         if let Some(ip_str) = &policy.client_ip {
             match ip_str.parse::<IpAddr>() {
                 Ok(ip) => {
+                    // An operator may write a dual-stack client as the mapped
+                    // form (`::ffff:192.168.1.50`); collapse it onto the
+                    // native key so both spellings hit the same entry.
+                    let ip = normalise_mapped(ip);
                     let compiled = CompiledPolicy {
                         blocklist_bypass: policy.blocklist_bypass,
                         zones_allowed: Arc::from(policy.zones_allowed.as_slice()),
@@ -262,6 +266,12 @@ impl DnsHandler {
     /// Resolve the per-query policy for `src_ip`. Returns the default
     /// (no restrictions) when no `[[policy]]` entry matches.
     fn resolve_policy(&self, src_ip: IpAddr) -> PolicyDecision {
+        // A dual-stack listener ([::]:53) reports IPv4 peers in
+        // IPv4-mapped form (::ffff:a.b.c.d). Unwrap it so policy lookups
+        // key on the same canonical address space as the rate limiter —
+        // otherwise `[[policy]] client_ip = "192.168.1.50"` silently never
+        // matches those clients.
+        let src_ip = normalise_mapped(src_ip);
         match self.policy_by_ip.load().get(&src_ip) {
             Some(p) => PolicyDecision {
                 blocklist_bypass: p.blocklist_bypass,
@@ -4576,6 +4586,114 @@ mod tests {
         // Query from 127.0.0.1 should still be blocked (policy is for 10.0.0.5).
         let resp = query(harness.port, "ads.example.com.", ProtoRecordType::A).await;
         assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_lookup_unwraps_ipv4_mapped_v6_source() {
+        // A dual-stack listener ([::]:53) reports IPv4 peers in
+        // IPv4-mapped form (::ffff:a.b.c.d). resolve_policy must unwrap
+        // that form so a [[policy]] written with the native v4 address
+        // still matches — and an operator who wrote the mapped spelling
+        // must collapse onto the same canonical key.
+        let metrics = Arc::new(Metrics::new().expect("metrics"));
+        let authority_cfg = AuthorityConfig {
+            mesh_zone_bundle_path: None,
+            mesh_zone_verifier_key_path: None,
+            mesh_zone_max_age_secs: 600,
+            mesh_zone: "mesh.".to_string(),
+            static_records: Vec::new(),
+            poll_interval_secs: 30,
+        };
+        let authority = Arc::new(Authority::new(authority_cfg).expect("authority"));
+        let blocklist = Arc::new(BlocklistEngine::new(BlocklistConfig {
+            sources: Vec::new(),
+            reload_interval_secs: 0,
+            block_response: BlockResponse::Nxdomain,
+            ..BlocklistConfig::default()
+        }));
+        let upstream = UpstreamConfig {
+            resolvers: vec!["https://127.0.0.1:1/dns-query".to_string()],
+            timeout_ms: 500,
+            ..UpstreamConfig::default()
+        };
+        let dns_config = DnsConfig {
+            server: Default::default(),
+            upstream,
+            authority: Default::default(),
+            blocklist: Default::default(),
+            privacy: Default::default(),
+            metrics: Default::default(),
+            rate_limit: Default::default(),
+            policy: Vec::new(),
+            rewrite: Vec::new(),
+            safesearch: Default::default(),
+        };
+        let resolver = Arc::new(Resolver::new(dns_config).await.expect("resolver"));
+        let query_log = Arc::new(crate::query_log::QueryLog::new(16));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(
+            &rustydns_core::config::RateLimitConfig {
+                enabled: false,
+                ..rustydns_core::config::RateLimitConfig::default()
+            },
+        ));
+        let policies = vec![
+            NodePolicy {
+                node_id: None,
+                client_ip: Some("192.168.1.50".to_string()),
+                blocklist_bypass: false,
+                zones_allowed: vec!["mesh.".to_string()],
+                log_all_queries: false,
+                block_windows: Vec::new(),
+                blocklist_group: None,
+            },
+            NodePolicy {
+                node_id: None,
+                client_ip: Some("::ffff:192.168.2.50".to_string()),
+                blocklist_bypass: true,
+                zones_allowed: Vec::new(),
+                log_all_queries: false,
+                block_windows: Vec::new(),
+                blocklist_group: None,
+            },
+        ];
+        let handler = DnsHandler::new(
+            authority,
+            blocklist,
+            resolver,
+            metrics,
+            query_log,
+            rate_limiter,
+            &policies,
+            &[],
+        )
+        .expect("handler");
+
+        // Mapped-form source matches the native-v4 policy entry.
+        let mapped = handler.resolve_policy("::ffff:192.168.1.50".parse().unwrap());
+        assert_eq!(mapped.zones_allowed.len(), 1, "exactly one allowed zone");
+        assert_eq!(
+            mapped.zones_allowed[0],
+            "mesh.",
+            "mapped-form source must match the native-v4 policy"
+        );
+
+        // The native spelling still matches too.
+        let native = handler.resolve_policy("192.168.1.50".parse().unwrap());
+        assert_eq!(native.zones_allowed[0], "mesh.");
+
+        // An operator-written MAPPED literal collapses onto the native key.
+        let op_mapped = handler.resolve_policy("192.168.2.50".parse().unwrap());
+        assert!(
+            op_mapped.blocklist_bypass,
+            "::ffff: operator literal must key the same policy entry"
+        );
+
+        // Unrelated client keeps the default decision.
+        assert!(
+            !handler
+                .resolve_policy("10.9.9.9".parse().unwrap())
+                .blocklist_bypass
+        );
     }
 
     #[test]
