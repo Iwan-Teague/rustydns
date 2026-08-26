@@ -1447,13 +1447,45 @@ fn validate_metrics_path(path: &str) -> Result<()> {
     // like `/health` to every hop in front of the daemon. That mismatch
     // is an easy way to park the unauthenticated metrics endpoint on a
     // path that monitoring and ACLs believe is the health check. Reject
-    // rather than silently rewriting operator config.
-    if path.split('/').any(|seg| seg == "." || seg == "..") {
+    // rather than silently rewriting operator config. Percent-encoded
+    // spellings count too: most clients percent-decode `%2e` BEFORE path
+    // normalisation, so `/%2e/health` normalises to `/health` on the way
+    // in even though this daemon routes it as a distinct literal.
+    if path.split('/').any(is_dot_segment) {
         anyhow::bail!(
-            "metrics.path `{path}` contains RFC 3986 dot-segments (`.` or `..`) that clients and proxies may normalise onto a different route than this daemon serves; use a plain literal path"
+            "metrics.path `{path}` contains RFC 3986 dot-segments (`.` or `..`, including percent-encoded %2e spellings) that clients and proxies may normalise onto a different route than this daemon serves; use a plain literal path"
         );
     }
     Ok(())
+}
+
+/// Is this path segment a dot-segment — literally (`.` / `..`) or via a
+/// minimal percent-decoding of the only byte that matters here (`%2e`,
+/// case-insensitive)? A conservative decoder: invalid or non-`%2e` escapes
+/// are left verbatim, so `/%2etrics` stays a legal literal segment.
+fn is_dot_segment(seg: &str) -> bool {
+    if seg == "." || seg == ".." {
+        return true;
+    }
+    let bytes = seg.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 3 <= bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+            let lo = (bytes[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+            decoded.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    decoded.as_slice() == b"." || decoded.as_slice() == b".."
 }
 
 /// Drop every Linux capability from every set after the daemon has
@@ -1785,6 +1817,11 @@ mod tests {
             "/../metrics",  // parent escape
             "/a/./b",       // embedded mid-path
             "/././metrics", // repeated
+            // Percent-encoded spellings decode to `.` in browsers/proxies
+            // before normalisation — same shadow, sneakier bytes.
+            "/%2e/health",     // %2e == "."
+            "/%2E%2E/metrics", // uppercase hex == ".."
+            "/x/.%2e/queries", // mixed literal + encoded == ".."
         ] {
             let normalized = normalize_metrics_path(bad);
             let err =
@@ -1792,8 +1829,10 @@ mod tests {
             let msg = format!("{err:#}");
             assert!(msg.contains("dot-segments"), "msg = {msg}");
         }
-        // Dot-free paths that merely CONTAIN dots inside labels stay legal.
-        for good in ["/metrics", "/m.etrics", "/v1.2/metrics"] {
+        // Dot-free paths that merely CONTAIN dots inside labels stay legal —
+        // including escapes that are NOT `%2e` (the decoder must not
+        // over-reject: `2r` is not a hex pair, so it stays verbatim).
+        for good in ["/metrics", "/m.etrics", "/v1.2/metrics", "/%2etrics"] {
             validate_metrics_path(good).expect("dot-in-label path must be accepted");
         }
     }
