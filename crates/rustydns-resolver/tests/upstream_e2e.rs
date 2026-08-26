@@ -2622,6 +2622,53 @@ async fn rebinding_defence_filters_loopback_link_local_and_private_v6() {
 }
 
 #[tokio::test]
+async fn rebinding_defence_catches_ipv4_mapped_v6_loopback() {
+    // The mapped-form dodge: a hostile upstream serves the blocked host as
+    // AAAA rdata ::ffff:127.0.0.1 hoping the v6 classifier waves it through.
+    // is_private_or_internal_v6 unwraps IPv4-mapped forms before classifying,
+    // so the record must be dropped exactly like its native-v4 twin.
+    let mock = MockUpstream::new(|name, qtype| {
+        if matches!(qtype, RecordType::AAAA) {
+            vec![
+                aaaa_record(
+                    name,
+                    "::ffff:127.0.0.1".parse().expect("mapped loopback"),
+                    300,
+                ),
+                aaaa_record(name, "2606:4700::1111".parse().expect("global v6"), 300),
+            ]
+        } else {
+            vec![a_record(name, Ipv4Addr::new(93, 184, 216, 34), 300)]
+        }
+    })
+    .await;
+
+    let mut cfg = plain_config(&mock.addr_string());
+    cfg.upstream.block_private_rdata = true;
+    let resolver = Resolver::new(cfg).await.expect("resolver init");
+
+    let out = resolver
+        .resolve("mapped.example.", "AAAA")
+        .await
+        .expect("resolve AAAA");
+    assert_eq!(
+        out.records.len(),
+        1,
+        "only the global v6 answer may survive"
+    );
+    match &out.records[0].data {
+        RecordData::Aaaa(ip) => {
+            assert_eq!(*ip, "2606:4700::1111".parse::<Ipv6Addr>().expect("v6"))
+        }
+        other => panic!("expected global AAAA, got {other:?}"),
+    }
+    assert_eq!(
+        out.private_rdata_dropped, 1,
+        "mapped-form loopback must count as dropped"
+    );
+}
+
+#[tokio::test]
 async fn resolver_never_sends_edns_client_subnet() {
     // PRIVACY (RFC 7871): the resolver must never advertise EDNS Client Subnet
     // upstream — that would leak the client's network to the upstream/CDN.
