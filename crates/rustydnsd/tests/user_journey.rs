@@ -1253,3 +1253,45 @@ async fn sighup_picks_up_policy_changes_live() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn print_config_output_is_deterministic() {
+    // DETERMINISM: --print-config must produce byte-identical output
+    // across runs. Non-deterministic serialization (e.g. HashMap key
+    // ordering leaking into TOML) would make config diffs unreliable
+    // in CI and break infrastructure-as-code pipelines.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg = tmp.path().join("rustydns.toml");
+    std::fs::write(
+        &cfg,
+        "[server]\nlisten = [\"127.0.0.1:5399\"]\nmesh_zone = \"test.\"\n\n\
+         [upstream]\nprotocol = \"plain\"\nresolvers = [\"127.0.0.1:5300\"]\n\
+         dnssec_validation = false\n\n\
+         [metrics]\nlisten = \"127.0.0.1:19153\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    async fn run_print(config: &Path) -> Vec<u8> {
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+            .arg("--config")
+            .arg(config)
+            .arg("--print-config")
+            .output()
+            .await
+            .expect("print-config run");
+        assert!(out.status.success());
+        out.stdout
+    }
+
+    use std::path::Path;
+    let run1 = run_print(&cfg).await;
+    let run2 = run_print(&cfg).await;
+    assert_eq!(
+        run1, run2,
+        "--print-config output must be deterministic across runs"
+    );
+}
