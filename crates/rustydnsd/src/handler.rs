@@ -29,7 +29,7 @@ use rustydns_resolver::Resolver;
 
 use crate::metrics::Metrics;
 use crate::query_log::{QueryLog, ServedBy};
-use crate::rate_limiter::{normalise_mapped, LimitDecision, RateLimiter};
+use crate::rate_limiter::{LimitDecision, RateLimiter, normalise_mapped};
 use crate::rewrite::{RewriteDecision, RewriteMap};
 
 use std::collections::HashMap;
@@ -2828,7 +2828,7 @@ mod tests {
         // empty the answer set and return — never spin or panic — and the
         // count must cover every record (reply goes out TC + no answers).
         for n in [1usize, 2, 7] {
-            let mut answers: Vec<Record> = (0..n as u8).map(|i| wire_a(i)).collect();
+            let mut answers: Vec<Record> = (0..n as u8).map(wire_a).collect();
             let shed = shed_beyond_cap(&mut answers, 512, |ans, _tc| Some(ans.len() * 100 + 600));
             assert_eq!(shed, n, "every record must be shed when none can fit");
             assert!(answers.is_empty());
@@ -4672,8 +4672,7 @@ mod tests {
         let mapped = handler.resolve_policy("::ffff:192.168.1.50".parse().unwrap());
         assert_eq!(mapped.zones_allowed.len(), 1, "exactly one allowed zone");
         assert_eq!(
-            mapped.zones_allowed[0],
-            "mesh.",
+            mapped.zones_allowed[0], "mesh.",
             "mapped-form source must match the native-v4 policy"
         );
 
