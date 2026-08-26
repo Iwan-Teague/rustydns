@@ -165,6 +165,27 @@ fn build_policy_map(policies: &[NodePolicy]) -> HashMap<IpAddr, CompiledPolicy> 
     policy_by_ip
 }
 
+/// Shed trailing answer records until the encoded reply fits `cap`,
+/// returning how many records were removed. The caller must already
+/// have set TC on its metadata; this helper only trims. The probe
+/// closure returns the wire size of `answers` as currently marked, or
+/// `None` if encoding failed (treated as over-cap so we keep shedding).
+///
+/// Linear shedding is deliberate: name compression makes encoded size
+/// non-monotonic in record count, so a binary search could keep a set
+/// that does not actually fit.
+fn shed_beyond_cap(
+    answers: &mut Vec<Record>,
+    cap: usize,
+    mut measure: impl FnMut(&[Record], bool) -> Option<usize>,
+) -> usize {
+    let before = answers.len();
+    while !answers.is_empty() && measure(answers, true).is_none_or(|n| n > cap) {
+        answers.pop();
+    }
+    before - answers.len()
+}
+
 impl DnsHandler {
     /// Construct a new handler with shared authority, blocklist, resolver,
     /// rate limiter, and query-log ring buffer.
@@ -365,7 +386,8 @@ impl DnsHandler {
                 Some(e) => (e.max_payload() as usize).clamp(512, MAX_EDNS_PAYLOAD as usize),
                 None => 512,
             };
-            let measure = |ans: &[Record], tc: bool, m0: Metadata| -> Option<usize> {
+            let mut scratch = Vec::with_capacity(cap * 2);
+            let mut measure = |ans: &[Record], tc: bool, m0: Metadata| -> Option<usize> {
                 let mut m = m0;
                 m.truncation = tc;
                 let b = MessageResponseBuilder::from_message_request(request);
@@ -376,19 +398,25 @@ impl DnsHandler {
                     std::iter::empty::<&Record>(),
                     std::iter::empty::<&Record>(),
                 );
-                let mut scratch = Vec::with_capacity(cap * 2);
+                // Reuse one scratch buffer across every probe encode: the
+                // shed loop below can iterate hundreds of times for one
+                // large answer, and a fresh `cap * 2` heap allocation per
+                // probe is pure waste.
+                scratch.clear();
                 let mut enc = BinEncoder::new(&mut scratch);
                 r.destructive_emit(&mut enc).ok()?;
                 Some(scratch.len())
             };
             if measure(&answers, false, metadata).is_none_or(|n| n > cap) {
                 metadata.truncation = true;
-                while !answers.is_empty()
-                    && measure(&answers, true, metadata).is_none_or(|n| n > cap)
-                {
-                    answers.pop();
-                    warn!("udp response exceeded its cap; truncated to fit (TC set)");
-                }
+                let shed = shed_beyond_cap(&mut answers, cap, |ans, tc| {
+                    measure(ans, tc, metadata)
+                });
+                // One warning per truncated reply, not one per shed record.
+                warn!(
+                    shed_records = shed,
+                    "udp response exceeded its cap; truncated to fit (TC set)"
+                );
             }
         }
 
@@ -2739,6 +2767,69 @@ mod tests {
             .expect("reply within timeout")
             .expect("udp recv");
         assert!(n <= 4096, "EDNS-clamped reply exceeded 4096: {n} bytes");
+    }
+
+    #[test]
+    fn shed_beyond_cap_trims_from_the_tail_until_fit_and_counts() {
+        use crate::handler::shed_beyond_cap;
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record};
+
+        // Synthetic probe: each record costs exactly 100 bytes, cap 512 →
+        // the largest fitting prefix holds 5 records; the remaining 75 of
+        // an 80-record answer must be shed, counted once, and the kept
+        // records must be the FIRST five (trailing pops only).
+        let wire_a = |i: u32| {
+            Record::from_rdata(
+                ProtoName::from_ascii("shed.mesh.").expect("name"),
+                300,
+                RData::A(A([10, 11, (i / 256) as u8, (i % 256) as u8].into())),
+            )
+        };
+        let mut answers: Vec<Record> = (0..80u32).map(wire_a).collect();
+        let shed = shed_beyond_cap(&mut answers, 512, |ans, _tc| Some(ans.len() * 100));
+        assert_eq!(shed, 75, "must shed everything past the 5-record prefix");
+        assert_eq!(answers.len(), 5);
+        let first_ip = answers
+            .first()
+            .and_then(|r| match r.data {
+                hickory_proto::rr::RData::A(a) => Some(a.0.to_string()),
+                _ => None,
+            })
+            .expect("A record");
+        assert_eq!(first_ip, "10.11.0.0", "kept records must be the head, not scattered");
+    }
+
+    #[test]
+    fn shed_beyond_cap_single_record_that_cannot_fit_sheds_all_and_terminates() {
+        use crate::handler::shed_beyond_cap;
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record};
+
+        let wire_a = |octet: u8| {
+            Record::from_rdata(
+                ProtoName::from_ascii("big.mesh.").expect("name"),
+                300,
+                RData::A(A([10, 12, 0, octet].into())),
+            )
+        };
+        // Degenerate case: even ONE record busts the cap. The loop must
+        // empty the answer set and return — never spin or panic — and the
+        // count must cover every record (reply goes out TC + no answers).
+        for n in [1usize, 2, 7] {
+            let mut answers: Vec<Record> =
+                (0..n as u8).map(|i| wire_a(i)).collect();
+            let shed = shed_beyond_cap(&mut answers, 512, |ans, _tc| {
+                Some(ans.len() * 100 + 600)
+            });
+            assert_eq!(shed, n, "every record must be shed when none can fit");
+            assert!(answers.is_empty());
+        }
+        // Encode failure is treated as over-cap: keep shedding to empty.
+        let mut answers: Vec<Record> = (0..3u8).map(|i| wire_a(100 + i)).collect();
+        let shed = shed_beyond_cap(&mut answers, 512, |_ans, _tc| None);
+        assert_eq!(shed, 3);
+        assert!(answers.is_empty());
     }
 
     #[tokio::test]
