@@ -377,6 +377,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gather_falls_back_to_last_good_across_consecutive_failures() {
+        // PEEK-vs-CONSUME teeth (loader-unit layer): a source that keeps
+        // failing must keep contributing its LAST GOOD content on every
+        // round. Consume-on-use semantics would drop it after the FIRST
+        // grace reload - silently resuming under-blocking exactly when
+        // operators still assume protection. The daemon's 60s SIGHUP
+        // fetch-spacing makes this untestable at the binary layer; here we
+        // drive gather directly with no spacing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_a = dir.path().join("a.hosts");
+        let file_b = dir.path().join("b.hosts");
+        std::fs::write(&file_a, "alpha-from-a.test\n").unwrap();
+        std::fs::write(&file_b, "beta-from-b.test\n").unwrap();
+
+        let cfg = rustydns_core::config::BlocklistConfig {
+            local_files: vec![file_a.clone(), file_b.clone()],
+            max_fetch_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let loader = BlocklistLoader::new(Arc::new(cfg)).expect("loader builds");
+
+        let names = |srcs: &[(String, BlocklistSource)]| -> Vec<String> {
+            srcs.iter().map(|(c, _)| c.clone()).collect()
+        };
+
+        // Round 1: both readable.
+        let (r1, failed1) = loader
+            .gather(&[file_a.clone(), file_b.clone()], &[], &[])
+            .await;
+        assert_eq!(failed1, 0);
+        let n1 = names(&r1);
+        assert!(n1.iter().any(|c| c.contains("alpha-from-a")));
+        assert!(n1.iter().any(|c| c.contains("beta-from-b")));
+
+        // Round 2+3: BOTH files now gone. Every subsequent round must
+        // still return both retained contents.
+        std::fs::remove_file(&file_a).unwrap();
+        std::fs::remove_file(&file_b).unwrap();
+        for round in 2..=3 {
+            let (rn, failedn) = loader
+                .gather(&[file_a.clone(), file_b.clone()], &[], &[])
+                .await;
+            assert_eq!(
+                failedn, 0,
+                "retained sources must not be counted as hard failures"
+            );
+            let nn = names(&rn);
+            assert!(
+                nn.iter().any(|c| c.contains("alpha-from-a")),
+                "round {round}: alpha retention lost"
+            );
+            assert!(
+                nn.iter().any(|c| c.contains("beta-from-b")),
+                "round {round}: beta retention lost (consume-on-use regression?)"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn read_local_accepts_file_under_cap() {
         let dir = std::env::temp_dir().join(format!("rustydns-bl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tempdir");

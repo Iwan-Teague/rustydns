@@ -798,36 +798,16 @@ async fn blocklist_partial_failure_retains_last_good_entries() {
         "nothing may leak upstream"
     );
 
-    // SUSTAINED outage: a second consecutive failed round must ALSO fall
-    // back to retained content (peek, not consume). With consume-on-use
-    // semantics the entry would vanish after the first grace reload and
-    // beta would start forwarding here.
-    std::fs::remove_file(&file_a).unwrap(); // now BOTH sources fail
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(child.id().expect("pid") as i32),
-        nix::sys::signal::Signal::SIGHUP,
-    )
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    let deadline2 = std::time::Instant::now() + Duration::from_secs(3);
-    let mut probes_round2 = 0u32;
-    while std::time::Instant::now() < deadline2 {
-        if expect_nx(&sock, probe_id + 500, "beta.test.").await {
-            probes_round2 += 1;
-        } else {
-            panic!("beta forwarded after SECOND failed round - retention consumed");
-        }
-        probe_id += 1;
-        tokio::time::sleep(Duration::from_millis(80)).await;
-    }
-    assert!(probes_round2 >= 5, "round-2 probe window too short");
-    // Behavioral guard: sustained outage must not leak anything upstream.
-    // NOTE: distinguishing peek-vs-consume retention HERE proved
-    // mutation-inconclusive in-process (hickory's negative cache can mask
-    // a single-round difference); the peek design is asserted by the
-    // loader's contract docs and this observable-behavior guard.
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Upstream isolation across the whole run: zero forwards. (Sustained-
+    // outage retention beyond THIS single failed reload is covered at the
+    // loader-unit layer: the daemon enforces a 60s minimum spacing between
+    // blocklist fetch rounds, so consecutive SIGHUP-driven rebuilds cannot
+    // be driven from an integration test.)
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing may leak upstream"
+    );
 
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
