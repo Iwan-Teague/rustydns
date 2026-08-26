@@ -2291,6 +2291,20 @@ async fn binary_e2e_conditional_forwarding_routes_by_zone() {
     );
     assert_eq!(hits_default.load(std::sync::atomic::Ordering::SeqCst), 2);
 
+    // Zone APEX (exact match with the zone itself) routes too.
+    let apex = resolve_a(&sock, 720, "corp.test.").await;
+    assert_eq!(apex.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(hits_route.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+    // Mixed-case subdomain routes identically. ATTRIBUTION (mutation
+    // #109): case-folding is enforced by the handler's canonical_qname
+    // BEFORE route selection - this resolver-side fold is belt-and-braces,
+    // so a regression here surfaces as handler-dependent behaviour.
+    let mixed = resolve_a(&sock, 721, "Db.Corp.Test.").await;
+    assert_eq!(mixed.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(hits_route.load(std::sync::atomic::Ordering::SeqCst), 5);
+    assert_eq!(hits_default.load(std::sync::atomic::Ordering::SeqCst), 2);
+
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
     stub_default.abort();
