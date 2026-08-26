@@ -104,7 +104,23 @@ impl ClientId {
     /// - /16 gives ~65k possible addresses per prefix, sufficient to prevent
     ///   per-device identification in all but extremely small deployments.
     pub fn anonymized(&self) -> AnonymizedClientId {
-        let anon_ip = match self.source_ip {
+        // IPv4-mapped IPv6 (`::ffff:a.b.c.d`) — what a dual-stack socket
+        // (`[::]:53`, `bindv6only=0`) reports for every IPv4 peer — is
+        // unwrapped BEFORE anonymisation, mirroring
+        // `rustydnsd::rate_limiter::normalise_mapped`. Without this, the V6
+        // branch below zeroes segments 4–7 including the embedded `ffff`
+        // block, and EVERY mapped-v4 client collapses to the identical
+        // `::/64/anon` string: per-client log correlation on dual-stack
+        // deployments becomes impossible while the limiter sees the real
+        // native address.
+        let source_ip = match self.source_ip {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(v6),
+            },
+            v4 @ IpAddr::V4(_) => v4,
+        };
+        let anon_ip = match source_ip {
             IpAddr::V4(v4) => {
                 let mut octets = v4.octets();
                 // Zero the last TWO octets → /16 prefix.
@@ -255,5 +271,30 @@ mod tests {
 
         let id6 = ClientId::from_ip("::1".parse().unwrap());
         assert!(id6.anonymized().to_string().contains("/64/anon"));
+    }
+
+    #[test]
+    fn anonymized_ipv4_mapped_v6_unwraps_to_native_v4_prefix() {
+        // A dual-stack listener reports IPv4 peers as ::ffff:a.b.c.d. The
+        // anonymiser must unwrap to the NATIVE v4 /16 form — not zero the
+        // mapped segments into the degenerate `::/64/anon` that every v4
+        // client would share, which would make per-client log correlation
+        // impossible on `[::]:53` deployments.
+        let id = ClientId::from_ip("::ffff:192.168.1.100".parse().unwrap());
+        let anon = id.anonymized().to_string();
+        assert_eq!(anon, "192.168.0.0/16/anon", "got: {anon}");
+
+        // Distinct /16s stay distinct; the last two octets never surface.
+        let other = ClientId::from_ip("::ffff:10.20.30.40".parse().unwrap())
+            .anonymized()
+            .to_string();
+        assert_eq!(other, "10.20.0.0/16/anon", "got: {other}");
+        assert_ne!(anon, other);
+
+        // Genuine IPv6 (not mapped) keeps the /64 treatment.
+        let real_v6 = ClientId::from_ip("2001:db8:0:1:dead:beef:1234:5678".parse().unwrap())
+            .anonymized()
+            .to_string();
+        assert_eq!(real_v6, "2001:db8:0:1::/64/anon", "got: {real_v6}");
     }
 }
