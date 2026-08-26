@@ -588,15 +588,22 @@ impl DnsHandler {
     /// ANY (qtype 255) queries are REFUSED: an ANY answer can be arbitrarily
     /// large (every record the zone holds), making the resolver an
     /// amplification vector, and RFC 8482 documents refusal as the compliant
-    /// minimal-answer posture. Nothing here serves zone transfers by any
-    /// other name.
+    /// minimal-answer posture. AXFR/IXFR (qtypes 252/251) join them: zone
+    /// transfer is an AUTHORITATIVE-server opcode (RFC 5936 / RFC 1995) — we
+    /// are a recursive resolver with nothing to transfer, so forwarding the
+    /// qtype upstream only invites a hostile peer to stream an unbounded dump
+    /// through us. Nothing here serves zone transfers by any other name.
     fn gate_any_qtype(&self, ctx: &QueryCtx<'_>) -> Option<Reply> {
-        if ctx.qtype == RecordType::ANY {
-            self.metrics.inc_policy_refused_any();
-            Some(Reply::reject(ResponseCode::Refused))
-        } else {
-            None
+        if matches!(
+            ctx.qtype,
+            RecordType::ANY | RecordType::AXFR | RecordType::IXFR
+        ) {
+            if ctx.qtype == RecordType::ANY {
+                self.metrics.inc_policy_refused_any();
+            }
+            return Some(Reply::reject(ResponseCode::Refused));
         }
+        None
     }
 
     /// Scheduled block window (TODO 8.5): if the client is inside an active
@@ -2627,6 +2634,37 @@ mod tests {
         assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
         assert!(resp.answers.is_empty(), "ANY must never carry answers");
         assert!(!resp.metadata.authoritative);
+    }
+
+    #[tokio::test]
+    async fn zone_transfer_qtypes_are_refused_against_amplification() {
+        // AXFR/IXFR are authoritative-server opcodes (RFC 5936/1995). A
+        // recursive resolver has nothing to transfer: forwarding the qtype
+        // upstream would only relay whatever a hostile peer streams back.
+        // Both must be REFUSED at the same pre-pipeline gate as ANY —
+        // the unreachable upstream proves no fall-through happened.
+        let harness = build_harness(
+            vec![static_a("router.mesh", "100.64.0.5")],
+            "",
+            vec!["https://127.0.0.1:1/dns-query".to_string()],
+            BlockResponse::Nxdomain,
+        )
+        .await;
+        for (label, qtype) in [
+            ("AXFR", ProtoRecordType::AXFR),
+            ("IXFR", ProtoRecordType::IXFR),
+        ] {
+            let resp = query(harness.port, "zone.example.org.", qtype).await;
+            assert_eq!(
+                resp.metadata.response_code,
+                ResponseCode::Refused,
+                "{label} must be refused, not forwarded"
+            );
+            assert!(resp.answers.is_empty(), "{label} must never carry answers");
+        }
+        // Metric scoping is structural: inc_policy_refused_any fires only
+        // in the qtype == ANY branch of gate_any_qtype, so AXFR/IXFR
+        // refusals cannot inflate rustydns_policy_refused_any_total.
     }
 
     #[tokio::test]
