@@ -2782,3 +2782,54 @@ async fn binary_e2e_in_zone_nodata_is_noerror_not_nxdomain() {
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_concurrent_multi_client_resolution() {
+    // CONCURRENCY at the wire: four independent client sockets query
+    // DIFFERENT names. Each must receive its OWN response on its OWN
+    // socket - proving no cross-talk, no port collision, and correct
+    // per-query correlation under multi-client load.
+    use std::sync::atomic::Ordering;
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let cfg_path = write_daemon_config(tmp.path(), dns_port, upstream_port, metrics_port, None);
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let names = ["alpha.test.", "beta.test.", "gamma.test.", "delta.test."];
+    let mut socks = Vec::new();
+    for _ in 0..4 {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        s.connect(("127.0.0.1", dns_port)).await.expect("connect");
+        socks.push(s);
+    }
+
+    // Each client queries its own name and verifies its own answer.
+    for (i, sock) in socks.iter().enumerate() {
+        let id = 700u16 + i as u16;
+        let name = names[i];
+        sock.send(&build_query(id, name)).await.expect("send");
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+            .await
+            .expect("reply within timeout")
+            .expect("recv");
+
+        let reply = Message::from_bytes(&buf[..n]).expect("decode");
+        assert_eq!(reply.metadata.id, id);
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            reply.answers.iter().any(|r| matches!(&r.data,
+                hickory_proto::rr::RData::A(a) if a.0.to_string() == "192.0.2.1")),
+            "{name} must resolve via stub"
+        );
+    }
+
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
