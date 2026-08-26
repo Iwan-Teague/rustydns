@@ -453,4 +453,29 @@ mod tests {
             LimitDecision::Refuse
         );
     }
+    #[test]
+    fn exhausted_client_does_not_affect_other_clients() {
+        // ISOLATION: one client exhausting its token budget must not affect
+        // any other client's ability to resolve.
+        let rl = RateLimiter::new(&rustydns_core::config::RateLimitConfig {
+            enabled: true,
+            qps: 1,
+            burst: 2,
+            max_tracked_clients: 100,
+        });
+
+        let ip_a: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+
+        assert!(rl.check(ip_a) == LimitDecision::Allow);
+        assert!(rl.check(ip_a) == LimitDecision::Allow);
+        assert!(
+            rl.check(ip_a) != LimitDecision::Allow,
+            "A must be refused after burst"
+        );
+        assert!(
+            rl.check(ip_b) == LimitDecision::Allow,
+            "B must be unaffected by A's exhaustion"
+        );
+    }
 }
