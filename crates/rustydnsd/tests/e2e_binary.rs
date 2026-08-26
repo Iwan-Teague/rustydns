@@ -508,7 +508,10 @@ async fn binary_e2e_operator_endpoints_health_metrics_queries() {
     let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
-    let client = reqwest::Client::builder().build().unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     let base = format!("http://127.0.0.1:{metrics_port}");
 
     // /health: ready after listeners bound; no-store caching.
@@ -709,7 +712,10 @@ async fn binary_e2e_doh_post_resolves_over_http_seam() {
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     // RFC 8484 POST: application/dns-message body -> same back.
-    let client = reqwest::Client::builder().build().unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     let resp = client
         .post(format!("http://127.0.0.1:{doh_port}/dns-query"))
         .header("content-type", "application/dns-message")
@@ -770,7 +776,10 @@ async fn binary_e2e_doh_get_resolves_via_base64url_param() {
     let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
-    let client = reqwest::Client::builder().build().unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     let encoded = URL_SAFE_NO_PAD.encode(build_query(12, "get.test."));
     let resp = client
         .get(format!(
@@ -1687,7 +1696,10 @@ async fn binary_e2e_doh_wrong_content_type_is_415() {
     let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
-    let client = reqwest::Client::builder().build().unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     for ct in ["text/plain", "application/json", ""] {
         let mut req = client
             .post(format!("http://127.0.0.1:{doh_port}/dns-query"))
