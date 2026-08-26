@@ -562,7 +562,14 @@ fn init_tracing() {
             filter = filter.add_directive(d);
         }
     }
-    for crate_name in ["hickory_server", "hickory_proto", "hickory_resolver"] {
+    // hickory-net 0.26 (transports moved here in the 0.26 split) logs the
+    // FULL ENCODED QUERY at debug level ("final message") - clamp it too.
+    for crate_name in [
+        "hickory_server",
+        "hickory_proto",
+        "hickory_resolver",
+        "hickory_net",
+    ] {
         if !hickory_clamp_overridden(&targets, crate_name) {
             filter = filter.add_directive(format!("{crate_name}=warn").parse().unwrap());
         }
@@ -1932,9 +1939,16 @@ mod tests {
         // BARE-LEVEL directive (RUST_LOG=debug, no `target=` form): the
         // directive text lands in the targets list as the literal "debug",
         // which matches no hickory crate name - so the clamp MUST stay
-        // engaged for all three. Pins that a plain level bump cannot
-        // silently unclamp hickory's qname-bearing internals.
-        for crate_name in ["hickory_server", "hickory_proto", "hickory_resolver"] {
+        // engaged for all four. Pins that a plain level bump cannot
+        // silently unclamp hickory's qname-bearing internals. hickory-net
+        // 0.26 (transports moved here in the 0.26 split) logs the FULL
+        // ENCODED QUERY at debug level ("final message") - clamp it too.
+        for crate_name in [
+            "hickory_server",
+            "hickory_proto",
+            "hickory_resolver",
+            "hickory_net",
+        ] {
             assert!(
                 !hickory_clamp_overridden(&["debug".to_string()], crate_name),
                 "bare RUST_LOG=debug must not stand down the clamp for {crate_name}"
