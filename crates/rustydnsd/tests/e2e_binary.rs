@@ -2604,3 +2604,84 @@ async fn binary_e2e_longest_prefix_route_wins_regardless_of_declaration_order() 
     stub_broad.abort();
     stub_narrow.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_authority_static_record_served_with_aa_flag() {
+    // AUTHORITY path at the wire: a [[authority.static_records]] entry
+    // must be served with the AA flag set and bypass both the blocklist
+    // AND the resolver entirely (pipeline order: Authority first).
+    // Pins that the authority arm works through the real binary, not
+    // just handler unit tests.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"lab.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.lab.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub, hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Query the static record: AA flag set, correct A answer.
+    sock.send(&build_query(90, "router.lab."))
+        .await
+        .expect("send");
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("reply")
+        .expect("recv");
+    let reply = Message::from_bytes(&buf[..n]).expect("decode");
+    assert_eq!(reply.metadata.id, 90);
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        reply.metadata.authoritative,
+        "static record must be served with AA flag"
+    );
+    assert_eq!(reply.answers.len(), 1);
+    match &reply.answers[0].data {
+        hickory_proto::rr::RData::A(ip) => {
+            assert_eq!(
+                ip.0.to_string(),
+                "10.0.0.1",
+                "must serve the configured address"
+            );
+        }
+        other => panic!("expected A record, got {other:?}"),
+    }
+
+    // The authority answered WITHOUT consulting the upstream.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
