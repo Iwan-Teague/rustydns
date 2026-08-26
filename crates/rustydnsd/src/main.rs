@@ -763,6 +763,7 @@ impl ActiveListeners {
     fn start_metrics(&mut self, cfg: &rustydns_core::config::DnsConfig) -> Result<()> {
         let addr = metrics_listen_addr(&cfg.metrics)?;
         let path = normalize_metrics_path(&cfg.metrics.path);
+        validate_metrics_path(&path)?;
         self.install_metrics(addr, path)
     }
 
@@ -999,6 +1000,10 @@ impl ActiveListeners {
             }
         };
         let new_path = normalize_metrics_path(&cfg.metrics.path);
+        if let Err(e) = validate_metrics_path(&new_path) {
+            warn!(error = %e, "SIGHUP: metrics.path invalid; metrics listener unchanged");
+            return;
+        }
         if Some(new_addr) == self.live_metrics && new_path == self.live_metrics_path {
             return;
         }
@@ -1412,6 +1417,21 @@ fn normalize_metrics_path(path: &str) -> String {
     }
 }
 
+/// Reject a configured metrics path that collides with the metrics
+/// server's fixed routes. `/health` and `/queries` are always registered;
+/// axum's `Router::route` PANICS on a duplicate route — inside the spawned
+/// server task that means the metrics listener silently dies. Fail fast at
+/// startup / SIGHUP instead of crashing the listener at serve time.
+fn validate_metrics_path(path: &str) -> Result<()> {
+    const RESERVED: [&str; 2] = ["/health", "/queries"];
+    if RESERVED.contains(&path) {
+        anyhow::bail!(
+            "metrics.path `{path}` is reserved by the daemon's own endpoints ({RESERVED:?}); pick another path"
+        );
+    }
+    Ok(())
+}
+
 /// Drop every Linux capability from every set after the daemon has
 /// finished binding privileged ports.
 ///
@@ -1679,6 +1699,31 @@ mod tests {
         assert_eq!(normalize_metrics_path("foo"), "/foo");
         assert_eq!(normalize_metrics_path("/foo"), "/foo");
         assert_eq!(normalize_metrics_path("  /foo  "), "/foo");
+    }
+
+    #[test]
+    fn metrics_path_colliding_with_fixed_routes_is_rejected() {
+        // `/health` and `/queries` are always registered on the metrics
+        // router; a configured duplicate makes axum's Router::route panic
+        // inside the spawned server task, silently killing the listener.
+        // Validation must reject both verbatim and padded spellings.
+        for bad in ["/health", "/queries", " /health ", "  /queries"] {
+            let normalized = normalize_metrics_path(bad);
+            let err = validate_metrics_path(&normalized)
+                .expect_err("reserved path must be rejected");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("reserved"), "msg = {msg}");
+        }
+        // Non-colliding paths (including near-misses) pass untouched.
+        for good in [
+            "/metrics",
+            "/mymetrics",
+            "/healthy",
+            "/querylog",
+            "/health/",
+        ] {
+            validate_metrics_path(good).expect("non-reserved path must be accepted");
+        }
     }
 
     // ---- check_config_permissions ------------------------------------------
