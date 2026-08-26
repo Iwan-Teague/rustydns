@@ -2094,11 +2094,6 @@ async fn spawn_poisoning_stub(
     std_sock.set_nonblocking(true).expect("nonblocking");
     let sock = tokio::net::UdpSocket::from_std(std_sock).expect("stub into tokio");
 
-    // evil.other.test. IN A 6.6.6.6 - explicit labels (no compression),
-    // so the answer name differs from any echoed question.
-    const EVIL_NAME: &[u8] = &[
-        4, b'e', b'v', b'i', b'l', 5, b'o', b't', b'h', b'e', b'r', 4, b't', b'e', b's', b't', 0,
-    ];
     // victim CNAME -> evil.other.test. Answer name is compression pointer
     // @12 (the echoed question); RDLEN covers "evil.other.test." (17 bytes).
     const CNAME_ANSWER: &[u8] = &[
