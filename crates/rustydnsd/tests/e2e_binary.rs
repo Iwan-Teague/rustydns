@@ -2459,3 +2459,66 @@ async fn binary_e2e_sinkhole_mode_serves_operator_ip_for_blocked_domains() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_safesearch_rewrites_google_over_udp() {
+    // SAFESEARCH enforcement at the wire: a real client query for
+    // google.com must be answered with a CNAME to
+    // forcesafesearch.google.com — the rewrite pipeline runs BEFORE the
+    // resolver, so the stub never sees google.com itself. The control
+    // domain (example.org) passes through untouched and fails closed
+    // against the unreachable resolver.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"test.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [safesearch]\n\
+         enabled = true\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // google.com → CNAME forcesafesearch.google.com.
+    let reply = resolve_a(&sock, 500, "google.com.").await;
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        reply.answers.iter().any(|r| matches!(&r.data,
+        hickory_proto::rr::RData::CNAME(t) if t.to_string() == "forcesafesearch.google.com.")),
+        "google.com must produce a forcesafesearch CNAME: {:?}",
+        reply.answers
+    );
+
+    // Non-search collateral: example.org is NOT rewritten; it goes to
+    // the stub upstream as a normal query.
+    let ok = resolve_a(&sock, 501, "example.org.").await;
+    assert_eq!(ok.metadata.response_code, ResponseCode::NoError);
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
