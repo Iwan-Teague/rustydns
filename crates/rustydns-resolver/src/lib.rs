@@ -1346,6 +1346,68 @@ mod tests {
     }
 
     #[test]
+    fn bailiwick_filter_reverse_order_chain_grows_pass_by_pass_and_drops_decoys() {
+        // The chain is listed TAIL-FIRST, so each fixpoint pass can extend the
+        // allowed set by exactly one link (the pass-1 scan meets only the
+        // qname-owned CNAME before it reaches any link it could unlock). This
+        // pins that repeated passes converge regardless of answer ordering and
+        // that every case/dot-variant hop is folded onto one key. Both decoys
+        // — a reverse-pointing CNAME and an A under its owner — sit on
+        // out-of-bailiwick names and MUST be dropped.
+        let mut records = vec![
+            DnsRecord::new(
+                "end.example.org.",
+                RecordData::A(Ipv4Addr::new(203, 0, 113, 9)),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "d.example.org.",
+                RecordData::Cname("END.Example.ORG.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "c.example.org.",
+                RecordData::Cname("D.EXAMPLE.org.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "b.example.org",
+                RecordData::Cname("c.EXAMPLE.ORG".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "start.example.com.",
+                RecordData::Cname("B.example.org.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "evil.test.",
+                RecordData::Cname("start.example.com.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "evil.test.",
+                RecordData::A(Ipv4Addr::new(6, 6, 6, 6)),
+                Duration::from_secs(300),
+            ),
+        ];
+        let dropped = filter_out_of_bailiwick(&mut records, "start.example.com.");
+        assert_eq!(dropped, 2, "both evil.test decoys must be dropped");
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "end.example.org.",
+                "d.example.org.",
+                "c.example.org.",
+                "b.example.org.",
+                "start.example.com."
+            ],
+            "whole forward chain survives tail-first ordering; decoys go"
+        );
+    }
+
+    #[test]
     fn bailiwick_filter_case_variant_chain_kept_and_reverse_links_rejected() {
         // The fixpoint must match owner/target names case-insensitively and
         // trailing-dot-tolerantly (the pre-computed key path), follow links
