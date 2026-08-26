@@ -2833,3 +2833,108 @@ async fn binary_e2e_concurrent_multi_client_resolution() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn binary_e2e_multiple_static_records_and_nodata() {
+    // AUTHORITY serving: multiple static records for different names,
+    // plus NODATA for an in-zone name without any record.
+    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\
+         mesh_zone = \"mesh.\"\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [blocklist]\n\n\
+         [[authority.static_records]]\n\
+         name = \"router.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.1\"\n\
+         ttl = 300\n\n\
+         [[authority.static_records]]\n\
+         name = \"backup.mesh.\"\n\
+         type = \"A\"\n\
+         address = \"10.0.0.2\"\n\
+         ttl = 300\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
+
+    let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    async fn ask(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> Message {
+        sock.send(&build_query(id, name)).await.expect("send");
+        for _ in 0..12 {
+            let mut buf = vec![0u8; 4096];
+            match tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await {
+                Err(_) => continue,
+                Ok(Err(_)) => continue,
+                Ok(Ok((n, _))) => {
+                    if let Ok(m) = Message::from_bytes(&buf[..n])
+                        && m.metadata.id == id
+                    {
+                        return m;
+                    }
+                }
+            }
+        }
+        panic!("no reply for {name}");
+    }
+
+    // Both static records served authoritatively.
+    let router = ask(&sock, 90, "router.mesh.").await;
+    assert_eq!(router.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        router
+            .answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                hickory_proto::rr::RData::A(ip) => Some(ip.0.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["10.0.0.1"],
+        "router.mesh must serve its configured A record"
+    );
+
+    let backup = ask(&sock, 91, "backup.mesh.").await;
+    assert_eq!(backup.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        backup
+            .answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                hickory_proto::rr::RData::A(ip) => Some(ip.0.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["10.0.0.2"],
+        "backup.mesh must serve its configured A record"
+    );
+
+    // In-zone ghost: NODATA (NoError + empty), never NXDOMAIN.
+    let ghost = ask(&sock, 92, "ghost.mesh.").await;
+    assert_eq!(ghost.metadata.response_code, ResponseCode::NoError);
+    assert!(ghost.answers.is_empty(), "ghost must be NODATA");
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+}
