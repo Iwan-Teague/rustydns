@@ -693,7 +693,7 @@ fn parse_upstream_url(url: &str, protocol: UpstreamProtocol) -> ResolverResult<P
             None => {
                 return Err(RustyDnsError::Config(format!(
                     "upstream `{url}` has unexpected characters after `]` (expected `:port`)"
-                )))
+                )));
             }
         };
         (host, port)
@@ -1053,13 +1053,26 @@ fn qtype_name(qtype: RecordType) -> &'static str {
 
 pub(crate) fn filter_out_of_bailiwick(records: &mut Vec<DnsRecord>, qname: &str) -> u32 {
     let canonical = |n: &str| n.trim_end_matches('.').to_ascii_lowercase();
+    // Canonicalise every owner/target exactly ONCE, up front. The reachability
+    // fixpoint below re-scans the whole answer once per chain hop, so doing the
+    // lowercasing inside the loop turned a hostile N-record reply with a D-hop
+    // chain into O(D·N) heap allocations on the query hot path. With the keys
+    // pre-computed the passes do only hash lookups; total allocation is O(N).
+    let owners: Vec<String> = records.iter().map(|r| canonical(&r.name)).collect();
+    let targets: Vec<String> = records
+        .iter()
+        .map(|r| match &r.data {
+            RecordData::Cname(target) => canonical(target),
+            _ => String::new(),
+        })
+        .collect();
     let mut allowed: std::collections::HashSet<String> = [canonical(qname)].into();
     loop {
         let mut grew = false;
-        for r in records.iter() {
-            if let RecordData::Cname(target) = &r.data
-                && allowed.contains(&canonical(&r.name))
-                && allowed.insert(canonical(target))
+        for (i, r) in records.iter().enumerate() {
+            if matches!(&r.data, RecordData::Cname(_))
+                && allowed.contains(&owners[i])
+                && allowed.insert(targets[i].clone())
             {
                 grew = true;
             }
@@ -1068,8 +1081,15 @@ pub(crate) fn filter_out_of_bailiwick(records: &mut Vec<DnsRecord>, qname: &str)
             break;
         }
     }
-    let before = records.len();
-    records.retain(|r| allowed.contains(&canonical(&r.name)));
+    // Final retain consults the pre-computed owners too — one more pass of
+    // lookups instead of N fresh lowercased allocations.
+    let mut idx = 0usize;
+    records.retain(|_| {
+        let keep = allowed.contains(&owners[idx]);
+        idx += 1;
+        keep
+    });
+    let before = owners.len();
     let dropped = (before - records.len()) as u32;
     if dropped > 0 {
         tracing::warn!(
@@ -1326,6 +1346,56 @@ mod tests {
     }
 
     #[test]
+    fn bailiwick_filter_case_variant_chain_kept_and_reverse_links_rejected() {
+        // The fixpoint must match owner/target names case-insensitively and
+        // trailing-dot-tolerantly (the pre-computed key path), follow links
+        // only FORWARD from the qname (a decoy pointing back at the qname
+        // must not smuggle its own owner into the allowed set), and keep
+        // non-CNAME records whose owner sits on a reached link.
+        let mut records = vec![
+            DnsRecord::new(
+                "www.example.com.",
+                RecordData::Cname("CDN.Example.ORG.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "cdn.example.org",
+                RecordData::Cname("origin.example.net.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "ORIGIN.example.NET.",
+                RecordData::A(Ipv4Addr::new(203, 0, 113, 70)),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "unrelated.test.",
+                RecordData::Cname("www.example.com.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "unrelated.test.",
+                RecordData::A(Ipv4Addr::new(6, 6, 6, 6)),
+                Duration::from_secs(300),
+            ),
+        ];
+        let dropped = filter_out_of_bailiwick(&mut records, "WWW.Example.COM");
+        assert_eq!(dropped, 2, "both unrelated.test records must be counted");
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        // DnsRecord::new normalises owners, so survivors come back canonical;
+        // the point is WHICH records survived, not their surface casing.
+        assert_eq!(
+            names,
+            [
+                "www.example.com.",
+                "cdn.example.org.",
+                "origin.example.net."
+            ],
+            "forward chain survives across case/dot variants; reverse-link decoys go"
+        );
+    }
+
+    #[test]
     fn zone_no_match_for_unrelated() {
         assert!(!zone_matches("example.com.", "lan."));
         assert!(!zone_matches("notlan.", "lan."));
@@ -1568,11 +1638,8 @@ mod tests {
     fn parse_upstream_url_ipv6_literal_defaults_port() {
         // A bracketed IPv6 literal without `:port` must fall back to the
         // scheme's default port, exactly like a bare v4 host does.
-        let p = parse_upstream_url(
-            "https://[2606:4700::1111]/dns-query",
-            UpstreamProtocol::Doh,
-        )
-        .unwrap();
+        let p = parse_upstream_url("https://[2606:4700::1111]/dns-query", UpstreamProtocol::Doh)
+            .unwrap();
         assert_eq!(p.host, "2606:4700::1111");
         assert_eq!(p.port, 443);
 
