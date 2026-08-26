@@ -1022,3 +1022,84 @@ async fn world_readable_config_is_rejected_with_actionable_error() {
         "error must suggest the fix: {combined}"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn minimal_viable_config_validates_and_serves() {
+    // PLUG-AND-PLAY floor: the absolute minimum TOML that starts a
+    // functional daemon. Every omitted section falls back to documented
+    // defaults — no hidden requirements, no silent "you also need..."
+    // surprises. Pins the boundary between "zero config" and "must
+    // configure" so future default changes that break this are caught.
+    //
+    // Minimum: server.listen (bind address) + one plain resolver (offline
+    // stub). Everything else defaults.
+    let (dns_port, upstream_port, metrics_port) = (reserve_port(), reserve_port(), reserve_port());
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cfg_path = tmp.path().join("rustydns.toml");
+    let config = format!(
+        "[server]\n\
+         listen = [\"127.0.0.1:{dns_port}\"]\n\n\
+         [upstream]\n\
+         protocol = \"plain\"\n\
+         resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
+         dnssec_validation = false\n\n\
+         [metrics]\n\
+         listen = \"127.0.0.1:{metrics_port}\"\n"
+    );
+    std::fs::write(&cfg_path, &config).expect("write config");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rustydnsd");
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "daemon not ready on minimal config");
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client bind");
+    sock.connect(("127.0.0.1", dns_port))
+        .await
+        .expect("connect");
+
+    // Minimal config serves queries normally: NoError + stub answer.
+    for (id, name) in [(600u16, "minimal.test."), (601, "anything.clean.")] {
+        sock.send(&build_query(id, name)).await.expect("send");
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await {
+            Err(_) => panic!("no reply for {name}"),
+            Ok(Err(e)) => panic!("recv error: {e}"),
+            Ok(Ok((n, _))) => {
+                let m = Message::from_bytes(&buf[..n]).expect("decode");
+                assert_eq!(m.metadata.id, id);
+                assert_eq!(m.metadata.response_code, ResponseCode::NoError, "{name}");
+                assert!(!m.answers.is_empty(), "{name} must have answers");
+            }
+        }
+    }
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
