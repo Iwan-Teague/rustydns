@@ -978,3 +978,47 @@ async fn docker_config_journey_resolves_over_doh() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn world_readable_config_is_rejected_with_actionable_error() {
+    // PRIVACY invariant (AGENTS.md): config files carry upstream
+    // credentials; a world-readable file must be refused with an error
+    // that says so and tells the operator the fix. Binary-level pin:
+    // unit tests cover the function; this covers the spawned-process
+    // contract end-to-end.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg = tmp.path().join("rustydns.toml");
+    std::fs::write(
+        &cfg,
+        "[server]\nlisten = [\"127.0.0.1:5399\"]\nmesh_zone = \"test.\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--validate-config")
+        .output()
+        .await
+        .expect("run");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "world-readable config must exit 1"
+    );
+    let combined = String::from_utf8_lossy(&out.stdout).to_string()
+        + "\n"
+        + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        combined.contains("world-readable"),
+        "error must name the world-readability: {combined}"
+    );
+    assert!(
+        combined.contains("chmod"),
+        "error must suggest the fix: {combined}"
+    );
+}
