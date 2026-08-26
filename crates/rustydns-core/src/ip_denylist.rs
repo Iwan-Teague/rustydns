@@ -46,7 +46,20 @@ impl IpDenylist {
     }
 
     /// Returns `true` if `ip` falls inside any configured range.
+    ///
+    /// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are unwrapped before
+    /// matching, so an upstream cannot dodge a v4 range by answering with the
+    /// mapped form as AAAA rdata — the same pivot `is_private_or_internal_v6`
+    /// closes for the rebinding defence. A mapped address is classified by the
+    /// IPv4 predicate only; configure v4 ranges to catch it.
     pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(v6),
+            },
+            v4 => v4,
+        };
         match ip {
             IpAddr::V4(v4) => {
                 let bits = u32::from(v4);
@@ -212,5 +225,23 @@ mod tests {
     fn non_numeric_prefix_rejected() {
         let err = IpDenylist::parse(&["1.2.3.0/foo".to_string()]).unwrap_err();
         assert!(err.contains("invalid prefix"), "{err}");
+    }
+
+    #[test]
+    fn ipv4_mapped_v6_form_matches_v4_ranges() {
+        // A hostile upstream can dodge a v4 denylist by answering with the
+        // IPv4-mapped form (`::ffff:a.b.c.d`) as AAAA rdata — the address
+        // family tag alone must not decide which rule set is consulted.
+        let d = list(&["10.0.0.0/8", "5.6.7.8"]);
+        assert!(d.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(d.contains("::ffff:5.6.7.8".parse().unwrap()));
+        // Distinct v4 outside the range stays out, even in mapped form.
+        assert!(!d.contains("::ffff:11.0.0.1".parse().unwrap()));
+        // Genuine (non-mapped) v6 is untouched by v4 rules.
+        assert!(!d.contains("2001:db8::1".parse().unwrap()));
+        // v6 rules still match genuine v6 in the same list.
+        let d6 = list(&["fc00::/7"]);
+        assert!(d6.contains("fd12::1".parse().unwrap()));
+        assert!(!d6.contains("::ffff:10.1.2.3".parse().unwrap()));
     }
 }
