@@ -323,8 +323,8 @@ impl BlocklistEngine {
         self.is_blocked_for_group(domain, None)
     }
 
-    /// Returns `true` if `domain` is blocked for a client in `group` (TODO
-    /// 8.6). `None`, or an unknown group name, falls back to the global
+    /// Returns `true` if `domain` is blocked for a client in `group`.
+    /// `None`, or an unknown group name, falls back to the global
     /// blocklist. Lock-free; the group lookup is a single `HashMap` get.
     #[inline]
     pub fn is_blocked_for_group(&self, domain: &str, group: Option<&str>) -> bool {
