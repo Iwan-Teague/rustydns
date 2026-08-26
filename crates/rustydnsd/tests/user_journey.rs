@@ -813,3 +813,168 @@ async fn blocklist_partial_failure_retains_last_good_entries() {
     let _ = child.wait().await;
     stub.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn docker_config_journey_resolves_over_doh() {
+    // JOURNEY 4: the shipped CONTAINER config must work at runtime, not
+    // merely parse. Substitutions are limited to ports (CI is unprivileged
+    // and collision-free), upstream endpoints (offline stub), and the
+    // DNSSEC knob the stub cannot satisfy. Everything else travels
+    // verbatim: wildcard binds, fail-closed, TLS 1.3 floor,
+    // block_response field, loopback-only metrics.
+
+    let tpl_path = repo_root().join("rustydns.docker.toml");
+    let tpl = std::fs::read_to_string(&tpl_path).expect("shipped rustydns.docker.toml");
+
+    // Drift guards on security-posture anchors.
+    for anchor in [
+        "listen = [\"0.0.0.0:53\"]",
+        "doh_listen = \"0.0.0.0:8053\"",
+        "block_response = \"nxdomain\"",
+        "fail_closed = true",
+        "min_tls_version = \"1.3\"",
+        "dnssec_validation = true",
+        "listen = \"127.0.0.1:9153\"",
+        "protocol = \"doh\"",
+    ] {
+        assert!(
+            tpl.contains(anchor),
+            "docker template drifted: missing {anchor}"
+        );
+    }
+    assert!(
+        !tpl.contains("response_code"),
+        "legacy typo must stay banned"
+    );
+
+    let (dns_port, doh_port, upstream_port, metrics_port) = (
+        reserve_port(),
+        reserve_port(),
+        reserve_port(),
+        reserve_port(),
+    );
+    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+
+    let served = tpl
+        .replace(
+            "listen = [\"0.0.0.0:53\"]",
+            &format!("listen = [\"0.0.0.0:{dns_port}\"]"),
+        )
+        .replace(
+            "doh_listen = \"0.0.0.0:8053\"",
+            &format!("doh_listen = \"0.0.0.0:{doh_port}\""),
+        )
+        .replace(
+            "listen = \"127.0.0.1:9153\"",
+            &format!("listen = \"127.0.0.1:{metrics_port}\""),
+        )
+        .replace("protocol = \"doh\"", "protocol = \"plain\"")
+        .replace("dnssec_validation = true", "dnssec_validation = false");
+
+    // Swap BOTH real DoH resolver URLs for the offline stub (bare
+    // host:port form required by protocol=plain).
+    let start = served.find("resolvers = [").expect("resolvers array");
+    let end = served[start..].find(']').expect("array close") + start;
+    let served = format!(
+        "{}resolvers = [\"127.0.0.1:{upstream_port}\"]{}",
+        &served[..start],
+        &served[end + 1..]
+    );
+
+    // Post-substitution posture checks.
+    assert!(served.contains("block_response = \"nxdomain\""));
+    assert!(served.contains("fail_closed = true"));
+    assert!(
+        served.contains(&format!("resolvers = [\"127.0.0.1:{upstream_port}\"]")),
+        "stub resolver substitution missing"
+    );
+    for provider in ["quad9", "cloudflare-dns"] {
+        assert!(
+            !served.contains(provider),
+            "real upstream {provider} must be fully replaced"
+        );
+    }
+    assert!(!served.contains("response_code"));
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg_path = tmp.path().join("rustydns.toml");
+    std::fs::write(&cfg_path, &served).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rustydnsd"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn rustydnsd");
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", dns_port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "daemon not ready on docker-template config");
+
+    // UDP resolution through the shipped container config.
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.connect(("127.0.0.1", dns_port)).await.unwrap();
+
+    async fn expect_resolved(sock: &tokio::net::UdpSocket, id: u16, name: &str) -> Message {
+        sock.send(&build_query(id, name)).await.expect("send");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let mut buf = vec![0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+                Err(_) => continue,
+                Ok(Err(_)) => continue,
+                Ok(Ok((n, _))) => {
+                    if let Ok(m) = Message::from_bytes(&buf[..n])
+                        && m.metadata.id == id
+                    {
+                        return m;
+                    }
+                }
+            }
+        }
+        panic!("no reply within 10s for {name}");
+    }
+
+    let r = expect_resolved(&sock, 400, "www.example.com.").await;
+    assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+    assert!(r.answers.iter().any(|a| matches!(&a.data,
+        hickory_proto::rr::RData::A(ip) if ip.0.to_string() == "192.0.2.1")));
+
+    // DoH POST through the SAME process (template ships doh_listen).
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://127.0.0.1:{doh_port}/dns-query"))
+        .header("content-type", "application/dns-message")
+        .body(build_query(401, "via-doh.example.com."))
+        .send()
+        .await
+        .expect("DoH POST");
+    assert_eq!(resp.status(), 200);
+    let wire = resp.bytes().await.expect("body");
+    let reply = Message::from_bytes(&wire).expect("decode");
+    assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+    assert!(reply.answers.iter().any(|a| matches!(&a.data,
+        hickory_proto::rr::RData::A(ip) if ip.0.to_string() == "192.0.2.1")));
+
+    child.kill().await.expect("kill daemon");
+    let _ = child.wait().await;
+    stub.abort();
+}
