@@ -1655,7 +1655,63 @@ fn normalize_metrics_path(path: &str) -> anyhow::Result<String> {
              another path (the metrics listener always serves /health and /queries)"
         );
     }
+    // axum routes through matchit, where `{...}` is a parameter capture
+    // and `{*...}` a tail wildcard. A configured path carrying those
+    // characters would register a capture-all route — widening the reach
+    // of the UNAUTHENTICATED metrics endpoint to arbitrary paths — or be
+    // rejected by matchit at insert time, panicking inside the spawned
+    // server task and silently killing the listener. Reject up front.
+    if normalised.contains('{') || normalised.contains('}') || normalised.contains('*') {
+        anyhow::bail!(
+            "metrics.path `{path}` contains router metacharacters (`{{`, `}}`, `*`) that axum/matchit would interpret as parameter or wildcard captures; use a plain literal path"
+        );
+    }
+    // RFC 3986 §3.3 dot-segments. Our router matches the RAW configured
+    // bytes, but clients and intermediaries (browsers, reverse proxies,
+    // gateways) normalise `.` / `..` segments before forwarding — so a
+    // path like `/./health` serves metrics at this address while looking
+    // like `/health` to every hop in front of the daemon. That mismatch
+    // is an easy way to park the unauthenticated metrics endpoint on a
+    // path that monitoring and ACLs believe is the health check. Reject
+    // rather than silently rewriting operator config. Percent-encoded
+    // spellings count too: most clients percent-decode `%2e` BEFORE path
+    // normalisation, so `/%2e/health` normalises to `/health` on the way
+    // in even though this daemon routes it as a distinct literal.
+    if normalised.split('/').any(is_dot_segment) {
+        anyhow::bail!(
+            "metrics.path `{path}` contains RFC 3986 dot-segments (`.` or `..`, including percent-encoded %2e spellings) that clients and proxies may normalise onto a different route than this daemon serves; use a plain literal path"
+        );
+    }
     Ok(normalised)
+}
+
+/// Is this path segment a dot-segment — literally (`.` / `..`) or via a
+/// minimal percent-decoding of the only byte that matters here (`%2e`,
+/// case-insensitive)? A conservative decoder: invalid or non-`%2e` escapes
+/// are left verbatim, so `/%2etrics` stays a legal literal segment.
+fn is_dot_segment(seg: &str) -> bool {
+    if seg == "." || seg == ".." {
+        return true;
+    }
+    let bytes = seg.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 3 <= bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+            let lo = (bytes[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+            decoded.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    decoded.as_slice() == b"." || decoded.as_slice() == b".."
 }
 
 /// Drop every Linux capability from every set after the daemon has
@@ -2049,6 +2105,59 @@ mod tests {
         }
         // Sanity: non-reserved paths still pass.
         assert!(normalize_metrics_path("/mymetrics").is_ok());
+    }
+
+    #[test]
+    fn metrics_path_router_metacharacters_are_rejected() {
+        // axum/matchit treat `{...}` as a parameter capture and `{*...}`
+        // as a tail wildcard. A configured metrics.path carrying them
+        // would either register a capture-all route for the UNAUTHENTICATED
+        // metrics endpoint or panic at insert inside the spawned server
+        // task. Both spellings must be rejected with a metacharacter error.
+        for bad in [
+            "/{p}",       // single-segment capture-all
+            "/{*rest}",   // tail wildcard
+            "/met{rics}", // embedded brace, still matchit syntax
+            "/*",         // bare star rejected conservatively
+        ] {
+            let err = normalize_metrics_path(bad).expect_err("metacharacter path must be rejected");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("metacharacters"), "msg = {msg}");
+        }
+    }
+
+    #[test]
+    fn metrics_path_dot_segments_are_rejected() {
+        // RFC 3986 §3.3 dot-segments split the address space: this daemon's
+        // router matches raw configured bytes, while browsers and reverse
+        // proxies normalise `.`/`..` before forwarding — so `/./health`
+        // would park the UNAUTHENTICATED metrics endpoint on a path every
+        // intermediary treats as the health route. Every dot-segment
+        // spelling must be rejected with a dot-segment error, including
+        // after whitespace trim (the operator may write " ./health ").
+        for bad in [
+            "./health",     // no leading slash: normalize prepends one
+            "/./health",    // the /health shadow
+            "/health/.",    // trailing dot-segment
+            "/../metrics",  // parent escape
+            "/a/./b",       // embedded mid-path
+            "/././metrics", // repeated
+            // Percent-encoded spellings decode to `.` in browsers/proxies
+            // before normalisation — same shadow, sneakier bytes.
+            "/%2e/health",     // %2e == "."
+            "/%2E%2E/metrics", // uppercase hex == ".."
+            "/x/.%2e/queries", // mixed literal + encoded == ".."
+        ] {
+            let err = normalize_metrics_path(bad).expect_err("dot-segment path must be rejected");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("dot-segments"), "msg = {msg}");
+        }
+        // Dot-free paths that merely CONTAIN dots inside labels stay legal —
+        // including escapes that are NOT `%2e` (the decoder must not
+        // over-reject: `2r` is not a hex pair, so it stays verbatim).
+        for good in ["/metrics", "/m.etrics", "/v1.2/metrics", "/%2etrics"] {
+            normalize_metrics_path(good).expect("dot-in-label path must be accepted");
+        }
     }
 
     // ---- check_config_permissions ------------------------------------------
