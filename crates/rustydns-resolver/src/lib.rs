@@ -536,7 +536,14 @@ pub const MIN_POSITIVE_CACHE_TTL_SECS: u64 = 2;
 /// Mirror of the cache floor: an upstream cannot wedge an entry in the
 /// cache forever by advertising absurd TTLs — entries are clamped down to
 /// this ceiling so stale answers age out within a bounded window.
-const MAX_POSITIVE_CACHE_TTL_SECS: u64 = 86400;
+///
+/// Also shared with `rustydnsd`'s answer path, which clamps the TTL it
+/// puts on CLIENT-facing records to the same window: hickory's
+/// `positive_max_ttl` bounds only our own cache retention, not the wire
+/// TTL handed downstream, so an unclamped reply would let a hostile
+/// upstream pin a poisoned answer in every stub cache (browser, OS) for
+/// the advertised duration — far outliving any operator-side fix.
+pub const MAX_POSITIVE_CACHE_TTL_SECS: u64 = 86400;
 
 fn build_resolver_opts(config: &DnsConfig, protocol: UpstreamProtocol) -> ResolverOpts {
     let mut opts = ResolverOpts::default();
@@ -708,18 +715,38 @@ fn parse_upstream_url(url: &str, protocol: UpstreamProtocol) -> ResolverResult<P
         )));
     }
 
-    let (host, port) = if let Some(idx) = host_port.rfind(':') {
-        // Avoid matching colons inside an IPv6 literal `[::1]:443`.
-        let after_bracket = host_port.starts_with('[') && host_port.contains(']');
-        if after_bracket {
-            let close = host_port.find(']').unwrap();
-            let host = host_port[1..close].to_string();
-            let port_part = host_port.get(close + 2..).unwrap_or("");
-            let port = port_part
+    let (host, port) = if let Some(inner) = host_port.strip_prefix('[') {
+        // RFC 3986 IP-literal form: `[<ipv6>][:port]`. Everything up to
+        // the closing `]` is the literal; after it only `:port` or
+        // nothing (scheme default) is legal. Anything else is a config
+        // error — never a silently shifted port.
+        let Some(close) = inner.find(']') else {
+            return Err(RustyDnsError::Config(format!(
+                "upstream `{url}` has an unterminated `[` IPv6 literal (missing `]`)"
+            )));
+        };
+        let host = inner[..close].to_string();
+        if host.parse::<std::net::IpAddr>().is_err() {
+            return Err(RustyDnsError::Config(format!(
+                "upstream `{url}` has an invalid or empty IP literal `[{host}]`"
+            )));
+        }
+        let after = &inner[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => p
                 .parse::<u16>()
-                .map_err(|_| RustyDnsError::Config(format!("upstream `{url}` has invalid port")))?;
-            (host, port)
-        } else if host_port[idx + 1..].chars().all(|c| c.is_ascii_digit()) {
+                .map_err(|_| RustyDnsError::Config(format!("upstream `{url}` has invalid port")))?,
+            None if after.is_empty() => default_port(&scheme, protocol),
+            None => {
+                return Err(RustyDnsError::Config(format!(
+                    "upstream `{url}` has unexpected characters after `]` (expected `:port`)"
+                )));
+            }
+        };
+        (host, port)
+    } else if let Some(idx) = host_port.rfind(':') {
+        // Bare host (or v4): a trailing all-digit segment is the port.
+        if host_port[idx + 1..].chars().all(|c| c.is_ascii_digit()) {
             let port = host_port[idx + 1..]
                 .parse::<u16>()
                 .map_err(|_| RustyDnsError::Config(format!("upstream `{url}` has invalid port")))?;
@@ -1086,13 +1113,26 @@ fn qtype_name(qtype: RecordType) -> &'static str {
 
 pub(crate) fn filter_out_of_bailiwick(records: &mut Vec<DnsRecord>, qname: &str) -> u32 {
     let canonical = |n: &str| n.trim_end_matches('.').to_ascii_lowercase();
+    // Canonicalise every owner/target exactly ONCE, up front. The reachability
+    // fixpoint below re-scans the whole answer once per chain hop, so doing the
+    // lowercasing inside the loop turned a hostile N-record reply with a D-hop
+    // chain into O(D·N) heap allocations on the query hot path. With the keys
+    // pre-computed the passes do only hash lookups; total allocation is O(N).
+    let owners: Vec<String> = records.iter().map(|r| canonical(&r.name)).collect();
+    let targets: Vec<String> = records
+        .iter()
+        .map(|r| match &r.data {
+            RecordData::Cname(target) => canonical(target),
+            _ => String::new(),
+        })
+        .collect();
     let mut allowed: std::collections::HashSet<String> = [canonical(qname)].into();
     loop {
         let mut grew = false;
-        for r in records.iter() {
-            if let RecordData::Cname(target) = &r.data
-                && allowed.contains(&canonical(&r.name))
-                && allowed.insert(canonical(target))
+        for (i, r) in records.iter().enumerate() {
+            if matches!(&r.data, RecordData::Cname(_))
+                && allowed.contains(&owners[i])
+                && allowed.insert(targets[i].clone())
             {
                 grew = true;
             }
@@ -1101,8 +1141,15 @@ pub(crate) fn filter_out_of_bailiwick(records: &mut Vec<DnsRecord>, qname: &str)
             break;
         }
     }
-    let before = records.len();
-    records.retain(|r| allowed.contains(&canonical(&r.name)));
+    // Final retain consults the pre-computed owners too — one more pass of
+    // lookups instead of N fresh lowercased allocations.
+    let mut idx = 0usize;
+    records.retain(|_| {
+        let keep = allowed.contains(&owners[idx]);
+        idx += 1;
+        keep
+    });
+    let before = owners.len();
     let dropped = (before - records.len()) as u32;
     if dropped > 0 {
         tracing::warn!(
@@ -1353,6 +1400,7 @@ mod tests {
         assert!(build_resolver_opts(&cfg, UpstreamProtocol::Plain).case_randomization);
         assert!(!build_resolver_opts(&cfg, UpstreamProtocol::Doh).case_randomization);
         assert!(!build_resolver_opts(&cfg, UpstreamProtocol::Doq).case_randomization);
+        assert!(!build_resolver_opts(&cfg, UpstreamProtocol::Odoh).case_randomization);
     }
 
     #[test]
@@ -1462,6 +1510,118 @@ mod tests {
                 .iter()
                 .all(|r| r.name.to_ascii_lowercase().ends_with("victim.example.org.")),
             "only chain members may survive: {records:?}"
+        );
+    }
+
+    #[test]
+    fn bailiwick_filter_reverse_order_chain_grows_pass_by_pass_and_drops_decoys() {
+        // The chain is listed TAIL-FIRST, so each fixpoint pass can extend the
+        // allowed set by exactly one link (the pass-1 scan meets only the
+        // qname-owned CNAME before it reaches any link it could unlock). This
+        // pins that repeated passes converge regardless of answer ordering and
+        // that every case/dot-variant hop is folded onto one key. Both decoys
+        // — a reverse-pointing CNAME and an A under its owner — sit on
+        // out-of-bailiwick names and MUST be dropped.
+        let mut records = vec![
+            DnsRecord::new(
+                "end.example.org.",
+                RecordData::A(Ipv4Addr::new(203, 0, 113, 9)),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "d.example.org.",
+                RecordData::Cname("END.Example.ORG.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "c.example.org.",
+                RecordData::Cname("D.EXAMPLE.org.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "b.example.org",
+                RecordData::Cname("c.EXAMPLE.ORG".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "start.example.com.",
+                RecordData::Cname("B.example.org.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "evil.test.",
+                RecordData::Cname("start.example.com.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "evil.test.",
+                RecordData::A(Ipv4Addr::new(6, 6, 6, 6)),
+                Duration::from_secs(300),
+            ),
+        ];
+        let dropped = filter_out_of_bailiwick(&mut records, "start.example.com.");
+        assert_eq!(dropped, 2, "both evil.test decoys must be dropped");
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "end.example.org.",
+                "d.example.org.",
+                "c.example.org.",
+                "b.example.org.",
+                "start.example.com."
+            ],
+            "whole forward chain survives tail-first ordering; decoys go"
+        );
+    }
+
+    #[test]
+    fn bailiwick_filter_case_variant_chain_kept_and_reverse_links_rejected() {
+        // The fixpoint must match owner/target names case-insensitively and
+        // trailing-dot-tolerantly (the pre-computed key path), follow links
+        // only FORWARD from the qname (a decoy pointing back at the qname
+        // must not smuggle its own owner into the allowed set), and keep
+        // non-CNAME records whose owner sits on a reached link.
+        let mut records = vec![
+            DnsRecord::new(
+                "www.example.com.",
+                RecordData::Cname("CDN.Example.ORG.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "cdn.example.org",
+                RecordData::Cname("origin.example.net.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "ORIGIN.example.NET.",
+                RecordData::A(Ipv4Addr::new(203, 0, 113, 70)),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "unrelated.test.",
+                RecordData::Cname("www.example.com.".into()),
+                Duration::from_secs(300),
+            ),
+            DnsRecord::new(
+                "unrelated.test.",
+                RecordData::A(Ipv4Addr::new(6, 6, 6, 6)),
+                Duration::from_secs(300),
+            ),
+        ];
+        let dropped = filter_out_of_bailiwick(&mut records, "WWW.Example.COM");
+        assert_eq!(dropped, 2, "both unrelated.test records must be counted");
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        // DnsRecord::new normalises owners, so survivors come back canonical;
+        // the point is WHICH records survived, not their surface casing.
+        assert_eq!(
+            names,
+            [
+                "www.example.com.",
+                "cdn.example.org.",
+                "origin.example.net."
+            ],
+            "forward chain survives across case/dot variants; reverse-link decoys go"
         );
     }
 
@@ -1740,6 +1900,35 @@ mod tests {
         .unwrap();
         assert_eq!(p.host, "2606:4700::1111");
         assert_eq!(p.port, 443);
+    }
+
+    #[test]
+    fn parse_upstream_url_ipv6_literal_defaults_port() {
+        // A bracketed IPv6 literal without `:port` must fall back to the
+        // scheme's default port, exactly like a bare v4 host does.
+        let p = parse_upstream_url("https://[2606:4700::1111]/dns-query", UpstreamProtocol::Doh)
+            .unwrap();
+        assert_eq!(p.host, "2606:4700::1111");
+        assert_eq!(p.port, 443);
+
+        let p = parse_upstream_url("[2001:db8::1]", UpstreamProtocol::Plain).unwrap();
+        assert_eq!(p.host, "2001:db8::1");
+        assert_eq!(p.port, 53);
+    }
+
+    #[test]
+    fn parse_upstream_url_rejects_malformed_ipv6_literals() {
+        // `[::1]9153` used to parse as host `::1` port **153** (the
+        // port window was shifted one byte past `]`), silently pointing
+        // the upstream at the wrong port. Unterminated literals used to
+        // yield nonsense hosts like `[::`. Both are config errors now.
+        for bad in ["[::1]9153", "[::1:x]", "https://[2606:4700::1"] {
+            let err = parse_upstream_url(bad, UpstreamProtocol::Plain).unwrap_err();
+            match err {
+                RustyDnsError::Config(msg) => assert!(!msg.is_empty(), "{bad}"),
+                other => panic!("expected Config for {bad}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

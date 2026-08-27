@@ -3758,7 +3758,7 @@ async fn binary_e2e_deny_unknown_fields_with_omitted_sections() {
     // OMITTING an entire section must still produce correct serde defaults.
     // A regression that breaks default deserialization for absent sections
     // would make every minimal config fail to start.
-    let (dns_port, upstream_port, metrics_port) = pick_ports();
+    let (dns_port, upstream_port, _metrics_port) = pick_ports();
     let tmp = tempfile::TempDir::new().expect("tempdir");
 
     // Only [server] and [upstream] — no [blocklist], [metrics],
@@ -3780,7 +3780,7 @@ async fn binary_e2e_deny_unknown_fields_with_omitted_sections() {
             .expect("chmod config");
     }
 
-    let (stub, _hits) = spawn_stub_udp_dns(upstream_port).await;
+    let (stub, _hits, _caps) = spawn_stub_udp_dns(upstream_port).await;
     let mut child = spawn_and_wait_ready(&cfg_path, dns_port).await;
 
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
