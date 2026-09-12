@@ -8,6 +8,33 @@ This project does not yet follow semantic versioning — every change up to
 
 ## Unreleased
 
+### Breaking changes
+
+- **DoT/DoQ servers now require TLS 1.3.** Both server-side TLS configs
+  are pinned to `TLS13` only (`with_protocol_versions(&[&TLS13])`); a
+  TLS-1.2-only client's ClientHello is answered with a
+  `protocol_version` alert instead of a handshake. TLS-1.2-only DoT
+  clients — e.g. old Android Private DNS ("Android 7/8") — are refused.
+  There is no downgrade knob by design: keeping 1.2 enabled only serves
+  downgrade-and-strip middleboxes. The `ring` `CryptoProvider` is now
+  passed explicitly (`builder_with_provider`) so the config no longer
+  depends on the implicit process-default provider.
+- **A non-loopback `doh_listen` without TLS material is refused at
+  startup AND at config validation.** The DoH listener serves PLAINTEXT
+  HTTP/2 (TLS is a reverse proxy's job), so binding it to a public
+  interface with no `server.tls_cert_path`/`server.tls_key_path`
+  configured would publish an open, unencrypted DNS resolver. The gate
+  lives in both the daemon (`ensure_doh_bind_allowed`, fatal at bind)
+  and `validate_config`, so `--validate-config` (systemd
+  `ExecStartPre`, compose pre-upgrade) fails on the same configs the
+  daemon would die on — previously a bad `doh_listen = "0.0.0.0:8053"`
+  validated clean and then crash-looped under
+  `restart: unless-stopped` on upgrade. IPv4-mapped spellings
+  (`[::ffff:203.0.113.7]`) are canonicalised before the loopback
+  decision. Note the cert/key paths only *permit* a non-loopback bind;
+  they never make the DoH port itself TLS — keep it behind an
+  operator-provided TLS-terminating reverse proxy.
+
 ### Daemon (`rustydnsd`)
 
 - **Per-source-IP rate limiting** (`[rate_limit]`). Default-on token

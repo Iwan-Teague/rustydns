@@ -21,7 +21,9 @@
 # -----------------------------------------------------------------------------
 # Stage 1: builder
 # -----------------------------------------------------------------------------
-FROM rust:1.88-bookworm AS builder
+# Digest-pinned (A16): `rust:1.88-bookworm`, multi-arch manifest list,
+# resolved from Docker Hub 2026-09-12. Re-resolve on toolchain bumps.
+FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 
 WORKDIR /build
 
@@ -47,7 +49,9 @@ RUN cargo build --release --bin rustydnsd \
 # -----------------------------------------------------------------------------
 # Stage 2: runtime
 # -----------------------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+# Digest-pinned (A16): `debian:bookworm-slim`, multi-arch manifest
+# list, resolved from Docker Hub 2026-09-12. Re-resolve on base bumps.
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 
 # Minimal runtime: the binary only needs glibc + libcap utilities
 # (for the in-process capability dropping). ca-certificates is NOT
@@ -82,6 +86,12 @@ CMD ["--config", "/etc/rustydns/rustydns.toml"]
 # here — it's loopback-only by design (the daemon refuses to bind it
 # off-loopback). If you need metrics out-of-container, terminate
 # scraping at a sidecar that connects to `localhost:9153`.
+# 8053 (DoH) is loopback-only inside the container by default: the
+# daemon refuses a non-loopback bind without TLS configured, and even
+# with TLS material configured the DoH port itself serves PLAINTEXT
+# HTTP/2 (the cert/key only permit the bind; TLS is a reverse proxy's
+# job). EXPOSE merely documents the port — publish nothing on 8053
+# without an operator-provided TLS-terminating reverse proxy in front.
 EXPOSE 53/udp 53/tcp 853 8053
 
 # debian:bookworm-slim deliberately ships no wget/curl, so the probe uses

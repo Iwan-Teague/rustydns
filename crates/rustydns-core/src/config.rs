@@ -2065,6 +2065,36 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     // DoT (TCP) and DoQ (UDP) on the same address remain explicitly ALLOWED:
     // different transports, legitimate common :853 deployment shape.
 
+    // DoH bind gate (parity with the daemon's `ensure_doh_bind_allowed`).
+    // The DoH listener speaks PLAINTEXT HTTP/2 — TLS is expected to be
+    // terminated by a reverse proxy in front of it. A non-loopback bind
+    // without any TLS material configured (`tls_cert_path` + `tls_key_path`,
+    // the only evidence a deployment terminates TLS at all) would publish an
+    // open, unencrypted DNS resolver, so it is refused HERE as well as in the
+    // daemon: `--validate-config` (systemd `ExecStartPre`, compose
+    // pre-upgrade checks) must fail on the same configs the daemon would die
+    // on at startup, or a bad `doh_listen` crash-loops on upgrade. NOTE the
+    // cert/key paths only PERMIT the bind — the DoH port itself stays
+    // plaintext HTTP/2 behind an operator-provided TLS reverse proxy.
+    if let Some(doh) = cfg.server.doh_listen.as_ref().and_then(parse_addr) {
+        let tls_configured =
+            cfg.server.tls_cert_path.is_some() && cfg.server.tls_key_path.is_some();
+        // Canonicalise IPv4-mapped V6 forms first (same `norm_ip` rule as the
+        // overlap checks above, mirroring `MetricsConfig::effective_listen`)
+        // so `[::ffff:203.0.113.7]` is judged by the public address it really
+        // is, not by its `::ffff:` spelling.
+        if !tls_configured && !norm_ip(doh.ip()).is_loopback() {
+            return Err(crate::RustyDnsError::Config(format!(
+                "server.doh_listen `{doh}` is not a loopback address and no TLS cert/key \
+                 is configured; refusing to serve plaintext DNS-over-HTTPS on a public \
+                 interface. Bind DoH to 127.0.0.1 behind a TLS-terminating reverse proxy. \
+                 server.tls_cert_path + server.tls_key_path only PERMIT a non-loopback \
+                 bind — they do not add TLS to the DoH port itself, which stays \
+                 plaintext HTTP/2 behind an operator-provided reverse proxy."
+            )));
+        }
+    }
+
     // DoT requires cert + key
     if (cfg.server.dot_listen.is_some() || cfg.server.doq_listen.is_some())
         && (cfg.server.tls_cert_path.is_none() || cfg.server.tls_key_path.is_none())
@@ -2871,6 +2901,71 @@ mod tests {
         let mut cfg = baseline();
         cfg.server.doq_listen = Some("0.0.0.0:853".to_string());
         assert_config_err(validate_config(&cfg), "tls_cert_path");
+    }
+
+    #[test]
+    fn doh_listen_public_without_tls_rejected() {
+        // DoH bind gate (validate_config side, F1 parity): the DoH listener
+        // serves PLAINTEXT HTTP/2; a public bind with no TLS material
+        // configured must fail --validate-config BEFORE the daemon dies at
+        // startup and crash-loops under ExecStartPre / compose restart.
+        let mut cfg = baseline();
+        cfg.server.doh_listen = Some("192.0.2.10:8053".to_string());
+        assert_config_err(validate_config(&cfg), "doh_listen");
+        assert_config_err(validate_config(&cfg), "not a loopback");
+        assert_config_err(validate_config(&cfg), "refusing to serve plaintext");
+    }
+
+    #[test]
+    fn doh_listen_wildcard_v4_without_tls_rejected() {
+        // 0.0.0.0 binds every interface — the least loopback an address can
+        // be. The loopback check must classify the unspecified address as
+        // non-loopback and refuse the bind.
+        let mut cfg = baseline();
+        cfg.server.doh_listen = Some("0.0.0.0:8053".to_string());
+        assert_config_err(validate_config(&cfg), "not a loopback");
+    }
+
+    #[test]
+    fn doh_listen_wildcard_v6_without_tls_rejected() {
+        // [::] binds dual-stack (v6 + v4-mapped) — equally public, equally
+        // refused.
+        let mut cfg = baseline();
+        cfg.server.doh_listen = Some("[::]:8053".to_string());
+        assert_config_err(validate_config(&cfg), "not a loopback");
+    }
+
+    #[test]
+    fn doh_listen_mapped_v6_public_without_tls_rejected() {
+        // IPv4-mapped spellings of a public address are refused too — same
+        // canonicalisation rule as MetricsConfig::effective_listen.
+        let mut cfg = baseline();
+        cfg.server.doh_listen = Some("[::ffff:203.0.113.7]:8053".to_string());
+        assert_config_err(validate_config(&cfg), "not a loopback");
+    }
+
+    #[test]
+    fn doh_listen_loopback_without_tls_accepted() {
+        // Loopback binds (native v4, native v6, mapped form) never need TLS
+        // and must validate clean — the default config is one of these.
+        for addr in ["127.0.0.1:8053", "[::1]:8053", "[::ffff:127.0.0.1]:8053"] {
+            let mut cfg = baseline();
+            cfg.server.doh_listen = Some(addr.to_string());
+            validate_config(&cfg)
+                .unwrap_or_else(|e| panic!("{addr} is loopback and must validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn doh_listen_public_with_tls_configured_accepted() {
+        // A non-loopback bind WITH both cert+key configured passes
+        // validation (the daemon still warns at runtime: the DoH port
+        // stays plaintext — the operator must front it with a TLS proxy).
+        let mut cfg = baseline();
+        cfg.server.doh_listen = Some("0.0.0.0:8053".to_string());
+        cfg.server.tls_cert_path = Some("/certs/cert.pem".into());
+        cfg.server.tls_key_path = Some("/certs/key.pem".into());
+        validate_config(&cfg).expect("non-loopback DoH with TLS material validates");
     }
 
     #[test]

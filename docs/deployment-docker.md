@@ -20,7 +20,10 @@ docker compose up -d
 ```
 
 Then point a client at the host on port 53 (UDP/TCP), 853 TCP (DoT),
-853 UDP (DoQ — opt-in, see compose port comment), or 8053 TCP (DoH).
+853 UDP (DoQ — opt-in, see compose port comment). **DoH (8053) is not
+published**: the listener binds `127.0.0.1` inside the container and
+serves PLAINTEXT HTTP/2 — expose it only through the TLS-terminating
+reverse-proxy pattern below.
 DoT and DoQ share a port number but use different transport protocols (TCP vs UDP)
 and therefore different sockets — they can both be enabled simultaneously.
 
@@ -98,7 +101,7 @@ The compose file publishes:
 | 53 | 53 | TCP | Plain DNS (fallback / TC=1) |
 | 853 | 853 | TCP | DNS-over-TLS |
 | 853 | 853 | UDP | DNS-over-QUIC (RFC 9250) — opt-in; uncomment the mapping when `doq_listen` is set |
-| 8053 | 8053 | TCP | DNS-over-HTTPS |
+| — | 8053 | TCP | **Not published.** DoH binds `127.0.0.1` in-container and serves PLAINTEXT HTTP/2 (the daemon refuses a non-loopback bind without TLS configured — and cert/key config only *permits* the bind, it never makes DoH itself TLS). Expose via the reverse-proxy pattern below |
 
 **The metrics endpoint (`:9153`) is intentionally not published.** It
 serves `/metrics`, `/health`, and `/queries`, and rustydnsd refuses to
@@ -119,6 +122,30 @@ sidecar in the **same network namespace** so it can reach
 
 …and have nginx proxy `:9090` → `127.0.0.1:9153/metrics` with whatever
 authentication you want on top.
+
+The **same netns trick is the only supported way to expose DoH**. The
+daemon's DoH listener serves PLAINTEXT HTTP/2 on `127.0.0.1:8053` and is
+refused on any non-loopback bind without TLS material configured
+(`server.tls_cert_path` + `server.tls_key_path`); even with those set, the
+cert/key only *permit* the bind — **the DoH port itself never speaks TLS**.
+TLS must be terminated by an operator-provided reverse proxy that shares
+the daemon's network namespace:
+
+```yaml
+  doh-proxy:
+    image: nginx:alpine
+    network_mode: "service:rustydnsd"   # share rustydnsd's netns
+    ports:
+      - "443:443"                        # publish ONLY the proxy's HTTPS port
+    volumes:
+      - ./nginx-doh-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+```
+
+…with nginx proxying `:443` (TLS) → `127.0.0.1:8053` (HTTP/2 upstream).
+Because `ports:` on a `network_mode: "service:…"` container applies to the
+shared namespace, declaring the HTTPS publish on the proxy service is what
+puts it on the wire — nothing for 8053 is ever published from `rustydnsd`
+itself.
 
 ## Verify it's working
 
