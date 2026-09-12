@@ -858,7 +858,10 @@ async fn docker_config_journey_resolves_over_doh() {
     // Drift guards on security-posture anchors.
     for anchor in [
         "listen = [\"0.0.0.0:53\"]",
-        "doh_listen = \"0.0.0.0:8053\"",
+        // DoH binds loopback INSIDE the container: the listener speaks
+        // plaintext HTTP/2 and the daemon refuses a non-loopback bind
+        // without TLS configured (fail-closed startup gate).
+        "doh_listen = \"127.0.0.1:8053\"",
         "block_response = \"nxdomain\"",
         "fail_closed = true",
         "min_tls_version = \"1.3\"",
@@ -890,8 +893,8 @@ async fn docker_config_journey_resolves_over_doh() {
             &format!("listen = [\"0.0.0.0:{dns_port}\"]"),
         )
         .replace(
-            "doh_listen = \"0.0.0.0:8053\"",
-            &format!("doh_listen = \"0.0.0.0:{doh_port}\""),
+            "doh_listen = \"127.0.0.1:8053\"",
+            &format!("doh_listen = \"127.0.0.1:{doh_port}\""),
         )
         .replace(
             "listen = \"127.0.0.1:9153\"",
@@ -1206,6 +1209,24 @@ async fn sighup_picks_up_policy_changes_live() {
         panic!("no reply for {name}");
     }
 
+    // SIGHUP application latency is load-dependent (the daemon reloads
+    // async), so poll for the expected code instead of sleeping a fixed
+    // interval — under a parallel cargo test run a 600ms sleep flakes while
+    // the reload contract still holds.
+    async fn eventually(sock: &tokio::net::UdpSocket, id: u16, name: &str, expected: ResponseCode) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let code = ask(sock, id, name).await;
+            if code == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "policy reload did not converge within 10s: expected {expected:?} for {name}, last saw {code:?}"
+            );
+        }
+    }
+
     // Pre-policy: external domain resolves.
     assert_eq!(
         ask(&sock, 500, "before-restriction.example.").await,
@@ -1224,14 +1245,9 @@ async fn sighup_picks_up_policy_changes_live() {
         nix::sys::signal::Signal::SIGHUP,
     )
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
 
     // Post-policy: external query refused.
-    assert_eq!(
-        ask(&sock, 501, "external.example.org.").await,
-        ResponseCode::Refused,
-        "post-policy external queries must be REFUSED"
-    );
+    eventually(&sock, 501, "external.example.org.", ResponseCode::Refused).await;
 
     // Restore open config and SIGHUP again.
     std::fs::write(&cfg_path, &open_config).unwrap();
@@ -1240,14 +1256,9 @@ async fn sighup_picks_up_policy_changes_live() {
         nix::sys::signal::Signal::SIGHUP,
     )
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
 
     // Access restored.
-    assert_eq!(
-        ask(&sock, 502, "restored.example.org.").await,
-        ResponseCode::NoError,
-        "removing the policy must restore normal resolution"
-    );
+    eventually(&sock, 502, "restored.example.org.", ResponseCode::NoError).await;
 
     child.kill().await.expect("kill daemon");
     let _ = child.wait().await;

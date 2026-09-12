@@ -33,9 +33,16 @@ Expected response times:
 
 - **Acknowledgement**: within 72 hours.
 - **Initial assessment** (severity, scope): within 7 days.
-- **Patch release**: depends on severity. Critical issues affecting
-  the resolver, authority, or blocklist pipeline aim for a patch
-  within 14 days of confirmation.
+- **Patch release** (measured from confirmation, per severity):
+
+  | Severity | Patch release target |
+  |----------|----------------------|
+  | Critical | 48 hours |
+  | High     | 7 days |
+  | Medium   | 30 days |
+
+  Lower severities are best-effort and ride the normal release
+  train.
 
 If you don't hear back within 72 hours, please escalate by emailing
 again with a subject prefix `[BUMP]` — the original mail may have

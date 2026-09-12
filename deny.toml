@@ -17,11 +17,24 @@ version = 2
 # Pull from the official RustSec advisory DB.
 db-path = "$CARGO_HOME/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
+# Deny-by-default: every advisory class is checked across the whole
+# graph and fails CI unless a crate is explicitly ignored below with a
+# rationale and a removal trigger. (cargo-deny >= 0.20: the
+# `vulnerability` key was removed — vulns are always errors — and
+# unmaintained/unsound take a *scope*; their diagnostics are errors.)
+unmaintained = "all"
+unsound = "all"
 # Yanked crates aren't an immediate vulnerability but they shouldn't
 # end up in a release either — fail CI so we notice before shipping.
 yanked = "deny"
 # Ignored advisories carry a rationale and a removal trigger.
-ignore = []
+ignore = [
+    # chacha20 0.10.0 in Cargo.lock is yanked upstream; it enters the
+    # graph via rand 0.10.1 ← hickory-net 0.26.1. Cargo.lock updates
+    # are handled outside deny.toml — run `cargo update -p chacha20`
+    # once hickory publishes a compatible refresh, then REMOVE this.
+    { crate = "chacha20", reason = "yanked 0.10.0 via rand/hickory; bump lock with cargo update -p chacha20" },
+]
 
 # ---------------------------------------------------------------------------
 # Bans
@@ -29,7 +42,7 @@ ignore = []
 [bans]
 # AGENTS.md forbids the openssl C bindings ("rustls backend only, no
 # openssl") and the old unmaintained trust-dns crate family.
-multiple-versions = "warn"  # log duplicates without failing CI
+multiple-versions = "deny"  # duplicates must be skip-listed below with a reason
 wildcards = "deny"          # `foo = "*"` deps are forbidden
 # Workspace-internal path deps don't carry version constraints; that's
 # correct usage (cargo resolves them via the path) but cargo-deny
@@ -48,9 +61,40 @@ deny = [
     { name = "trust-dns-client" },
 ]
 
-# Any duplicate that appears in future will
-# trip the `multiple-versions = "warn"` lint above.
-skip = []
+# Real duplicates in the current graph (verified with cargo-deny
+# 0.20.2, 2026-09-12). Each is a genuine version skew from upstream
+# ecosystems we don't control — mostly the rand/digest 0.9→0.10
+# migration window and the old-vs-new Windows target stacks. They fail
+# the `multiple-versions = "deny"` lint unless skipped here; prune
+# entries as upstream collapses the duplicates.
+skip = [
+    { crate = "block-buffer", reason = "rand 0.9 vs 0.10 dependency windows" },
+    { crate = "chacha20", reason = "rand 0.9 vs 0.10 dependency windows" },
+    { crate = "core-foundation", reason = "macOS target stack skew (io/8.x)" },
+    { crate = "cpufeatures", reason = "digest 0.10 internal skew" },
+    { crate = "crypto-common", reason = "rand 0.9 vs 0.10 dependency windows" },
+    { crate = "digest", reason = "digest 0.10 point releases via sha2/chacha20" },
+    { crate = "getrandom", reason = "getrandom 0.2 vs 0.3 migration (ring/rand/wasm)" },
+    { crate = "jni", reason = "Android target stack skew (getrandom/wasm)" },
+    { crate = "jni-sys", reason = "Android target stack skew (getrandom/wasm)" },
+    { crate = "r-efi", reason = "UEFI target stack skew (getrandom)" },
+    { crate = "rand", reason = "rand 0.9 vs 0.10 migration (hickory)" },
+    { crate = "rand_core", reason = "rand 0.9 vs 0.10 migration (hickory)" },
+    { crate = "sha2", reason = "digest point releases via rand/hickory" },
+    { crate = "thiserror", reason = "thiserror 1.x vs 2.x migration (transitive)" },
+    { crate = "thiserror-impl", reason = "thiserror 1.x vs 2.x migration (transitive)" },
+    { crate = "windows-sys", reason = "windows-sys 0.52/0.59/0.61 via multiple stacks" },
+    { crate = "windows-targets", reason = "old vs new Windows target stacks" },
+    { crate = "windows_aarch64_gnullvm", reason = "old vs new Windows target stacks" },
+    { crate = "windows_aarch64_msvc", reason = "old vs new Windows target stacks" },
+    { crate = "windows_i686_gnu", reason = "old vs new Windows target stacks" },
+    { crate = "windows_i686_gnullvm", reason = "old vs new Windows target stacks" },
+    { crate = "windows_i686_msvc", reason = "old vs new Windows target stacks" },
+    { crate = "windows_x86_64_gnu", reason = "old vs new Windows target stacks" },
+    { crate = "windows_x86_64_gnullvm", reason = "old vs new Windows target stacks" },
+    { crate = "windows_x86_64_msvc", reason = "old vs new Windows target stacks" },
+    { crate = "wit-bindgen", reason = "wasi target stack skew (getrandom 0.3)" },
+]
 
 # ---------------------------------------------------------------------------
 # Licenses

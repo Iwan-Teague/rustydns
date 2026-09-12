@@ -34,10 +34,24 @@ services:
     container_name: rustydnsd
     restart: unless-stopped
 
-    # Bind the DNS ports. UDP+TCP/53 for plain DNS, TCP/853 for DoT,
-    # TCP/8053 for DoH. DoQ (DNS-over-QUIC) is UDP/853 — uncomment the
-    # mapping below if you set `doq_listen` in rustydns.toml. The
-    # /metrics + /health + /queries endpoint on :9153 is intentionally
+    # Bind the DNS ports. UDP+TCP/53 for plain DNS, TCP/853 for DoT.
+    # DoQ (DNS-over-QUIC) is UDP/853 — uncomment the mapping below if you
+    # set `doq_listen` in rustydns.toml.
+    # TCP/8053 (DoH) is intentionally NOT published: the DoH listener speaks
+    # PLAINTEXT HTTP/2 and binds 127.0.0.1 inside the container (the daemon
+    # refuses a non-loopback bind without TLS configured — and note the
+    # cert/key config only PERMITS such a bind; it never makes the DoH port
+    # itself TLS). To expose DoH, run a TLS-terminating reverse proxy that
+    # forwards to 127.0.0.1:8053 and publish only the proxy's HTTPS port.
+    # The proxy MUST join rustydnsd's network namespace to reach the
+    # loopback bind:
+    #   doh-proxy:
+    #     image: <your-proxy>
+    #     network_mode: "service:rustydnsd"   # share rustydnsd's netns
+    #     # ...proxy 443 -> 127.0.0.1:8053; publish 443 here or via a
+    #     # further front container — ports on this service apply to the
+    #     # shared netns, so declare them on the proxy.
+    # The /metrics + /health + /queries endpoint on :9153 is intentionally
     # NOT published — keep it loopback-only and scrape via a sidecar that
     # joins this container's network namespace.
     ports:
@@ -45,7 +59,11 @@ services:
       - "53:53/tcp"
       - "853:853/tcp"
       # - "853:853/udp"   # DoQ (RFC 9250); enable with server.doq_listen
-      - "8053:8053/tcp"
+      # - "8053:8053/tcp" # DoH: loopback-only in-container, PLAINTEXT HTTP/2
+      #                   # (cert/key never make it TLS) — front with a
+      #                   # TLS-terminating reverse proxy instead; the proxy
+      #                   # needs network_mode: "service:rustydnsd" to reach
+      #                   # 127.0.0.1:8053.
 
     # Read-only rootfs. The daemon writes nothing to its image; the only
     # writable surfaces are the explicit volumes below and a tmpfs for

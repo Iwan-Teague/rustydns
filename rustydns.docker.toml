@@ -24,11 +24,14 @@ listen = ["0.0.0.0:53"]
 mesh_zone = "mesh."
 
 # DNS-over-HTTPS listener.
-# ⚠ SECURITY: 8053 is published by compose. A publicly reachable DoH endpoint
-#   can be abused as a DNS amplification vector — front it with a reverse
-#   proxy that enforces rate limiting, or delete its `ports:` mapping if you
-#   only need DoH inside your LAN.
-doh_listen = "0.0.0.0:8053"
+# ⚠ SECURITY: bound to 127.0.0.1 INSIDE the container. The DoH listener
+#   speaks PLAINTEXT HTTP/2 and the daemon refuses to bind it to a
+#   non-loopback interface unless TLS cert/key paths are configured. To
+#   expose DoH outside the container, run a TLS-terminating reverse proxy
+#   (nginx / Caddy / Traefik) that forwards to 127.0.0.1:8053 and publish
+#   only the proxy's HTTPS port — or scrape DoH from a sidecar sharing this
+#   container's network namespace (see docs/deployment-docker.md).
+doh_listen = "127.0.0.1:8053"
 
 # DNS-over-TLS listener (uncomment to enable).
 # ⚠ SECURITY: requires tls_cert_path and tls_key_path below; the daemon

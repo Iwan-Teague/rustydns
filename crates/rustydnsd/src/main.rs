@@ -821,7 +821,9 @@ impl ActiveListeners {
                 format!("server.doh_listen `{s}` is not a valid socket address")
             })?;
             let upstream_timeout = Duration::from_millis(cfg.upstream.timeout_ms);
-            self.install_doh(addr, upstream_timeout)?;
+            let tls_configured =
+                cfg.server.tls_cert_path.is_some() && cfg.server.tls_key_path.is_some();
+            self.install_doh(addr, upstream_timeout, tls_configured)?;
         }
         Ok(())
     }
@@ -835,10 +837,15 @@ impl ActiveListeners {
 
     /// Bind + spawn a DoH server on `addr`, then cancel any prior one
     /// (zero-drop). On bind failure the old server is left untouched.
-    fn install_doh(&mut self, addr: SocketAddr, upstream_timeout: Duration) -> Result<()> {
-        if !addr.ip().is_loopback() {
-            warn!(listen = %addr, "DoH listener is not loopback; ensure a TLS reverse proxy and access controls are in place");
-        }
+    /// A non-loopback bind is refused unless TLS material is configured
+    /// (see [`ensure_doh_bind_allowed`]).
+    fn install_doh(
+        &mut self,
+        addr: SocketAddr,
+        upstream_timeout: Duration,
+        tls_configured: bool,
+    ) -> Result<()> {
+        ensure_doh_bind_allowed(addr, tls_configured)?;
         let listener = listeners::bind_tcp(addr)
             .with_context(|| format!("failed to bind DoH listener on {addr}"))?;
         let token = self.parent_shutdown.child_token();
@@ -1053,7 +1060,9 @@ impl ActiveListeners {
             }
             Some(addr) => {
                 let upstream_timeout = Duration::from_millis(cfg.upstream.timeout_ms);
-                if let Err(e) = self.install_doh(addr, upstream_timeout) {
+                let tls_configured =
+                    cfg.server.tls_cert_path.is_some() && cfg.server.tls_key_path.is_some();
+                if let Err(e) = self.install_doh(addr, upstream_timeout, tls_configured) {
                     warn!(error = %e, "SIGHUP: DoH rebind failed; keeping current DoH listener");
                 } else {
                     info!(listen = %addr, "SIGHUP: DoH listener rebound live");
@@ -1814,6 +1823,49 @@ fn drop_capabilities() {
     );
 }
 
+/// Fail-closed gate for the DoH bind address.
+///
+/// The DoH listener speaks PLAINTEXT HTTP/2 (`doh.rs`) — TLS is expected
+/// to be terminated by a reverse proxy in front of it. Binding it to a
+/// non-loopback address without any TLS material configured
+/// (`server.tls_cert_path` + `server.tls_key_path`, the only evidence a
+/// deployment terminates TLS at all) would publish an open, unencrypted
+/// DNS resolver, so the bind is refused. Mirror `MetricsConfig::
+/// effective_listen`: canonicalise IPv4-mapped V6 forms first so
+/// `[::ffff:203.0.113.7]` is judged by the public address it really is,
+/// not by its `::ffff:` spelling. A non-loopback bind WITH TLS material
+/// configured is accepted, but still warned about (the DoH port itself
+/// stays plaintext; only the proxy terminates TLS).
+fn ensure_doh_bind_allowed(addr: SocketAddr, tls_configured: bool) -> Result<()> {
+    let ip = match addr.ip() {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+    if ip.is_loopback() {
+        return Ok(());
+    }
+    if !tls_configured {
+        bail!(
+            "server.doh_listen `{addr}` is not a loopback address and no TLS cert/key \
+             is configured; refusing to serve plaintext DNS-over-HTTPS on a public \
+             interface. Bind DoH to 127.0.0.1 behind a TLS-terminating reverse proxy. \
+             server.tls_cert_path and server.tls_key_path only PERMIT a non-loopback \
+             bind — they do not make DoH itself TLS: the DoH port serves PLAINTEXT \
+             HTTP/2 and TLS must be terminated by an operator-provided reverse proxy."
+        );
+    }
+    warn!(
+        listen = %addr,
+        "DoH listener is not loopback; tls_cert_path/tls_key_path only permit this bind \
+         and do NOT secure DoH itself — the DoH port still serves PLAINTEXT HTTP/2, so \
+         an operator-provided TLS reverse proxy and access controls must sit in front"
+    );
+    Ok(())
+}
+
 /// Build a rustls [`TlsServerConfig`] from the cert+key paths in
 /// `server`. Called when `dot_listen` is configured.
 fn load_tls_config(server: &ServerConfig) -> Result<Arc<TlsServerConfig>> {
@@ -1851,7 +1903,25 @@ fn build_tls_server_config(server: &ServerConfig, alpn: &[&[u8]]) -> Result<Arc<
     let key = PrivateKeyDer::from_pem_file(key_path)
         .with_context(|| format!("failed to read or parse TLS private key {key_path:?}"))?;
 
-    let mut config = TlsServerConfig::builder()
+    // TLS 1.3 ONLY: pin the protocol floor before any suite selection.
+    // `with_protocol_versions(&[&rustls::version::TLS13])` restricts
+    // the versions the server will negotiate, so a TLS 1.2 ClientHello is
+    // answered with a `protocol_version` alert instead of a handshake — there
+    // is no way for a client to downgrade the DoT/DoQ listeners. Both RFC
+    // 7858 (DoT) and RFC 9250 (DoQ) clients we target speak TLS 1.3, and
+    // keeping 1.2 enabled would only serve downgrade-and-strip middleboxes.
+    // The `ring` CryptoProvider is passed EXPLICITLY via
+    // `builder_with_provider` rather than relying on the process-default
+    // provider: production code never calls `install_default` (only tests
+    // do), so the default builder's implicit "ambient process state, else
+    // crate-feature" selection is exactly the kind of hidden dependency a
+    // crypto-critical config must not have. `with_protocol_versions` returns
+    // `Result` (suite selection can fail for the pinned versions), hence `?`.
+    let builder = TlsServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?;
+    let mut config = builder
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| anyhow!("invalid TLS key or certificate: {e}"))?;
@@ -2827,6 +2897,139 @@ mod tests {
             doq.alpn_protocols,
             vec![b"doq".to_vec()],
             "DoQ must advertise exactly RFC 9250's doq"
+        );
+    }
+
+    #[test]
+    fn doh_bind_gate_refuses_public_bind_without_tls() {
+        // The DoH listener serves PLAINTEXT HTTP/2; a public bind without any
+        // TLS material configured must fail startup, not warn.
+        let err = ensure_doh_bind_allowed("192.0.2.10:8053".parse().unwrap(), false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("doh_listen"), "must name the knob: {msg}");
+        assert!(msg.contains("loopback"), "must state the rule: {msg}");
+        assert!(
+            msg.contains("tls_cert_path"),
+            "must name the fix (tls_cert_path/tls_key_path): {msg}"
+        );
+
+        // IPv4-mapped V6 spellings of a public address are refused too —
+        // same canonicalisation rule as MetricsConfig::effective_listen.
+        let err = ensure_doh_bind_allowed("[::ffff:192.0.2.10]:8053".parse().unwrap(), false)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a loopback"),
+            "mapped-V6 public bind must be judged by its real address: {err:#}"
+        );
+    }
+
+    #[test]
+    fn doh_bind_gate_accepts_loopback_and_tls_backed_public_bind() {
+        // Loopback binds (native v4, native v6, mapped form) never need TLS.
+        for addr in ["127.0.0.1:8053", "[::1]:8053", "[::ffff:127.0.0.1]:8053"] {
+            ensure_doh_bind_allowed(addr.parse().unwrap(), false)
+                .unwrap_or_else(|e| panic!("{addr} is loopback and must be accepted: {e:#}"));
+        }
+        // A non-loopback bind WITH TLS cert/key configured is accepted.
+        ensure_doh_bind_allowed("192.0.2.10:8053".parse().unwrap(), true)
+            .expect("non-loopback DoH with TLS configured must be accepted");
+    }
+
+    #[tokio::test]
+    async fn dot_tls_config_refuses_tls12_clienthello_but_accepts_tls13() {
+        // Wire-level pin of the TLS 1.3 floor (AQ-14): the DoT/DoQ server
+        // config is built with `builder_with_protocol_versions(&[TLS13])`, so
+        // a client offering a TLS 1.2 ClientHello must fail the handshake
+        // (protocol_version alert), while a TLS 1.3 client still completes it.
+        use crate::test_pem::{TEST_CA_PEM, TEST_CERT_CN, TEST_LEAF_CERT_PEM, TEST_LEAF_KEY_PEM};
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, ServerName};
+
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+
+        let cert = tmp_path("dot13-cert.pem");
+        let key = tmp_path("dot13-key.pem");
+        write_file(&cert, TEST_LEAF_CERT_PEM.as_bytes());
+        write_file(&key, TEST_LEAF_KEY_PEM.as_bytes());
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            load_tls_config(&server_with_paths(Some(cert), Some(key)))
+                .expect("DoT TLS config builds"),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback TLS listener");
+        let port = listener.local_addr().unwrap().port();
+
+        // Server side: accept both legs, record the acceptor verdicts.
+        let server = tokio::spawn(async move {
+            let mut verdicts = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                verdicts.push(acceptor.accept(stream).await.is_ok());
+            }
+            verdicts
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in CertificateDer::pem_slice_iter(TEST_CA_PEM.as_bytes()) {
+            roots.add(ca.expect("parse CA pem")).expect("add CA root");
+        }
+        let server_name = ServerName::try_from(TEST_CERT_CN).expect("test CN is a valid name");
+
+        // Control leg: a TLS 1.3 client completes the handshake.
+        let tls13 = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth(),
+        ));
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect control leg");
+        tls13
+            .connect(server_name.clone(), stream)
+            .await
+            .expect("TLS 1.3 client must complete the handshake");
+
+        // Adversarial leg: a TLS 1.2-only client offers a TLS 1.2 ClientHello.
+        // The server is pinned to TLS 1.3, so the handshake must fail.
+        let tls12 = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect TLS 1.2 leg");
+        let err = tls12
+            .connect(server_name, stream)
+            .await
+            .expect_err("a TLS 1.2 ClientHello must be refused by the TLS-1.3-only server");
+        // Downcast to the PRECISE rustls reason, not just is_err(): the
+        // TLS-1.3-pinned server answers a 1.2 ClientHello with a
+        // `protocol_version` alert, so the client must observe
+        // `AlertReceived(ProtocolVersion)`. A generic failure (timeout,
+        // unexpected EOF, different alert) would pass is_err() but prove
+        // nothing about the downgrade refusal.
+        let inner = err
+            .into_inner()
+            .and_then(|e| e.downcast::<rustls::Error>().ok())
+            .expect("tokio-rustls io error must wrap a rustls::Error");
+        assert!(
+            matches!(
+                &*inner,
+                rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion)
+            ),
+            "expected AlertReceived(ProtocolVersion), got: {inner:?}"
+        );
+
+        let verdicts = server.await.expect("server task");
+        assert_eq!(
+            verdicts,
+            vec![true, false],
+            "server must accept the TLS 1.3 leg and reject the TLS 1.2 leg"
         );
     }
 }
