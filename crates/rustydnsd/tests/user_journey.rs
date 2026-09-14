@@ -138,7 +138,7 @@ fn ci_substitutions(example: &str, dns_port: u16, upstream_port: u16, metrics_po
         );
     }
     // And the untouched parts really are the shipped file.
-    assert!(out.contains("mesh_zone_bundle_path = \"/var/lib/rustynet/dns-zone.bundle\""));
+    assert!(out.contains("mesh_zone_bundle_path = \"/var/lib/rustynet/rustynetd.dns-zone\""));
     assert!(out.contains("[safesearch]"));
     out
 }
