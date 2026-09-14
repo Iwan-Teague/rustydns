@@ -4,15 +4,15 @@
 
 ## Zone data from rustynet-dns-zone
 
-Rustynet's control plane maintains a DNS zone for the mesh via the `rustynet-dns-zone` crate. Every peer that joins the mesh gets an `A` record under the mesh zone (default `mesh.`). The zone is published as a **signed, line-oriented bundle file** that `rustynetd` writes to disk. `rustydns-authority` reads that file, verifies its ed25519 signature against an operator-configured verifier key, and merges the records into its authority store:
+Rustynet's control plane maintains a DNS zone for the mesh via the `rustynet-dns-zone` crate. Every peer that joins the mesh gets an `A` record under the mesh zone (default `rustynet.`). The zone is published as a **signed, line-oriented bundle file** that `rustynetd` writes to disk. `rustydns-authority` reads that file, verifies its ed25519 signature against an operator-configured verifier key, and merges the records into its authority store:
 
 ```
 rustynetd
   └─► rustynet-control (membership reconciliation)
         └─► rustynet-dns-zone (builds + signs zone bundle)
-              └─► /var/lib/rustynet/dns-zone.bundle
+              └─► /var/lib/rustynet/rustynetd.dns-zone
                     └─► rustydns-authority (read + ed25519 verify + serve)
-                          └─► clients get `mydevice.mesh A 100.64.x.x`
+                          └─► clients get `mydevice.rustynet A 100.64.x.x`
 ```
 
 Earlier drafts of this document and `AGENTS.md` referred to a SQLite
@@ -28,7 +28,7 @@ Run `rustydnsd` on the same host as `rustynetd` (or any always-on device like th
 # In rustynet config (peer side)
 [dns]
 resolvers     = ["100.64.0.1"]   # mesh IP of the node running rustydnsd
-search_domains = ["mesh."]
+search_domains = ["rustynet."]
 ```
 
 ### Bundle + verifier-key paths
@@ -40,8 +40,8 @@ public key must be configured:
 ```toml
 # In rustydns.toml
 [authority]
-mesh_zone_bundle_path       = "/var/lib/rustynet/dns-zone.bundle"
-mesh_zone_verifier_key_path = "/var/lib/rustynet/dns-zone-verifier.key"
+mesh_zone_bundle_path       = "/var/lib/rustynet/rustynetd.dns-zone"
+mesh_zone_verifier_key_path = "/etc/rustynet/dns-zone.pub"
 mesh_zone_max_age_secs      = 600   # reject bundles older than 10 min
 poll_interval_secs          = 30
 ```
@@ -56,7 +56,7 @@ owns the bundle file and the key file. Neither file should be writable
 by `rustydns` — only by `rustynetd`. Verify with:
 
 ```bash
-ls -la /var/lib/rustynet/dns-zone.bundle /var/lib/rustynet/dns-zone-verifier.key
+ls -la /var/lib/rustynet/rustynetd.dns-zone /etc/rustynet/dns-zone.pub
 # -rw-r----- 1 rustynet rustynet ...   (bundle)
 # -rw-r----- 1 rustynet rustynet ...   (verifier key)
 id rustydns        # confirm rustydns is in the rustynet group
@@ -141,7 +141,7 @@ blocklist_bypass = true
 
 [[policy]]
 client_ip       = "100.64.0.99"
-zones_allowed   = ["mesh."]
+zones_allowed   = ["rustynet."]
 log_all_queries = true
 
 # NodeId-keyed policy (parsed but not yet matched — see note below)
@@ -163,7 +163,7 @@ moment the peer-table integration ships.
 | Rule | Use case | Risk |
 |------|----------|------|
 | `blocklist_bypass = true` | Server node that resolves ad endpoints for testing | Bypasses all ad blocking for that node |
-| `zones_allowed = ["mesh."]` | Guest / quarantined node | Node cannot resolve external names at all |
+| `zones_allowed = ["rustynet."]` | Guest / quarantined node | Node cannot resolve external names at all |
 | `log_all_queries = true` | Audit mode | Logs all queries from this node (subject to `log_client_ips` flag) |
 
 ### Trust model for policy grants
@@ -191,7 +191,7 @@ If you need a name like `rustyfin.mesh` to resolve differently from inside and o
 
 ```toml
 [[authority.static_records]]
-name          = "rustyfin.mesh."
+name          = "rustyfin.rustynet."
 type          = "A"
 address       = "203.0.113.1"    # public IP for external clients
 ttl           = 300

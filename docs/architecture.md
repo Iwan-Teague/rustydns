@@ -198,9 +198,9 @@ The binary. Responsibilities:
 ## Rustynet integration
 
 ```
-rustynetd ──writes──► dns-zone.bundle (signed, ed25519)
+rustynetd ──writes──► rustynetd.dns-zone (signed, ed25519)
                             │
-                 read + verify against verifier-key.hex
+                 read + verify against /etc/rustynet/dns-zone.pub
                             │
               rustydns-authority ──serves──► clients
 ```

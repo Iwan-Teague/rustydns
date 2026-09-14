@@ -173,7 +173,7 @@ running rustydnsd, and every device on the network gets the same filtering.
 | Daemon refuses to start | `journalctl -u rustydns -n 50` — `validate_config` prints the offending field and the fix |
 | `Permission denied` on `:53` | The binary needs `CAP_NET_BIND_SERVICE`. The systemd unit grants it; Docker uses file caps + `cap_add`. For bare runs: `sudo setcap cap_net_bind_service=+ep /usr/local/bin/rustydnsd` |
 | Every query → `SERVFAIL` | Upstream DoH is unreachable. Probe with `curl -v https://dns.quad9.net/dns-query`. If that fails, the daemon will too |
-| `/health` returns 503 | Mesh-zone bundle is stale or missing (only when `[authority.mesh_*]` is configured). Inspect `/var/lib/rustynet/dns-zone.bundle` mtime |
+| `/health` returns 503 | Mesh-zone bundle is stale or missing (only when `[authority.mesh_*]` is configured). Inspect `/var/lib/rustynet/rustynetd.dns-zone` mtime |
 | Config file rejected as world-readable | `chmod 640 /etc/rustydns/rustydns.toml && chown rustydns:rustydns /etc/rustydns/rustydns.toml` |
 | `rustydns_blocklist_hits_total` stays at 0 | Source URL likely failed to fetch (check `rustydns_blocklist_reload_failure_total` + `journalctl`) |
 | Plain DNS being used somehow | Confirm `upstream.protocol = "doh"` (or `"doq"`); `"plain"` emits a `tracing::warn!` containing "UNENCRYPTED" on every startup |
@@ -196,7 +196,7 @@ Client query
      │
      ▼
 ┌─────────────────┐
-│  Authority zone  │  Local mesh records (default zone: "mesh.") + static records.
+│  Authority zone  │  Local mesh records (default zone: "rustynet.") + static records.
 │                 │   Intra-zone CNAME chains are chased automatically.
 └────────┬────────┘
          │ no match (name not in any authoritative zone)

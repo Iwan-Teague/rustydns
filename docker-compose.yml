@@ -19,8 +19,8 @@
 #      config is world-readable, and a world-readable mount crash-loops
 #      under restart=unless-stopped.
 #   2. If you use the Rustynet mesh feature, drop the signed
-#      `dns-zone.bundle` and its hex-encoded ed25519 verifier key
-#      `dns-zone-verifier.key` into ./mesh/ — these are the artifact names
+#      `rustynetd.dns-zone` and its hex-encoded ed25519 verifier key
+#      `dns-zone.pub` into ./mesh/ — these are the artifact names
 #      rustynetd writes and the paths the example config expects.
 #   3. `docker compose up -d`
 #

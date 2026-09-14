@@ -21,7 +21,7 @@
 listen = ["0.0.0.0:53"]
 
 # Rustynet mesh zone name (must end with a dot).
-mesh_zone = "mesh."
+mesh_zone = "rustynet."
 
 # DNS-over-HTTPS listener.
 # ⚠ SECURITY: bound to 127.0.0.1 INSIDE the container. The DoH listener

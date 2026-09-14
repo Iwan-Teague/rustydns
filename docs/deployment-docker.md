@@ -250,8 +250,8 @@ static-only mode with a warn ("mesh bundle could not be loaded", later
 "mesh zone reload failed") — the last-good snapshot keeps serving until a
 good reload succeeds. The tell is `rustydns_mesh_zone_last_reload_seconds`
 going stale on /metrics plus `rustydns_mesh_zone_reload_failure_total`
-climbing. Check that ./mesh/ contains dns-zone.bundle +
-dns-zone-verifier.key matching the paths in your config.
+climbing. Check that ./mesh/ contains rustynetd.dns-zone +
+dns-zone.pub matching the paths in your config.
 
 **`SERVFAIL` on every query**
 

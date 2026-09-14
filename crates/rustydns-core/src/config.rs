@@ -50,7 +50,7 @@ fn default_max_fetch_bytes() -> u64 {
     50 * 1024 * 1024
 } // 50 MiB
 fn default_mesh_zone() -> String {
-    "mesh.".to_string()
+    "rustynet.".to_string()
 }
 fn default_metrics_listen() -> String {
     "127.0.0.1:9153".to_string()
@@ -1236,7 +1236,7 @@ impl Default for RateLimitConfig {
 /// # NodeId-keyed (schema accepted; matching deferred):
 /// [[policy]]
 /// node_id       = "ed25519:AbCdEf..."
-/// zones_allowed = ["mesh."]
+/// zones_allowed = ["rustynet."]
 /// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]

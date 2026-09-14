@@ -27,7 +27,7 @@
 listen = ["127.0.0.1:53"]
 
 # Rustynet mesh zone name (must end with a dot).
-mesh_zone = "mesh."
+mesh_zone = "rustynet."
 
 # DNS-over-HTTPS listener.
 # ⚠ SECURITY: Do not expose this to the public internet without a reverse
@@ -187,12 +187,12 @@ block_private_rdata = false
 
 # Path to the signed dns-zone bundle file written by rustynetd.
 # If unset, the authority runs in static-only mode (no mesh zone).
-mesh_zone_bundle_path = "/var/lib/rustynet/dns-zone.bundle"
+mesh_zone_bundle_path = "/var/lib/rustynet/rustynetd.dns-zone"
 
 # Path to the ed25519 verifier public key (hex-encoded, 64 chars on a
 # single line). Required when mesh_zone_bundle_path is set. The
 # corresponding signing key lives inside rustynetd and never leaves it.
-mesh_zone_verifier_key_path = "/var/lib/rustynet/dns-zone-verifier.key"
+mesh_zone_verifier_key_path = "/etc/rustynet/dns-zone.pub"
 
 # Maximum age (seconds) of a bundle that is still considered fresh. A
 # bundle whose generated_at_unix is older than now - max_age, OR whose
@@ -203,7 +203,7 @@ mesh_zone_max_age_secs = 600
 # Rustynet mesh zone name. Must end with '.'. Mirror of server.mesh_zone —
 # keep these two in sync (the daemon does not auto-sync them so you can
 # split-horizon if you need to).
-mesh_zone = "mesh."
+mesh_zone = "rustynet."
 
 # How often to re-read the bundle file in seconds (set to 0 to disable
 # polling — operators can still SIGHUP to reload on demand).
@@ -211,7 +211,7 @@ poll_interval_secs = 30
 
 # Static zone records.
 # [[authority.static_records]]
-# name    = "myserver.mesh."
+# name    = "myserver.rustynet."
 # type    = "A"
 # address = "100.64.0.10"
 # ttl     = 300
@@ -454,7 +454,7 @@ path   = "/metrics"
 # query outside `zones_allowed` returns REFUSED before the pipeline runs.
 # [[policy]]
 # client_ip     = "10.0.0.99"
-# zones_allowed = ["mesh."]
+# zones_allowed = ["rustynet."]
 
 # Example: assign a client to a named blocklist group (see [[blocklist.groups]]
 # above). This client is matched against the "strict" group's list instead of
