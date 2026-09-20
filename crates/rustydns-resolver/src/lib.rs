@@ -407,10 +407,7 @@ impl Resolver {
         match arm.inner.lookup(name, record_type).await {
             Ok(lookup) => {
                 let mut records = lookup_to_dns_records(lookup.answers());
-                let mut dropped: u32 = 0;
-                dropped += filter_out_of_bailiwick(&mut records, name);
-                dropped += filter_wrong_type(&mut records, record_type);
-                dropped += dedup_identical(&mut records);
+                let mut dropped = filter_answer_sanity(&mut records, name, record_type);
                 if on_default && self.config.upstream.block_private_rdata {
                     dropped += filter_private_rdata(&mut records);
                 }
@@ -1025,6 +1022,24 @@ pub(crate) fn filter_private_rdata(records: &mut Vec<DnsRecord>) -> u32 {
             "rebinding defence: dropped upstream A/AAAA record(s) with private rdata"
         );
     }
+    dropped
+}
+
+/// The answer-sanity pipeline shared by EVERY upstream transport — bailiwick
+/// containment, then unrequested-type, then identical-record dedup, in the
+/// order the individual defences document. Both the hickory arms
+/// (`resolve_via_hickory`) and the oblivious ODoH arm (`odoh::outcome_from_parts`)
+/// route answers through this one function, so no transport can serve an
+/// answer shape another transport would have filtered (AQ-64). Returns the
+/// total count of dropped records.
+pub(crate) fn filter_answer_sanity(
+    records: &mut Vec<DnsRecord>,
+    qname: &str,
+    qtype: RecordType,
+) -> u32 {
+    let mut dropped = filter_out_of_bailiwick(records, qname);
+    dropped += filter_wrong_type(records, qtype);
+    dropped += dedup_identical(records);
     dropped
 }
 

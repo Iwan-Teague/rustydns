@@ -66,7 +66,7 @@ use rustls_pki_types::CertificateDer;
 
 use rustydns_core::config::{DnsConfig, TlsVersion, redact_url_credentials};
 
-use crate::{ResolveOutcome, filter_private_rdata, lookup_to_dns_records};
+use crate::{ResolveOutcome, filter_answer_sanity, filter_private_rdata, lookup_to_dns_records};
 
 /// RFC 9230 media type for both the request body and the response.
 const ODOH_MEDIA_TYPE: &str = "application/oblivious-dns-message";
@@ -420,6 +420,8 @@ impl OdohArm {
         outcome_from_parts(
             &msg.answers,
             msg.metadata.response_code,
+            name,
+            qtype,
             block_private_rdata,
         )
     }
@@ -458,28 +460,36 @@ impl OdohArm {
         outcome_from_parts(
             &response.answers,
             response.metadata.response_code,
+            name,
+            qtype,
             block_private_rdata,
         )
     }
 }
 
-/// Shape a response's answers + rcode into a [`ResolveOutcome`], applying the
-/// rebinding-defence filter when requested. Shared by the plain and validated
-/// paths. A non-NoError/NXDomain rcode (SERVFAIL/REFUSED) is an upstream
-/// failure — fail closed, never retry over a less-private path.
+/// Shape a response's answers + rcode into a [`ResolveOutcome`]. Shared by the
+/// plain and validated paths. A non-NoError/NXDomain rcode (SERVFAIL/REFUSED)
+/// is an upstream failure — fail closed, never retry over a less-private path.
+///
+/// Answers pass through the SAME sanity pipeline as the hickory arms
+/// ([`crate::filter_answer_sanity`]: bailiwick containment, unrequested type,
+/// identical-record dedup) before the opt-in rebinding-defence filter — the
+/// oblivious transport must never serve an answer shape the standard path
+/// would have filtered (AQ-64).
 fn outcome_from_parts(
     answers: &[Record],
     response_code: ResponseCode,
+    qname: &str,
+    qtype: RecordType,
     block_private_rdata: bool,
 ) -> Result<ResolveOutcome, OdohError> {
     match response_code {
         ResponseCode::NoError => {
             let mut records = lookup_to_dns_records(answers);
-            let dropped = if block_private_rdata {
-                filter_private_rdata(&mut records)
-            } else {
-                0
-            };
+            let mut dropped = filter_answer_sanity(&mut records, qname, qtype);
+            if block_private_rdata {
+                dropped += filter_private_rdata(&mut records);
+            }
             Ok(ResolveOutcome {
                 records,
                 private_rdata_dropped: dropped,

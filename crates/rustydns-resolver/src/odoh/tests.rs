@@ -16,8 +16,8 @@ use hickory_proto::dnssec::crypto::EcdsaSigningKey;
 use hickory_proto::dnssec::rdata::{DNSKEY, DNSSECRData, RRSIG};
 use hickory_proto::dnssec::{Algorithm, DnssecSigner, PublicKeyBuf, SigningKey, TrustAnchors};
 use hickory_proto::op::{DnsRequestOptions, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::rdata::opt::EdnsCode;
+use hickory_proto::rr::rdata::{A, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordSet, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use hickory_resolver::net::xfer::{DnsHandle, FirstAnswer};
@@ -61,6 +61,12 @@ enum MockMode {
     /// Serve a pre-built (DNSSEC-signed) zone: answer each query with the
     /// records in `MockRelay::responses` for its qtype. Used by the DNSSEC tests.
     SignedZone,
+    /// A NoError A answer stuffed with the hostile filler the answer-sanity
+    /// defences exist for: the legitimate A, a byte-identical duplicate of
+    /// it, a same-name TXT (unrequested type), and an out-of-bailiwick A for
+    /// a name the client never asked about. Mirrors the standard-path e2e
+    /// fixtures so the ODoH arm can be held to identical filtering.
+    HostileAnswer,
 }
 
 /// Mutable target state, so a test can rotate the key mid-exchange.
@@ -246,6 +252,33 @@ fn build_mock_response(mode: MockMode, query: &Message) -> Result<Vec<u8>, OdohE
             raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
             raw.extend_from_slice(&[0x00, 0x04, 203, 0, 113, 7]);
             return Ok(raw);
+        }
+        MockMode::HostileAnswer => {
+            resp.metadata.response_code = ResponseCode::NoError;
+            if let Some(name) = name {
+                let evil = Name::from_ascii("evil.example.").expect("static name");
+                let legit = Record::from_rdata(
+                    name.clone(),
+                    60,
+                    RData::A(A(Ipv4Addr::new(203, 0, 113, 7))),
+                );
+                resp.answers.push(legit.clone());
+                // Byte-identical repeat of the legitimate A (RFC-legal, but
+                // the dedup defence collapses it).
+                resp.answers.push(legit);
+                // Same-name TXT: unrequested type next to an A query.
+                resp.answers.push(Record::from_rdata(
+                    name,
+                    60,
+                    RData::TXT(TXT::new(vec!["spam".to_string()])),
+                ));
+                // Out-of-bailiwick A for a name the client never asked about.
+                resp.answers.push(Record::from_rdata(
+                    evil,
+                    60,
+                    RData::A(A(Ipv4Addr::new(198, 51, 100, 9))),
+                ));
+            }
         }
         MockMode::RelayError | MockMode::Garbage | MockMode::AlwaysReject(_) => {
             unreachable!("handled before crypto")
@@ -520,6 +553,79 @@ async fn odoh_private_rdata_filtered_when_enabled() {
     );
     assert_eq!(outcome.private_rdata_dropped, 1);
     assert!(!outcome.nxdomain);
+}
+
+#[tokio::test]
+async fn odoh_hostile_answer_is_filtered_like_the_hickory_path() {
+    // AQ-64: the answer-sanity defences (bailiwick containment, unrequested
+    // type, identical-record dedup) run unconditionally on the hickory arms.
+    // The ODoH arm must apply the SAME pipeline — both transports route
+    // answers through one shared filter function, the exact sequence
+    // `resolve_via_hickory` applies — so any reply the standard path filters
+    // is filtered identically here. The reference below is that standard-path
+    // pipeline run over the same unfiltered answer the mock target serves.
+    use rustydns_core::record::DnsRecord;
+
+    let arm = arm_with_mock(MockMode::HostileAnswer);
+    let outcome = arm
+        .resolve("example.com.", RecordType::A, false)
+        .await
+        .expect("resolve");
+
+    // The identical unfiltered answer, shaped the same way the transport
+    // shapes it, through the shared sanity pipeline.
+    let mut reference = vec![
+        DnsRecord::new(
+            "example.com.",
+            RecordData::A(Ipv4Addr::new(203, 0, 113, 7)),
+            std::time::Duration::from_secs(60),
+        ),
+        DnsRecord::new(
+            "example.com.",
+            RecordData::A(Ipv4Addr::new(203, 0, 113, 7)),
+            std::time::Duration::from_secs(60),
+        ),
+        DnsRecord::new(
+            "example.com.",
+            RecordData::Txt(vec![b"spam".to_vec()]),
+            std::time::Duration::from_secs(60),
+        ),
+        DnsRecord::new(
+            "evil.example.",
+            RecordData::A(Ipv4Addr::new(198, 51, 100, 9)),
+            std::time::Duration::from_secs(60),
+        ),
+    ];
+    // The identical unfiltered answer, shaped the same way the transport
+    // shapes it, through the standard-path pipeline (`resolve_via_hickory`'s
+    // exact filter sequence, shared by both transports after the AQ-64 fix).
+    let reference_dropped = crate::filter_out_of_bailiwick(&mut reference, "example.com.")
+        + crate::filter_wrong_type(&mut reference, RecordType::A)
+        + crate::dedup_identical(&mut reference);
+
+    assert_eq!(
+        reference_dropped, 3,
+        "dup + wrong-type + out-of-bailiwick must all drop"
+    );
+    assert_eq!(
+        outcome.private_rdata_dropped, reference_dropped,
+        "ODoH must drop and count exactly what the shared pipeline drops"
+    );
+    assert_eq!(
+        outcome.records.len(),
+        reference.len(),
+        "ODoH must surface exactly the records the shared pipeline keeps"
+    );
+    for (got, want) in outcome.records.iter().zip(reference.iter()) {
+        assert_eq!(got.name, want.name, "owner name must match the pipeline");
+        assert_eq!(got.data, want.data, "rdata must match the pipeline");
+        assert_eq!(got.ttl, want.ttl);
+    }
+    assert!(
+        matches!(&outcome.records[0].data, RecordData::A(ip) if *ip == Ipv4Addr::new(203, 0, 113, 7)),
+        "only the legitimate A must survive: {:?}",
+        outcome.records
+    );
 }
 
 #[tokio::test]
