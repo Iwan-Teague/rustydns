@@ -261,7 +261,7 @@ For a detailed description of each component, see [`docs/architecture.md`](docs/
 
 - **`#![forbid(unsafe_code)]`** in all first-party crates
 - **`rustls`** for all TLS — no OpenSSL dependency
-- **TLS 1.3** minimum (TLS 1.2 configurable with startup warning)
+- **TLS 1.3** minimum (`min_tls_version = "1.2"` is rejected — fail closed)
 - **TLS certificate validation always on** — there is no `verify_tls_certs = false` option
 - **Fail-closed** — on validation failure or upstream error, return SERVFAIL; no stale answers
 - **HTTPS-only blocklist sources** — `http://` URLs are rejected at startup

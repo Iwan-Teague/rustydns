@@ -10,6 +10,8 @@ This project does not yet follow semantic versioning — every change up to
 
 ### Breaking changes
 
+- `upstream.min_tls_version = "1.2"` is no longer accepted: the `TlsVersion::Tls12` variant is gone, so a config that still pins "1.2" fails to parse (fail-closed). Only "1.3" (the default) is valid for the DoH/DoQ/ODoH clients. (AQ-14 residue; follows the D1 TLS 1.3 floor.)
+
 - **DoT/DoQ servers now require TLS 1.3.** Both server-side TLS configs
   are pinned to `TLS13` only (`with_protocol_versions(&[&TLS13])`); a
   TLS-1.2-only client's ClientHello is answered with a

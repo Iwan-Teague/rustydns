@@ -202,8 +202,8 @@ channel a case-mangled answer is indistinguishable from a spoof.
 
 All TLS is implemented by `rustls` — a pure-Rust TLS library with no dependency on
 OpenSSL or any system TLS library. `rustls` supports TLS 1.3 and 1.2 only; older
-protocol versions are not implemented. TLS 1.3 is the default minimum; configuring TLS
-1.2 as the minimum emits a startup warning.
+protocol versions are not implemented. TLS 1.3 is the only accepted minimum:
+`min_tls_version = "1.2"` is rejected at config load — the floor cannot be lowered.
 
 TLS certificate validation is always enabled and is not configurable. There is no
 `verify_tls_certs = false` option and no plan to add one. Operators who need to trust
