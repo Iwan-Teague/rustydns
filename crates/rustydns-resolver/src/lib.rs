@@ -855,9 +855,10 @@ fn build_tls_client_config(
             .map_err(|e| RustyDnsError::Resolver(format!("failed to add test root: {e}")))?;
     }
 
+    // `TlsVersion` has a single variant ("1.2" is rejected at config parse,
+    // AQ-14), so this is unconditionally the TLS-1.3-only version set.
     let versions: &[&rustls::SupportedProtocolVersion] = match min_tls {
         TlsVersion::Tls13 => &[&rustls::version::TLS13],
-        TlsVersion::Tls12 => &[&rustls::version::TLS13, &rustls::version::TLS12],
     };
 
     // PRIVACY / FINGERPRINT POSTURE (audited): this is the ONLY place we
@@ -2245,10 +2246,13 @@ mod tests {
     //
     // `build_tls_client_config` is the single place where
     // `upstream.min_tls_version` is turned into a rustls version set, so the
-    // whole TLS floor rests on it. This differential test stands up ONE
-    // TLS-1.2-only listener and proves the floor actually bites: the client
-    // config built with `Tls13` refuses the handshake, while the one built
-    // with `Tls12` completes it against the same server. There is no
+    // whole TLS floor rests on it, and since the config layer rejects "1.2"
+    // (no `TlsVersion::Tls12` variant) it can only ever produce the
+    // TLS-1.3-only set. This differential test stands up ONE TLS-1.2-only
+    // listener and proves the floor actually bites: the client config built
+    // by `build_tls_client_config` refuses the handshake, while an
+    // otherwise-identical client that also admits TLS 1.2 completes it
+    // against the same server. There is no
     // DoH/HTTP/DNS plumbing — the property under test is purely the negotiated
     // TLS version, which is exactly what an attacker downgrading an upstream
     // to TLS 1.2 would exploit.
@@ -2332,17 +2336,31 @@ MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg3eneNckGaJqvOLfi
             "min_tls_version = 1.3 must REFUSE a TLS-1.2-only upstream (no silent downgrade)"
         );
 
-        // min_tls = 1.2 → the same server MUST be accepted. This is what makes
-        // the assertion above about the *floor* and not some unrelated failure
-        // (cert, port, name): only the client's minimum version changed.
-        let cfg12 = build_tls_client_config(TlsVersion::Tls12, std::slice::from_ref(&cert_der))
-            .expect("client config (1.2 floor) must build");
-        let attempt12 = TlsConnector::from(cfg12)
+        // Positive control: the SAME server with an otherwise-identical
+        // client config that also admits TLS 1.2 (built inline — production
+        // can no longer express a 1.2 floor, since `TlsVersion` has no
+        // `Tls12` variant). This is what makes the assertion above about the
+        // *floor* and not some unrelated failure (cert, port, name): only
+        // the client's version set changed.
+        let mut control_roots = rustls::RootCertStore::empty();
+        control_roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        control_roots
+            .add(cert_der.clone())
+            .expect("test root must add");
+        let control_cfg = Arc::new(
+            rustls::ClientConfig::builder_with_protocol_versions(&[
+                &rustls::version::TLS13,
+                &rustls::version::TLS12,
+            ])
+            .with_root_certificates(control_roots)
+            .with_no_client_auth(),
+        );
+        let attempt12 = TlsConnector::from(control_cfg)
             .connect(name, TcpStream::connect(addr).await.unwrap())
             .await;
         assert!(
             attempt12.is_ok(),
-            "min_tls_version = 1.2 must ACCEPT a TLS-1.2 upstream: {:?}",
+            "1.2-capable control client must ACCEPT the TLS-1.2 upstream: {:?}",
             attempt12.err()
         );
     }

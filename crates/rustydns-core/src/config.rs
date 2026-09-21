@@ -13,7 +13,7 @@
 //! - No empty resolver list
 //! - Sane timeout and cache bounds
 //! - mesh_zone ends with '.'
-//! - TLS 1.2 minimum emits a warning
+//! - `min_tls_version = "1.2"` is rejected (TLS 1.3 is the only floor)
 //! - Plaintext upstream emits a persistent warning
 //! - DNSSEC disabled emits a warning
 //! - Disk query logging emits a warning
@@ -497,16 +497,15 @@ pub enum UpstreamProtocol {
 }
 
 /// Minimum TLS version for all upstream encrypted connections.
+///
+/// TLS 1.3 is the ONLY value: `min_tls_version = "1.2"` in `rustydns.toml`
+/// fails deserialisation (unknown variant), so the floor can never be
+/// lowered — fail closed (AQ-14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsVersion {
-    /// TLS 1.2. Accepted but not recommended.
-    ///
-    /// TLS 1.2 does not mandate forward secrecy and has a larger
-    /// fingerprinting surface. A startup warning is emitted when this is used.
-    #[serde(rename = "1.2")]
-    Tls12,
-    /// TLS 1.3. **Default.** Mandatory forward secrecy, minimal fingerprinting.
+    /// TLS 1.3. **Default and only accepted value.** Mandatory forward
+    /// secrecy, minimal fingerprinting.
     #[default]
     #[serde(rename = "1.3")]
     Tls13,
@@ -541,6 +540,8 @@ pub struct UpstreamConfig {
     pub fail_closed: bool,
 
     /// Minimum TLS version for upstream connections. Default: `"1.3"`.
+    /// Only `"1.3"` parses — `"1.2"` is rejected at deserialisation
+    /// (fail closed; no TLS 1.2 downgrade path exists).
     ///
     /// TLS certificate validation is always on and is not configurable.
     #[serde(default)]
@@ -1888,8 +1889,9 @@ pub fn load_config(path: &std::path::Path) -> Result<DnsConfig, crate::RustyDnsE
 /// Hard errors (returned as `Err`): blocklist `http://` sources, empty
 /// resolver list, `timeout_ms = 0`, excessively large cache/ring values.
 ///
-/// Soft warnings (logged, not rejected): plaintext protocol, TLS 1.2,
-/// DNSSEC disabled, disk query logging, full IP logging.
+/// Soft warnings (logged, not rejected): plaintext protocol,
+/// DNSSEC disabled, disk query logging, full IP logging. (`min_tls_version`
+/// has no soft case: `"1.2"` is rejected during deserialisation.)
 pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
     // --- Server ------------------------------------------------------------------
 
@@ -2347,15 +2349,6 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                 idx = idx
             );
         }
-    }
-
-    // TLS 1.2 warning
-    if cfg.upstream.min_tls_version == TlsVersion::Tls12 {
-        tracing::warn!(
-            "upstream.min_tls_version = \"1.2\" — TLS 1.2 does not mandate forward secrecy \
-             and has a larger fingerprinting surface than TLS 1.3. Upgrade to \"1.3\" unless \
-             your upstream resolvers do not support it."
-        );
     }
 
     // DNSSEC warning
@@ -4048,28 +4041,27 @@ mod tests {
     }
 
     #[test]
-    fn min_tls_version_one_two_is_accepted_with_disclosure_not_rejected() {
+    fn min_tls_version_one_two_is_rejected_at_parse() {
         // The TLS-1.3 floor is enforced at the rustls layer (see the
         // rustydns-resolver handshake differentials); at the CONFIG layer
-        // "1.2" is a deliberate, disclosed downgrade — accepted so operators
-        // with legacy-only upstreams can still run, but always soft-warned.
-        // This pins that contract: parse → accept, never a hard rejection.
-        let mut cfg = baseline();
-        cfg.upstream.min_tls_version = TlsVersion::Tls12;
-        validate_config(&cfg).expect("min_tls_version \"1.2\" is accepted (soft-warned)");
-
-        // The default floor is 1.3 without any operator opt-in.
-        assert_eq!(TlsVersion::default(), TlsVersion::Tls13);
-        assert_eq!(UpstreamConfig::default().min_tls_version, TlsVersion::Tls13);
-
-        // Both serde spellings round-trip exactly as written in rustydns.toml.
+        // `min_tls_version = "1.2"` no longer parses at all: `TlsVersion`
+        // has no `Tls12` variant, so serde fails closed with an
+        // unknown-variant error before `validate_config` ever runs. This
+        // pins that contract: parse → reject, never a soft-warned downgrade.
         #[derive(Deserialize)]
         struct Floor {
             min_tls_version: TlsVersion,
         }
-        let f12: Floor = toml::from_str("min_tls_version = \"1.2\"").unwrap();
+        assert!(
+            toml::from_str::<Floor>("min_tls_version = \"1.2\"").is_err(),
+            "min_tls_version \"1.2\" must be rejected (fail closed to TLS 1.3)"
+        );
+
+        // The only accepted spelling is "1.3", and it is the default both
+        // via `TlsVersion::default()` and via `UpstreamConfig::default()`.
+        assert_eq!(TlsVersion::default(), TlsVersion::Tls13);
+        assert_eq!(UpstreamConfig::default().min_tls_version, TlsVersion::Tls13);
         let f13: Floor = toml::from_str("min_tls_version = \"1.3\"").unwrap();
-        assert_eq!(f12.min_tls_version, TlsVersion::Tls12);
         assert_eq!(f13.min_tls_version, TlsVersion::Tls13);
     }
 }

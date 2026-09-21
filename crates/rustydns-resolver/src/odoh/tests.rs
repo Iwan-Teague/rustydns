@@ -1192,9 +1192,11 @@ mod http_cap {
 /// Real-TLS coverage for [`super::build_http_client`] — the reqwest client the
 /// production arm uses (the mock transport above never touches it). Mirrors
 /// lib.rs's `min_tls_version_floor_rejects_tls12_only_upstream` differential,
-/// but at the reqwest layer: ONE TLS-1.2-only rustls listener, and only the
-/// client's `min_tls_version` changes between halves. The same self-signed EC
-/// P-256 `localhost` leaf is reused as served cert + injected trust root.
+/// but at the reqwest layer: ONE TLS-1.2-only rustls listener; the client
+/// built by `build_http_client` (TLS 1.3, now the only expressible floor)
+/// must refuse it, while an otherwise-identical inline client floored at
+/// TLS 1.2 must complete. The same self-signed EC P-256 `localhost` leaf is
+/// reused as served cert + injected trust root.
 mod http_tls {
     use super::*;
     use std::sync::Arc;
@@ -1295,12 +1297,29 @@ MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg3eneNckGaJqvOLfi
             .await
             .expect_err("a TLS-1.3-floor client must refuse a TLS-1.2-only origin");
 
-        // Tls12 floor → the SAME origin completes; only the floor changed.
-        let resp = odoh_http_client(TlsVersion::Tls12, std::slice::from_ref(&cert_der))
+        // Control: the SAME origin with an otherwise-identical client whose
+        // floor is TLS 1.2, built inline (production can no longer express a
+        // 1.2 floor — `TlsVersion` has no `Tls12` variant). This is what
+        // makes the assertion above about the *floor* and not some unrelated
+        // failure (cert, port, name): only the floor changed.
+        let control = {
+            let mut b = reqwest::Client::builder()
+                .use_rustls_tls()
+                .https_only(true)
+                .min_tls_version(reqwest::tls::Version::TLS_1_2)
+                .redirect(reqwest::redirect::Policy::limited(3))
+                .timeout(Duration::from_secs(5));
+            b = b.add_root_certificate(
+                reqwest::Certificate::from_der(cert_der.as_ref())
+                    .expect("control test root parses"),
+            );
+            b.build().expect("control client builds")
+        };
+        let resp = control
             .get(format!("https://localhost:{port}/proxy"))
             .send()
             .await
-            .expect("a TLS-1.2-floor client reaches the 1.2-only origin");
+            .expect("a TLS-1.2-floor control client reaches the 1.2-only origin");
         assert_eq!(resp.status(), 200);
         assert!(
             !err.to_string().to_lowercase().contains("dns error"),

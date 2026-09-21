@@ -701,8 +701,9 @@ fn build_http_client(
     timeout: Duration,
     test_roots: &[CertificateDer<'static>],
 ) -> Result<reqwest::Client, OdohError> {
+    // `TlsVersion` has a single variant ("1.2" is rejected at config parse,
+    // AQ-14), so the floor is unconditionally TLS 1.3.
     let min = match min_tls {
-        TlsVersion::Tls12 => reqwest::tls::Version::TLS_1_2,
         TlsVersion::Tls13 => reqwest::tls::Version::TLS_1_3,
     };
     let mut builder = reqwest::Client::builder()
