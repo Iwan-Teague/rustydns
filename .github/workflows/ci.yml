@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, pinned 2026-09-12)
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head 6bed076 (a moving branch pinned to a commit; verified against the upstream ref 2026-09-22)
         with:
           # Match workspace.package.rust-version from Cargo.toml.
           # hickory 0.26 requires rustc 1.88, so the floor is pinned
@@ -114,7 +114,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, pinned 2026-09-12)
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head 6bed076 (a moving branch pinned to a commit; verified against the upstream ref 2026-09-22)
 
       - name: Cache cargo registry, index, and target
         uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
@@ -185,7 +185,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head, pinned 2026-09-12)
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head 6bed076 (a moving branch pinned to a commit; verified against the upstream ref 2026-09-22)
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
