@@ -2260,7 +2260,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
-                static_records: vec![static_a("rl.example.", "203.0.113.90")],
+                static_records: vec![static_a("rl.test.example.", "203.0.113.90")],
                 poll_interval_secs: 30,
             })
             .expect("authority"),
@@ -2311,7 +2311,7 @@ mod tests {
         query_msg.metadata.recursion_desired = true;
         query_msg.add_query({
             let mut q = Query::new();
-            q.set_name(ProtoName::from_ascii("rl.example.").unwrap())
+            q.set_name(ProtoName::from_ascii("rl.test.example.").unwrap())
                 .set_query_type(ProtoRecordType::A);
             q
         });
@@ -2405,7 +2405,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
-                static_records: vec![static_a("pk.example.", "100.64.0.9")],
+                static_records: vec![static_a("pk.test.example.", "100.64.0.9")],
                 poll_interval_secs: 30,
             })
             .expect("authority"),
@@ -2453,7 +2453,7 @@ mod tests {
         query_msg.metadata.recursion_desired = true;
         query_msg.add_query({
             let mut q = Query::new();
-            q.set_name(ProtoName::from_ascii("pk.example.").unwrap())
+            q.set_name(ProtoName::from_ascii("pk.test.example.").unwrap())
                 .set_query_type(ProtoRecordType::A);
             q
         });

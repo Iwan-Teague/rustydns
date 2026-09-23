@@ -699,7 +699,7 @@ async fn binary_e2e_doh_post_resolves_over_http_seam() {
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -769,7 +769,7 @@ async fn binary_e2e_doh_get_resolves_via_base64url_param() {
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -858,7 +858,7 @@ async fn binary_e2e_dot_tls_handshake_and_resolution() {
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -990,7 +990,7 @@ async fn binary_e2e_doq_quic_stream_resolution_with_ca_trust() {
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -1141,7 +1141,7 @@ async fn binary_e2e_dot_rejects_wrong_san_dial() {
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -1769,7 +1769,7 @@ async fn binary_e2e_doh_wrong_content_type_is_415() {
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -2080,7 +2080,7 @@ async fn binary_e2e_multi_upstream_queries_distribute_across_providers() {
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -2148,7 +2148,7 @@ async fn binary_e2e_serial_dispatch_still_fails_over_to_live_provider() {
          timeout_ms = 1200\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -2355,7 +2355,7 @@ async fn binary_e2e_conditional_forwarding_routes_by_zone() {
          resolvers = [\"127.0.0.1:{up_route}\"]\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -2658,7 +2658,7 @@ async fn binary_e2e_longest_prefix_route_wins_regardless_of_declaration_order() 
          resolvers = [\"127.0.0.1:{up_narrow}\"]\n\n\
          [blocklist]\n\n\
          [[authority.static_records]]\n\
-         name = \"router.mesh.\"\n\
+         name = \"router.mesh.lab.\"\n\
          type = \"A\"\n\
          address = \"10.0.0.1\"\n\
          ttl = 300\n\n\
@@ -2732,6 +2732,7 @@ async fn binary_e2e_authority_static_record_served_with_aa_flag() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\n\
          [[authority.static_records]]\n\
          name = \"router.mesh.\"\n\
          type = \"A\"\n\
@@ -2817,6 +2818,7 @@ async fn binary_e2e_in_zone_nodata_is_noerror_not_nxdomain() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\n\
          [[authority.static_records]]\n\
          name = \"router.mesh.\"\n\
          type = \"A\"\n\
@@ -2958,6 +2960,7 @@ async fn binary_e2e_multiple_static_records_and_nodata() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\n\
          [[authority.static_records]]\n\
          name = \"router.mesh.\"\n\
          type = \"A\"\n\
@@ -3066,6 +3069,7 @@ async fn binary_e2e_zone_apex_infrastructure_queries() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\n\
          [[authority.static_records]]\n\
          name = \"router.mesh.\"\n\
          type = \"A\"\n\
@@ -3210,6 +3214,7 @@ async fn binary_e2e_authority_serves_over_doh_transport() {
          [blocklist]\n\n\
          [metrics]\n\
          listen = \"127.0.0.1:{metrics_port}\"\n\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\n\
          [[authority.static_records]]\n\
          name = \"router.mesh.\"\n\
          type = \"A\"\n\
@@ -3295,6 +3300,7 @@ async fn binary_e2e_authority_cname_chain_resolution() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\n\
          [[authority.static_records]]\n\
          name = \"alias.mesh.\"\n\
          type = \"CNAME\"\n\
@@ -3385,6 +3391,7 @@ async fn binary_e2e_authority_precedes_blocklist_for_same_name() {
          dnssec_validation = false\n\n\
          [blocklist]\n\
          local_files = [\"{}\"]\n\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\n\
          [[authority.static_records]]\n\
          name = \"conflict.mesh.\"\n\
          type = \"A\"\n\
@@ -3461,6 +3468,7 @@ async fn binary_e2e_authority_serves_txt_records() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\n\
          [[authority.static_records]]\n\
          name = \"spf.mesh.\"\n\
          type = \"TXT\"\n\
@@ -3679,6 +3687,7 @@ async fn binary_e2e_txt_record_served_from_authority() {
          resolvers = [\"127.0.0.1:{upstream_port}\"]\n\
          dnssec_validation = false\n\n\
          [blocklist]\n\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\n\
          [[authority.static_records]]\n\
          name = \"spf.mesh.\"\n\
          type = \"TXT\"\n\

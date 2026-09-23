@@ -26,6 +26,21 @@ This project does not yet follow semantic versioning — every change up to
   assertions pinning the old exact-name behaviour were deliberately
   re-baselined with reasons at the test (AQ-163).
 
+- **A static record can no longer implicitly claim a bare-TLD zone.**
+  The parent-apex registration above refused nothing for two-label
+  record names: a lone `example.com.` A record registered the apex
+  `com.`, making the authority answer authoritative NODATA for every
+  non-static name under the whole TLD (`google.com.` included). The
+  derived apex is now refused at startup (`RustyDnsError::Zone`, daemon
+  aborts) when it is a single label, unless that label IS the configured
+  `mesh_zone` — the one single-label zone an operator declares
+  explicitly. Multi-label apexes (`lab.example.com.`), single-label
+  record names (self-apex) and the shipped shape (`router.mesh.` under
+  `mesh_zone = "mesh."`, `myserver.rustynet.` under `"rustynet."`) are
+  unaffected. Multi-label public suffixes (`co.uk.` from `foo.co.uk.`)
+  are still registrable — refusing those needs a public-suffix table and
+  remains an open owner decision. (AQ-171)
+
 ### Breaking changes
 
 - `upstream.min_tls_version = "1.2"` is no longer accepted: the `TlsVersion::Tls12` variant is gone, so a config that still pins "1.2" fails to parse (fail-closed). Only "1.3" (the default) is valid for the DoH/DoQ/ODoH clients. (AQ-14 residue; follows the D1 TLS 1.3 floor.)

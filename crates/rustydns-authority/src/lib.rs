@@ -118,7 +118,9 @@ impl Authority {
     /// warning rather than refusing to start.
     ///
     /// Returns [`RustyDnsError::Zone`] if any static record is malformed
-    /// (unknown type, missing required field, unparseable address, etc.).
+    /// (unknown type, missing required field, unparseable address, etc.) or
+    /// would make the authority claim a bare-TLD apex (see
+    /// [`static_zone_apex`]).
     pub fn new(config: AuthorityConfig) -> AuthorityResult<Self> {
         let mesh_zone = normalise_name(&config.mesh_zone).into_owned();
 
@@ -128,7 +130,7 @@ impl Authority {
         for sr in &config.static_records {
             let rec = static_record_to_dns_record(sr)?;
             let name = rec.name.clone();
-            let apex = static_zone_apex(&name)?;
+            let apex = static_zone_apex(&name, &mesh_zone)?;
             if !static_zones.iter().any(|z| z == apex) {
                 static_zones.push(apex.to_string());
             }
@@ -565,10 +567,37 @@ fn normalise_name(name: &str) -> std::borrow::Cow<'_, str> {
 /// is the parent of the record name: a record `router.mesh.` makes the
 /// authority authoritative for `mesh.` (and thus `ghost.mesh.` too). A
 /// single-label name (normalised form `mesh.`) is its own apex. Refuses
-/// ([`RustyDnsError::Zone`]) a name that would claim the DNS root.
-fn static_zone_apex(name: &str) -> AuthorityResult<&str> {
+/// ([`RustyDnsError::Zone`]) a name that would claim the DNS root, and a
+/// two-label name (`example.com.`) whose derived apex is a bare TLD: the
+/// authority would otherwise answer authoritative NODATA for the entire
+/// top-level domain (`google.com.` included) — unless that derived apex
+/// equals the configured `mesh_zone`, which the operator declares
+/// explicitly (`authority.mesh_zone`, default `rustynet.`). This bound is
+/// on the DERIVED apex of a multi-label record only. A record whose own
+/// normalised name is a single label is its own apex and registers
+/// unchanged (the `_ => Ok(name)` arm below): `localhost` works, and — a
+/// known operator footgun, not closed here — so would a record literally
+/// named `com`, which then blackholes `com.`. Whether own-apex single
+/// labels should also be refused, and how a legitimate non-mesh single-
+/// label internal zone should be declared, is deferred to the owner
+/// (charter/governance/owner-inbox.md OI-30); it is operator-explicit
+/// config, not attacker-influenced input.
+fn static_zone_apex<'a>(name: &'a str, mesh_zone: &str) -> AuthorityResult<&'a str> {
     match name.split_once('.') {
-        Some((_, parent)) if !parent.is_empty() => Ok(parent),
+        Some((_, parent)) if !parent.is_empty() => {
+            // Normalised names carry exactly one trailing ASCII dot, so a
+            // parent with no dot before it is a single label — a bare TLD.
+            let single_label = !parent[..parent.len() - 1].contains('.');
+            if single_label && parent != mesh_zone {
+                return Err(RustyDnsError::Zone(format!(
+                    "static record name {name:?} implies the bare TLD apex {parent:?} — \
+                     refusing to claim authority over a whole top-level domain (every name \
+                     under it would return authoritative NODATA); use a record name of at \
+                     least three labels, e.g. \"host.zone.tld\""
+                )));
+            }
+            Ok(parent)
+        }
         // Normalised names always carry a trailing dot, so "." is the only
         // name with an empty parent that is not a single label.
         _ if name == "." => Err(RustyDnsError::Zone(format!(
@@ -1047,6 +1076,59 @@ mod tests {
     }
 
     #[test]
+    fn two_label_record_refuses_bare_tld_apex() {
+        // AQ-171 / REVIEW-rustydns-rfc2308 R1: the parent-apex heuristic
+        // must not hand the authority a whole TLD. A lone `example.com.` A
+        // record used to register the apex `com.`, after which every
+        // non-static name under it (`google.com.`) returned authoritative
+        // NODATA from gate_authority — a total blackhole for the suffix.
+        // Refuse at load, fail closed at the door (same style as the root
+        // refusal in `static_zone_apex` and the 255-byte TXT refusal).
+        let err = Authority::new(cfg(vec![a("example.com", "93.184.216.34")]))
+            .expect_err("2-label record must not register a bare-TLD apex");
+        match err {
+            RustyDnsError::Zone(msg) => {
+                assert!(msg.contains("example.com"), "msg = {msg}");
+                assert!(msg.contains("com."), "msg = {msg}");
+                assert!(msg.contains("bare TLD"), "msg = {msg}");
+            }
+            other => panic!("expected Zone error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_label_apex_needs_explicit_mesh_zone_declaration() {
+        // The carve-out: the ONE single-label zone a config may claim is
+        // the declared mesh zone, so the shipped shape (`router.mesh.`
+        // under "mesh.", `myserver.rustynet.` under "rustynet." in the
+        // example config) stays legal.
+        assert!(Authority::new(cfg(vec![a("router.mesh", "10.0.0.1")])).is_ok());
+
+        // 3+-label records still derive one label up, under any mesh zone.
+        let mut config = cfg(vec![a("nas.home.lan", "10.0.0.9")]);
+        config.mesh_zone = "corp.internal.".to_string();
+        let auth = Authority::new(config).expect("multi-label apex must load");
+        assert_eq!(auth.lookup("nas.home.lan.", "A").map(|v| v.len()), Some(1));
+
+        // Single-label record names are their own apex — unchanged (the
+        // operator wrote that exact name; nothing is derived, so no
+        // mesh_zone check applies). This is the un-refused own-apex path:
+        // `localhost` is fine, but the same arm would admit a record named
+        // `com` and blackhole `com.` — deferred to OI-30, not a claim that
+        // the derived-path bound covers it.
+        assert!(Authority::new(cfg(vec![a("localhost", "127.0.0.1")])).is_ok());
+
+        // A foreign single-label TLD is refused: `nas.lan.` under
+        // mesh_zone = "mesh." would implicitly claim all of `lan.`
+        let err = Authority::new(cfg(vec![a("nas.lan", "10.0.0.9")]))
+            .expect_err("2-label record outside the mesh zone must not claim its TLD");
+        match err {
+            RustyDnsError::Zone(msg) => assert!(msg.contains("lan."), "msg = {msg}"),
+            other => panic!("expected Zone error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cname_target_is_normalised() {
         let r = StaticRecord {
             name: "alias.example.com".to_string(),
@@ -1067,8 +1149,10 @@ mod tests {
 
     #[test]
     fn mx_target_parses_preference_and_exchange() {
+        // 3-label record name: a 2-label one (`example.com`) is refused at
+        // load since AQ-171 — it would claim the bare TLD apex `com.`.
         let r = StaticRecord {
-            name: "example.com".to_string(),
+            name: "mail.example.com".to_string(),
             record_type: "MX".to_string(),
             address: None,
             target: Some("10 mail.example.com".to_string()),
@@ -1076,7 +1160,7 @@ mod tests {
             client_filter: None,
         };
         let auth = Authority::new(cfg(vec![r])).unwrap();
-        let result = auth.lookup("example.com", "MX").unwrap();
+        let result = auth.lookup("mail.example.com", "MX").unwrap();
         assert_eq!(result.len(), 1);
         match &result[0].data {
             RecordData::Mx {

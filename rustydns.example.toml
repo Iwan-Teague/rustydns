@@ -210,6 +210,11 @@ mesh_zone = "rustynet."
 poll_interval_secs = 30
 
 # Static zone records.
+# Record names need three or more labels (`myserver.rustynet.`) unless
+# their derived apex equals the mesh zone declared above — so with
+# mesh_zone = "rustynet." a two-label `nas.rustynet.` is legal (parent
+# `rustynet.` == mesh_zone). A two-label name like `nas.lan.` is refused
+# at startup: its parent apex would be the whole `lan.` TLD.
 # [[authority.static_records]]
 # name    = "myserver.rustynet."
 # type    = "A"

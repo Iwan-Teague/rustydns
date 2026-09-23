@@ -74,6 +74,7 @@ fn config_body(dns: u16, metrics: u16, doh: u16) -> String {
          [upstream]\n\
          protocol = \"plain\"\n\
          resolvers = [\"127.0.0.1:5353\"]\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\
          [[authority.static_records]]\n\
          name = \"probe.mesh\"\n\
          type = \"A\"\n\
@@ -426,6 +427,7 @@ fn dot_config_body(dns: u16, metrics: u16, doh: u16, dot: u16, cert: &Path, key:
          [upstream]\n\
          protocol = \"plain\"\n\
          resolvers = [\"127.0.0.1:5353\"]\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\
          [[authority.static_records]]\n\
          name = \"probe.mesh\"\n\
          type = \"A\"\n\
@@ -656,6 +658,7 @@ fn doq_config_body(dns: u16, metrics: u16, doh: u16, doq: u16, cert: &Path, key:
          [upstream]\n\
          protocol = \"plain\"\n\
          resolvers = [\"127.0.0.1:5353\"]\n\
+         [authority]\nmesh_zone = \"mesh.\"\n\
          [[authority.static_records]]\n\
          name = \"probe.mesh\"\n\
          type = \"A\"\n\
