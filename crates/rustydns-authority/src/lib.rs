@@ -128,8 +128,9 @@ impl Authority {
         for sr in &config.static_records {
             let rec = static_record_to_dns_record(sr)?;
             let name = rec.name.clone();
-            if !static_zones.iter().any(|z| z == &name) {
-                static_zones.push(name.clone());
+            let apex = static_zone_apex(&name)?;
+            if !static_zones.iter().any(|z| z == apex) {
+                static_zones.push(apex.to_string());
             }
             static_records.entry(name).or_default().push(rec);
         }
@@ -555,6 +556,26 @@ fn normalise_name(name: &str) -> std::borrow::Cow<'_, str> {
         n.push('.');
     }
     std::borrow::Cow::Owned(n)
+}
+
+/// Derive the zone apex that a static record's name belongs to.
+///
+/// The authority must answer (or NODATA/NXDOMAIN) for every name *within*
+/// a static zone, not just the record's own name, so the zone registered
+/// is the parent of the record name: a record `router.mesh.` makes the
+/// authority authoritative for `mesh.` (and thus `ghost.mesh.` too). A
+/// single-label name (normalised form `mesh.`) is its own apex. Refuses
+/// ([`RustyDnsError::Zone`]) a name that would claim the DNS root.
+fn static_zone_apex(name: &str) -> AuthorityResult<&str> {
+    match name.split_once('.') {
+        Some((_, parent)) if !parent.is_empty() => Ok(parent),
+        // Normalised names always carry a trailing dot, so "." is the only
+        // name with an empty parent that is not a single label.
+        _ if name == "." => Err(RustyDnsError::Zone(format!(
+            "static record name {name:?} would make the authority authoritative over the DNS root"
+        ))),
+        _ => Ok(name),
+    }
 }
 
 /// Convert a TOML [`StaticRecord`] into the in-memory [`DnsRecord`] form.
@@ -983,11 +1004,46 @@ mod tests {
         assert!(auth.is_authoritative_for("host.lab.example.com"));
         assert!(auth.is_authoritative_for("host.lab.example.com."));
 
-        // Outside any zone.
+        // RE-BASELINED (deliberate): flipped from `!authoritative` to
+        // `authoritative` when static zones were fixed to register the
+        // record's parent apex instead of the record name itself. The doc
+        // contract on `is_authoritative_for` ("equals the zone apex or is a
+        // subdomain of it ... every zone apex derived from static records")
+        // and RFC 2308 §2.1/§2.2 both require the authority to answer for
+        // the derived `lab.example.com.` zone — not just the exact record
+        // name. Old behaviour leaked in-zone NODATA/probe names to the
+        // upstream resolver instead of answering from the zone.
+        assert!(auth.is_authoritative_for("lab.example.com"));
+        // The derived apex is the record's *parent* (`lab.example.com.`),
+        // one label up — not every enclosing suffix, so `example.com`
+        // remains out of scope.
         assert!(!auth.is_authoritative_for("example.com"));
-        assert!(!auth.is_authoritative_for("lab.example.com"));
         assert!(!auth.is_authoritative_for("meshx")); // not a subdomain of "mesh."
         assert!(!auth.is_authoritative_for("notmesh"));
+    }
+
+    #[test]
+    fn static_record_registers_parent_apex_zone() {
+        // Witness for the e2e regression: a lone `router.mesh.` A record
+        // must make the authority authoritative for the whole `mesh.`
+        // zone — apex infrastructure queries and in-zone names without
+        // records answer authoritative NODATA instead of falling through
+        // to the upstream resolver (doc contract on
+        // `is_authoritative_for`, RFC 2308 §2.1/§2.2).
+        let auth = Authority::new(cfg(vec![a("router.mesh", "10.0.0.1")])).unwrap();
+
+        assert!(auth.is_authoritative_for("router.mesh."));
+        assert!(auth.is_authoritative_for("ghost.mesh."));
+        assert!(auth.is_authoritative_for("mesh.")); // apex itself
+
+        // In-zone NODATA: name known or zone held, type absent.
+        assert!(auth.lookup("ghost.mesh.", "A").map(|v| v.is_empty()) == Some(true));
+        assert!(auth.lookup("mesh.", "SOA").map(|v| v.is_empty()) == Some(true));
+        assert_eq!(auth.lookup("router.mesh.", "A").map(|v| v.len()), Some(1));
+
+        // No over-claim: other zones stay out of scope.
+        assert!(!auth.is_authoritative_for("example.org."));
+        assert!(!auth.is_authoritative_for("meshx."));
     }
 
     #[test]

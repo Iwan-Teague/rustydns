@@ -2655,14 +2655,20 @@ mod tests {
         assert!(resp.metadata.authoritative);
         assert_eq!(resp.answers.len(), 1);
 
-        // Same-suffix UNKNOWN name: static zones are exact-name tables (no
-        // SOA/NX-proof machinery), so an unknown name is NOT claimed
-        // authoritatively — it falls through to the upstream like any other
-        // recursive name and fails closed against the unreachable resolver.
-        // Pinning that it is never fake-answered locally.
+        // Same-suffix UNKNOWN name: RE-BASELINED (deliberate). This flipped
+        // from SERVFAIL-fall-through to authoritative NODATA when static
+        // zones were fixed to register the record's parent apex
+        // (`lab.example.com.`) instead of the record name itself. The
+        // authority contract (rustydns-authority `is_authoritative_for`
+        // doc: "equals the zone apex or is a subdomain of it ... every
+        // zone apex derived from static records") and RFC 2308 §2.1/§2.2
+        // require in-zone unknown names to be answered from the zone —
+        // NOERROR with no answers — instead of leaking the probe name to
+        // the upstream resolver. Old exact-name-table behaviour is what
+        // regressed the `binary_e2e_*_nodata_*` e2e tests.
         let ghost = query(harness.port, "ghost.lab.example.com.", ProtoRecordType::A).await;
-        assert_eq!(ghost.metadata.response_code, ResponseCode::ServFail);
-        assert!(!ghost.metadata.authoritative);
+        assert_eq!(ghost.metadata.response_code, ResponseCode::NoError);
+        assert!(ghost.metadata.authoritative);
         assert_eq!(
             ghost.answers.len(),
             0,

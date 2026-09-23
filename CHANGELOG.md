@@ -8,6 +8,24 @@ This project does not yet follow semantic versioning — every change up to
 
 ## Unreleased
 
+### Fixed
+
+- **Static records now make the authority authoritative for their whole
+  parent zone, not just the record's own name.** A lone `router.mesh.`
+  A record used to register the zone `router.mesh.` — exact-name only —
+  so in-zone names without records (`ghost.mesh.`) and zone-apex
+  infrastructure queries (`mesh.` SOA/NS) fell through to the upstream
+  resolver instead of being answered from the zone (authoritative
+  NODATA / NXDOMAIN). That leaked mesh-internal probe names to the
+  upstream and regressed the `binary_e2e_in_zone_nodata_*`,
+  `binary_e2e_zone_apex_*` and `binary_e2e_multiple_static_records_*`
+  e2e tests (latent since the static-zone machinery landed; triggered by
+  the 2026-09-14 mesh-zone default change to `rustynet.`). Zones now
+  register the record's parent apex (`mesh.`), matching the documented
+  `is_authoritative_for` contract and RFC 2308 §2.1/§2.2. Two unit
+  assertions pinning the old exact-name behaviour were deliberately
+  re-baselined with reasons at the test (AQ-163).
+
 ### Breaking changes
 
 - `upstream.min_tls_version = "1.2"` is no longer accepted: the `TlsVersion::Tls12` variant is gone, so a config that still pins "1.2" fails to parse (fail-closed). Only "1.3" (the default) is valid for the DoH/DoQ/ODoH clients. (AQ-14 residue; follows the D1 TLS 1.3 floor.)
