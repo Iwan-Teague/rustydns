@@ -101,10 +101,15 @@ skip = [
 # ---------------------------------------------------------------------------
 [licenses]
 version = 2
-# Workspace ships under MIT OR Apache-2.0; allow the standard set of
-# permissive licenses we'd be comfortable shipping. Add to this list
-# explicitly rather than relaxing the policy.
+# Workspace ships under PolyForm Noncommercial 1.0.0; allow that plus the
+# standard set of permissive licenses we'd be comfortable shipping. Add to
+# this list explicitly rather than relaxing the policy.
 allow = [
+    # ADR-021 (round 2): suite relicensed to PolyForm Noncommercial 1.0.0.
+    # SPDX-valid (id: PolyForm-Noncommercial-1.0.0) but NOT OSI-approved;
+    # cargo-deny resolves the id directly from crate manifests, so no
+    # [licenses.clarify] stanza is required.
+    "PolyForm-Noncommercial-1.0.0",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

@@ -14,7 +14,7 @@ edition      = "2024"
 # Bump this in lockstep with the Dockerfile builder image and the
 # CI `dtolnay/rust-toolchain` pin.
 rust-version = "1.88"
-license      = "MIT OR Apache-2.0"
+license      = "PolyForm-Noncommercial-1.0.0"
 authors      = ["Iwan Teague <iwanteague@gmail.com>"]
 repository   = "https://github.com/Iwan-Teague/rustydns"
 
