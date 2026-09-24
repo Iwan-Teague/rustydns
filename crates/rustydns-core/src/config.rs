@@ -1951,12 +1951,12 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         ("server.doh_listen", cfg.server.doh_listen.as_deref()),
         ("metrics.listen", Some(cfg.metrics.listen.as_str())),
     ] {
-        if let Some(v) = value {
-            if v.parse::<std::net::SocketAddr>().is_err() {
-                return Err(crate::RustyDnsError::Config(format!(
-                    "{field} entry `{v}` is not a valid socket address"
-                )));
-            }
+        if let Some(v) = value
+            && v.parse::<std::net::SocketAddr>().is_err()
+        {
+            return Err(crate::RustyDnsError::Config(format!(
+                "{field} entry `{v}` is not a valid socket address"
+            )));
         }
     }
 

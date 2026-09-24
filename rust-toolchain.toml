@@ -1,0 +1,13 @@
+# Pinned toolchain (AQ-233, following the rustychat precedent AQ-228/NF-1):
+# the gate (scripts/ci/gates.sh) resolves this channel and refuses to run
+# on the ambient toolchain, so a fresh stable cannot turn the local gate
+# red on its own. 1.88.0 is the floor this crate declares
+# (Cargo.toml:16, rust-version = "1.88") and the same version CI's `test`
+# job pins (ci.yml:52, toolchain: "1.88" — "This job IS the MSRV gate").
+# CI's `stable` job (ci.yml:105-141) is deliberate forward coverage that
+# stays CI-only. Bump this channel deliberately, with the full gate suite
+# green on the new version, never passively.
+[toolchain]
+channel = "1.88.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
