@@ -1246,6 +1246,7 @@ mod tests {
             mesh_zone_verifier_key_path: None,
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             static_records,
             poll_interval_secs: 30,
         };
@@ -1401,6 +1402,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: Vec::new(),
                 poll_interval_secs: 30,
             })
@@ -1605,6 +1607,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records,
                 poll_interval_secs: 30,
             })
@@ -1980,6 +1983,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: Vec::new(),
                 poll_interval_secs: 30,
             })
@@ -2088,6 +2092,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: Vec::new(),
                 poll_interval_secs: 30,
             })
@@ -2260,6 +2265,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: vec![static_a("rl.test.example.", "203.0.113.90")],
                 poll_interval_secs: 30,
             })
@@ -2405,6 +2411,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: vec![static_a("pk.test.example.", "100.64.0.9")],
                 poll_interval_secs: 30,
             })
@@ -3473,6 +3480,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: Vec::new(),
                 poll_interval_secs: 30,
             })
@@ -3561,6 +3569,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: Vec::new(),
                 poll_interval_secs: 30,
             })
@@ -3656,6 +3665,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: Vec::new(),
                 poll_interval_secs: 30,
             })
@@ -3746,6 +3756,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: vec![static_a("router.mesh", "100.64.0.5")],
                 poll_interval_secs: 30,
             })
@@ -4079,6 +4090,7 @@ mod tests {
             mesh_zone_verifier_key_path: None,
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             static_records: vec![static_a("router.mesh", "100.64.0.7")],
             poll_interval_secs: 30,
         };
@@ -4242,6 +4254,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: vec![static_a("router.mesh", "100.64.0.7")],
                 poll_interval_secs: 30,
             })
@@ -4531,6 +4544,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: vec![static_a("router.mesh", "100.64.0.8")],
                 poll_interval_secs: 30,
             })
@@ -4701,6 +4715,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: vec![static_a("router.mesh", "100.64.0.8")],
                 poll_interval_secs: 30,
             })
@@ -4905,6 +4920,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: Vec::new(),
                 poll_interval_secs: 30,
             })
@@ -5027,6 +5043,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: Vec::new(),
                 poll_interval_secs: 30,
             })
@@ -5223,6 +5240,7 @@ mod tests {
                     mesh_zone_verifier_key_path: None,
                     mesh_zone_max_age_secs: 600,
                     mesh_zone: "mesh.".to_string(),
+                    zones: Vec::new(),
                     static_records: Vec::new(),
                     poll_interval_secs: 30,
                 })

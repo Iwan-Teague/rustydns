@@ -334,6 +334,7 @@ mod tests {
             mesh_zone_verifier_key_path: None,
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             static_records,
             poll_interval_secs: 30,
         };

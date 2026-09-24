@@ -43,6 +43,24 @@ This project does not yet follow semantic versioning — every change up to
 
 ### Breaking changes
 
+- **A static record whose own name is a single label is now refused
+  unless the zone is declared.** The AQ-171 bare-TLD bound covered only
+  the derived apex of a two-label record; a record literally named
+  `com` still registered itself as its own apex and blackholed all of
+  `com.` with authoritative NODATA. That own-apex path is refused at
+  load now (`RustyDnsError::Zone`, daemon aborts) unless the label
+  equals `authority.mesh_zone` or is listed in the new
+  `authority.zones` allow-list — the declared way to serve a legitimate
+  single-label internal zone (`zones = ["home.", "localhost."]`), which
+  also admits two-label records under a non-mesh single-label zone
+  (`nas.home.`) that were unconditionally refused before. A config with
+  a single-label record name (e.g. `localhost`) must add the
+  declaration or the daemon will not start. `--validate-config` refuses
+  the same configs (it builds the Authority), and `validate_config`
+  checks every `zones` entry is a single label ending in `.`, naming
+  the offending entry otherwise. (OI-30, owner decision 2026-09-24
+  option c; AQ-171 residue)
+
 - `upstream.min_tls_version = "1.2"` is no longer accepted: the `TlsVersion::Tls12` variant is gone, so a config that still pins "1.2" fails to parse (fail-closed). Only "1.3" (the default) is valid for the DoH/DoQ/ODoH clients. (AQ-14 residue; follows the D1 TLS 1.3 floor.)
 
 - **DoT/DoQ servers now require TLS 1.3.** Both server-side TLS configs

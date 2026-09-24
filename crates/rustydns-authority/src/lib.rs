@@ -42,7 +42,7 @@ mod mesh;
 
 pub use mesh::{LoadedBundle, MeshBundleError};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -124,17 +124,38 @@ impl Authority {
     pub fn new(config: AuthorityConfig) -> AuthorityResult<Self> {
         let mesh_zone = normalise_name(&config.mesh_zone).into_owned();
 
+        // Explicitly declared internal zones (OI-30, `authority.zones`):
+        // the allow-list `static_zone_apex` admits on top of `mesh_zone`.
+        // Entries are pre-validated by `validate_config`, but this is the
+        // only consumer, so it normalises defensively rather than trusting
+        // another caller to have run validation.
+        let declared_zones: BTreeSet<String> = config
+            .zones
+            .iter()
+            .map(|z| normalise_name(z).into_owned())
+            .collect();
+
         // Build the static-record half once — it never changes at runtime.
         let mut static_records: HashMap<String, Vec<DnsRecord>> = HashMap::new();
         let mut static_zones: Vec<String> = Vec::new();
         for sr in &config.static_records {
             let rec = static_record_to_dns_record(sr)?;
             let name = rec.name.clone();
-            let apex = static_zone_apex(&name, &mesh_zone)?;
+            let apex = static_zone_apex(&name, &mesh_zone, &declared_zones)?;
             if !static_zones.iter().any(|z| z == apex) {
                 static_zones.push(apex.to_string());
             }
             static_records.entry(name).or_default().push(rec);
+        }
+
+        // A declared zone is a claim in its own right: the authority answers
+        // authoritatively for the apex and everything under it even before a
+        // record exists beneath it (operator-explicit config, the same trust
+        // level as the static records themselves).
+        for zone in &declared_zones {
+            if zone != &mesh_zone && !static_zones.iter().any(|z| z == zone) {
+                static_zones.push(zone.clone());
+            }
         }
 
         // Initial mesh-zone load. Failure is non-fatal.
@@ -567,33 +588,40 @@ fn normalise_name(name: &str) -> std::borrow::Cow<'_, str> {
 /// is the parent of the record name: a record `router.mesh.` makes the
 /// authority authoritative for `mesh.` (and thus `ghost.mesh.` too). A
 /// single-label name (normalised form `mesh.`) is its own apex. Refuses
-/// ([`RustyDnsError::Zone`]) a name that would claim the DNS root, and a
-/// two-label name (`example.com.`) whose derived apex is a bare TLD: the
-/// authority would otherwise answer authoritative NODATA for the entire
-/// top-level domain (`google.com.` included) — unless that derived apex
-/// equals the configured `mesh_zone`, which the operator declares
-/// explicitly (`authority.mesh_zone`, default `rustynet.`). This bound is
-/// on the DERIVED apex of a multi-label record only. A record whose own
-/// normalised name is a single label is its own apex and registers
-/// unchanged (the `_ => Ok(name)` arm below): `localhost` works, and — a
-/// known operator footgun, not closed here — so would a record literally
-/// named `com`, which then blackholes `com.`. Whether own-apex single
-/// labels should also be refused, and how a legitimate non-mesh single-
-/// label internal zone should be declared, is deferred to the owner
-/// (charter/governance/owner-inbox.md OI-30); it is operator-explicit
-/// config, not attacker-influenced input.
-fn static_zone_apex<'a>(name: &'a str, mesh_zone: &str) -> AuthorityResult<&'a str> {
+/// ([`RustyDnsError::Zone`]) a name that would claim the DNS root, and:
+///
+/// - a two-label name (`example.com.`) whose derived apex is a bare TLD —
+///   the authority would otherwise answer authoritative NODATA for the
+///   entire top-level domain (`google.com.` included); and
+/// - a record whose OWN normalised name is a single label (`com`), which
+///   would register that label as its own apex and blackhole it the same
+///   way (OI-30 closed this own-apex path; AQ-171 closed the derived one).
+///
+/// A single-label apex is admitted in exactly two cases: it equals the
+/// configured `mesh_zone` (declared via `authority.mesh_zone`, default
+/// `rustynet.`), or it is listed in `authority.zones` (`declared_zones`
+/// below) — the operator's explicit allow-list for internal zones such as
+/// `home.` or `localhost.`. Both arms of this function enforce the same
+/// rule, so a record cannot reach an undeclared bare-TLD apex by either
+/// path.
+fn static_zone_apex<'a>(
+    name: &'a str,
+    mesh_zone: &str,
+    declared_zones: &BTreeSet<String>,
+) -> AuthorityResult<&'a str> {
     match name.split_once('.') {
         Some((_, parent)) if !parent.is_empty() => {
             // Normalised names carry exactly one trailing ASCII dot, so a
             // parent with no dot before it is a single label — a bare TLD.
             let single_label = !parent[..parent.len() - 1].contains('.');
-            if single_label && parent != mesh_zone {
+            if single_label && parent != mesh_zone && !declared_zones.contains(parent) {
                 return Err(RustyDnsError::Zone(format!(
                     "static record name {name:?} implies the bare TLD apex {parent:?} — \
                      refusing to claim authority over a whole top-level domain (every name \
-                     under it would return authoritative NODATA); use a record name of at \
-                     least three labels, e.g. \"host.zone.tld\""
+                     under it would return authoritative NODATA); declare it with \
+                     `authority.zones = [\"{parent}\"]` if it is a deliberate internal \
+                     zone, or use a record name of at least three labels, e.g. \
+                     \"host.zone.tld\""
                 )));
             }
             Ok(parent)
@@ -603,7 +631,22 @@ fn static_zone_apex<'a>(name: &'a str, mesh_zone: &str) -> AuthorityResult<&'a s
         _ if name == "." => Err(RustyDnsError::Zone(format!(
             "static record name {name:?} would make the authority authoritative over the DNS root"
         ))),
-        _ => Ok(name),
+        _ => {
+            // Own-apex single-label record: without a declaration this is
+            // the same bare-TLD blackhole as the derived path above (a
+            // record literally named `com` used to claim all of `com.`),
+            // so it needs the same explicit operator intent.
+            if declared_zones.contains(name) || name == mesh_zone {
+                Ok(name)
+            } else {
+                Err(RustyDnsError::Zone(format!(
+                    "static record name {name:?} is a single-label name that would claim \
+                     the whole top-level domain {name:?} as its own apex — declare it \
+                     with `authority.zones = [\"{name}\"]` if it is a deliberate \
+                     internal zone (e.g. \"localhost.\")"
+                )))
+            }
+        }
     }
 }
 
@@ -799,6 +842,7 @@ mod tests {
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
             static_records: records,
+            zones: Vec::new(),
             poll_interval_secs: 30,
         }
     }
@@ -1098,8 +1142,9 @@ mod tests {
 
     #[test]
     fn single_label_apex_needs_explicit_mesh_zone_declaration() {
-        // The carve-out: the ONE single-label zone a config may claim is
-        // the declared mesh zone, so the shipped shape (`router.mesh.`
+        // The carve-out: a single-label zone a config may claim is the
+        // declared mesh zone (or an `authority.zones` entry — see the OI-30
+        // tests below), so the shipped shape (`router.mesh.`
         // under "mesh.", `myserver.rustynet.` under "rustynet." in the
         // example config) stays legal.
         assert!(Authority::new(cfg(vec![a("router.mesh", "10.0.0.1")])).is_ok());
@@ -1110,13 +1155,18 @@ mod tests {
         let auth = Authority::new(config).expect("multi-label apex must load");
         assert_eq!(auth.lookup("nas.home.lan.", "A").map(|v| v.len()), Some(1));
 
-        // Single-label record names are their own apex — unchanged (the
-        // operator wrote that exact name; nothing is derived, so no
-        // mesh_zone check applies). This is the un-refused own-apex path:
-        // `localhost` is fine, but the same arm would admit a record named
-        // `com` and blackhole `com.` — deferred to OI-30, not a claim that
-        // the derived-path bound covers it.
-        assert!(Authority::new(cfg(vec![a("localhost", "127.0.0.1")])).is_ok());
+        // Single-label record names are their own apex and need the same
+        // explicit declaration as a derived bare-TLD apex since OI-30 —
+        // `localhost` is the intended use, so it is declared via
+        // `authority.zones` here (the undeclared form is refused; see
+        // `own_apex_bare_tld_refused_without_declaration` below).
+        let mut config = cfg(vec![a("localhost", "127.0.0.1")]);
+        config.zones = vec!["localhost.".to_string()];
+        let auth = Authority::new(config).expect("declared localhost. zone must load");
+        assert_eq!(auth.lookup("localhost.", "A").map(|v| v.len()), Some(1));
+        // ...and the mesh_zone carve-out still admits its own label as an
+        // own-apex record name without any zones entry.
+        assert!(Authority::new(cfg(vec![a("mesh", "10.0.0.1")])).is_ok());
 
         // A foreign single-label TLD is refused: `nas.lan.` under
         // mesh_zone = "mesh." would implicitly claim all of `lan.`
@@ -1126,6 +1176,59 @@ mod tests {
             RustyDnsError::Zone(msg) => assert!(msg.contains("lan."), "msg = {msg}"),
             other => panic!("expected Zone error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn own_apex_bare_tld_refused_without_declaration() {
+        // OI-30 (option c): the own-apex path AQ-171 left open. A record
+        // literally named `com` used to register itself as its own apex —
+        // the authority then answered authoritative NODATA for ALL of
+        // `com.` (`google.com.` included) from nothing but a one-line
+        // operator typo. Refused at load now, same class as the derived
+        // bare-TLD refusal, unless the label is declared.
+        let err = Authority::new(cfg(vec![a("com", "93.184.216.34")]))
+            .expect_err("own-apex bare-TLD record must be refused without declaration");
+        match err {
+            RustyDnsError::Zone(msg) => {
+                assert!(msg.contains("com."), "msg = {msg}");
+                assert!(msg.contains("authority.zones"), "msg = {msg}");
+            }
+            other => panic!("expected Zone error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declared_zone_admits_subdomain_records_and_claims_the_apex() {
+        // OI-30: `home.` is not the mesh zone, so before the allow-list
+        // every record under it was refused (the F2 over-refusal). Declared
+        // in `authority.zones`, the two-label record loads, the apex is
+        // authoritative on its own (NODATA, not REFUSED/NXDOMAIN-upstream),
+        // and names outside the declaration stay out of scope.
+        let mut config = cfg(vec![a("nas.home", "10.0.0.9")]);
+        config.mesh_zone = "rustynet.".to_string();
+        config.zones = vec!["home.".to_string()];
+        let auth = Authority::new(config).expect("declared internal zone must load");
+
+        assert_eq!(auth.lookup("nas.home.", "A").map(|v| v.len()), Some(1));
+        assert!(auth.is_authoritative_for("nas.home."));
+        assert!(auth.is_authoritative_for("home."));
+        assert!(auth.lookup("ghost.home.", "A").map(|v| v.is_empty()) == Some(true));
+        // The declaration is not a blanket TLD grant: undeclared zones are
+        // still refused and still not authoritative.
+        assert!(!auth.is_authoritative_for("example.org."));
+        assert!(Authority::new(cfg(vec![a("nas.lan", "10.0.0.9")])).is_err());
+    }
+
+    #[test]
+    fn declared_bare_localhost_apex_is_served() {
+        // OI-30 witness: a bare `localhost.` record (single-label own-apex)
+        // is served once `localhost.` is in `authority.zones` — the
+        // intended use the old permissive arm accidentally allowed.
+        let mut config = cfg(vec![a("localhost", "127.0.0.1")]);
+        config.zones = vec!["localhost.".to_string()];
+        let auth = Authority::new(config).expect("declared localhost. zone must load");
+        assert_eq!(auth.lookup("localhost.", "A").map(|v| v.len()), Some(1));
+        assert!(auth.lookup("localhost.", "AAAA").map(|v| v.is_empty()) == Some(true));
     }
 
     #[test]
@@ -1323,6 +1426,7 @@ mod tests {
             mesh_zone_verifier_key_path: Some(key_path),
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             static_records: Vec::new(),
             poll_interval_secs: 30,
         };
@@ -1355,6 +1459,7 @@ mod tests {
             mesh_zone_verifier_key_path: Some(key_path),
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             static_records: std::mem::take(&mut sr),
             poll_interval_secs: 30,
         };
@@ -1383,6 +1488,7 @@ mod tests {
             mesh_zone_verifier_key_path: Some(key_path),
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             static_records: Vec::new(),
             poll_interval_secs: 30,
         };
@@ -1417,6 +1523,7 @@ mod tests {
             mesh_zone_verifier_key_path: Some(key_path),
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             static_records: Vec::new(),
             poll_interval_secs: 30,
         };
@@ -1447,6 +1554,7 @@ mod tests {
             mesh_zone_verifier_key_path: Some(key_path),
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             static_records: Vec::new(),
             poll_interval_secs: 30,
         })
@@ -1691,6 +1799,7 @@ mod tests {
             mesh_zone_verifier_key_path: Some(key_path),
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             // Two static records — must NOT be counted in mesh_record_count.
             static_records: vec![
                 a("static1.example.com", "10.0.0.1"),
@@ -1870,6 +1979,7 @@ mod tests {
             mesh_zone_verifier_key_path: Some(key_path),
             mesh_zone_max_age_secs: 600,
             mesh_zone: "mesh.".to_string(),
+            zones: Vec::new(),
             static_records: vec![cname("alias.example.com", "router.mesh")],
             poll_interval_secs: 30,
         };

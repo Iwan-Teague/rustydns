@@ -209,12 +209,24 @@ mesh_zone = "rustynet."
 # polling — operators can still SIGHUP to reload on demand).
 poll_interval_secs = 30
 
+# Additional single-label internal zones this authority may claim (OI-30).
+# A record whose OWN name is a single label (`localhost`, `home`) is
+# refused at startup unless its label equals mesh_zone or is declared
+# here — otherwise it would claim that whole top-level domain (`com`
+# would blackhole all of `com.`). Declaring a zone also makes the
+# authority authoritative for every name under it, and lets two-label
+# records under a NON-mesh single-label zone load (`nas.home.` below
+# would be refused without the `home.` declaration).
+# zones = ["home.", "localhost."]
+
 # Static zone records.
 # Record names need three or more labels (`myserver.rustynet.`) unless
 # their derived apex equals the mesh zone declared above — so with
 # mesh_zone = "rustynet." a two-label `nas.rustynet.` is legal (parent
 # `rustynet.` == mesh_zone). A two-label name like `nas.lan.` is refused
-# at startup: its parent apex would be the whole `lan.` TLD.
+# at startup: its parent apex would be the whole `lan.` TLD, unless
+# `lan.` is declared in `authority.zones` above. Single-label record
+# names (`localhost`) likewise need a `zones` declaration.
 # [[authority.static_records]]
 # name    = "myserver.rustynet."
 # type    = "A"

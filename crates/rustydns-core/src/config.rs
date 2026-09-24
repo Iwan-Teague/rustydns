@@ -742,6 +742,26 @@ pub struct AuthorityConfig {
     #[serde(default)]
     pub static_records: Vec<StaticRecord>,
 
+    /// Additional single-label internal zones this authority may claim.
+    ///
+    /// A static record whose own normalised name is a single label
+    /// (`localhost`, `home`) would register itself as its own apex —
+    /// authority over a whole top-level domain — and is refused at load
+    /// unless that name is the configured [`AuthorityConfig::mesh_zone`]
+    /// or appears in this list (OI-30, closing the bare-TLD footgun a
+    /// record literally named `com` used to slip through). The same list
+    /// exempts the DERIVED apex of a two-label record, so declaring
+    /// `zones = ["home."]` lets `nas.home.` serve under a foreign
+    /// `mesh_zone`. Declaring a zone here is a claim: the authority
+    /// answers authoritatively (NODATA/NXDOMAIN) for every name under it,
+    /// even with no records declared beneath the apex.
+    ///
+    /// Entries are normalised (trimmed, lowercased, trailing dot added),
+    /// must be exactly ONE label (`home.`, `localhost.`), and are
+    /// validated by `validate_config`.
+    #[serde(default)]
+    pub zones: Vec<String>,
+
     /// Bundle re-read interval in seconds. Minimum: 5. Default: 30.
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
@@ -755,6 +775,7 @@ impl Default for AuthorityConfig {
             mesh_zone_max_age_secs: default_mesh_zone_max_age_secs(),
             mesh_zone: default_mesh_zone(),
             static_records: Vec::new(),
+            zones: Vec::new(),
             poll_interval_secs: default_poll_interval(),
         }
     }
@@ -1956,6 +1977,36 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
         )));
     }
 
+    // authority.zones (OI-30): every entry declares ONE single-label
+    // internal zone the authority may claim on top of mesh_zone. Anything
+    // else here would either do nothing (a multi-label zone is already
+    // claimable through static records) or over-claim (the root), so it is
+    // refused with the entry named. Entries are normalised the same way the
+    // authority normalises them before matching record names.
+    let mut declared_zones = std::collections::BTreeSet::new();
+    for zone in &cfg.authority.zones {
+        let normalised = zone.trim().to_ascii_lowercase();
+        let normalised = if normalised.ends_with('.') {
+            normalised
+        } else {
+            format!("{normalised}.")
+        };
+        let label = &normalised[..normalised.len() - 1];
+        if label.is_empty() || label.contains('.') {
+            return Err(crate::RustyDnsError::Config(format!(
+                "authority.zones entry `{zone}` must be a single-label zone name ending \
+                 with '.' (e.g. \"home.\" or \"localhost.\") — it declares one internal \
+                 top-level domain, nothing more"
+            )));
+        }
+        if !declared_zones.insert(normalised) {
+            return Err(crate::RustyDnsError::Config(format!(
+                "authority.zones declares `{zone}` more than once (case-insensitive, \
+                 trailing dot optional)"
+            )));
+        }
+    }
+
     // The two declarations may INTENTIONALLY diverge (split-horizon: see the
     // example config) — the AUTHORITY value always governs mesh answering,
     // while the server value is informational. Surface the divergence loudly
@@ -2850,6 +2901,43 @@ mod tests {
         let mut cfg = baseline();
         cfg.authority.mesh_zone = "lan.home".to_string();
         assert_config_err(validate_config(&cfg), "authority.mesh_zone");
+    }
+
+    #[test]
+    fn authority_zones_single_label_entries_validate_and_normalise() {
+        // OI-30: a declared single-label internal zone list is valid as
+        // written — trailing dot optional, case folded. Nothing here
+        // claims anything by itself; the authority match is exercised in
+        // rustydns-authority's own tests.
+        let mut cfg = baseline();
+        cfg.authority.zones = vec!["Home".to_string(), "localhost.".to_string()];
+        validate_config(&cfg).expect("single-label zone entries must validate");
+    }
+
+    #[test]
+    fn authority_zones_multi_label_entry_rejected() {
+        // A multi-label entry can never do anything a static record would
+        // not already do, so accepting it would only mask a typo.
+        let mut cfg = baseline();
+        cfg.authority.zones = vec!["home.lan.".to_string()];
+        assert_config_err(validate_config(&cfg), "authority.zones entry `home.lan.`");
+    }
+
+    #[test]
+    fn authority_zones_root_entry_rejected() {
+        // "." would claim the DNS root; the list is for ONE internal label.
+        let mut cfg = baseline();
+        cfg.authority.zones = vec![".".to_string()];
+        assert_config_err(validate_config(&cfg), "authority.zones entry `.`");
+    }
+
+    #[test]
+    fn authority_zones_duplicate_entry_rejected() {
+        // Same zone twice (ignoring case and the optional trailing dot) is
+        // a config error, not something to silently deduplicate.
+        let mut cfg = baseline();
+        cfg.authority.zones = vec!["home.".to_string(), "HOME".to_string()];
+        assert_config_err(validate_config(&cfg), "more than once");
     }
 
     #[test]

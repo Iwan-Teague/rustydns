@@ -1488,6 +1488,9 @@ fn restart_required_changes(
     if old.authority.mesh_zone != new.authority.mesh_zone {
         changed.push("authority.mesh_zone");
     }
+    if old.authority.zones != new.authority.zones {
+        changed.push("authority.zones");
+    }
     if old.authority.mesh_zone_max_age_secs != new.authority.mesh_zone_max_age_secs {
         changed.push("authority.mesh_zone_max_age_secs");
     }
@@ -2510,6 +2513,7 @@ mod tests {
                 mesh_zone_verifier_key_path: None,
                 mesh_zone_max_age_secs: 600,
                 mesh_zone: "mesh.".to_string(),
+                zones: Vec::new(),
                 static_records: Vec::new(),
                 poll_interval_secs: 30,
             })
