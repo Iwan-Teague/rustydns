@@ -27,20 +27,18 @@ upstream_padding = true
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let all_logs = format!("{}\n{}", stdout, stderr);
+    let all_logs = format!("{stdout}\n{stderr}");
 
     assert!(
         all_logs
             .contains("privacy.query_minimization is enabled in config but hickory 0.26's stub"),
-        "qmin warning missing. Output was:\n{}",
-        all_logs
+        "qmin warning missing. Output was:\n{all_logs}"
     );
 
     assert!(
         all_logs
             .contains("privacy.upstream_padding is enabled in config but hickory 0.26 does not"),
-        "padding warning missing. Output was:\n{}",
-        all_logs
+        "padding warning missing. Output was:\n{all_logs}"
     );
 }
 
@@ -69,7 +67,7 @@ fn validate_config_full(config_content: &str) -> (String, Option<i32>) {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    (format!("{}\n{}", stdout, stderr), output.status.code())
+    (format!("{stdout}\n{stderr}"), output.status.code())
 }
 
 #[test]

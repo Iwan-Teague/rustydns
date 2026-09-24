@@ -1236,8 +1236,7 @@ async fn sighup_picks_up_policy_changes_live() {
 
     // Write RESTRICTED config and SIGHUP.
     let restricted_config = format!(
-        "{}\n[[policy]]\nclient_ip = \"127.0.0.1\"\nzones_allowed = [\"internal.lan.\"]\n",
-        open_config
+        "{open_config}\n[[policy]]\nclient_ip = \"127.0.0.1\"\nzones_allowed = [\"internal.lan.\"]\n"
     );
     std::fs::write(&cfg_path, &restricted_config).unwrap();
     nix::sys::signal::kill(

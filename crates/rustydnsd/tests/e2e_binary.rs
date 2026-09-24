@@ -368,7 +368,7 @@ async fn binary_e2e_malformed_packets_never_crash_or_poison() {
     {
         if let Ok(msg) = Message::from_bytes(&drain) {
             assert!(
-                !(msg.metadata.response_code == ResponseCode::NoError && !msg.answers.is_empty()),
+                msg.metadata.response_code != ResponseCode::NoError || msg.answers.is_empty(),
                 "hostile datagram produced a SERVED ANSWER: {:?}",
                 msg.answers
             );

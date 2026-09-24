@@ -17,7 +17,7 @@ fn run(args: &[&str]) -> (std::process::Output, String) {
         .expect("failed to execute rustydnsd");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    (output, format!("{}{}", stdout, stderr))
+    (output, format!("{stdout}{stderr}"))
 }
 
 #[test]

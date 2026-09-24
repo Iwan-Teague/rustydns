@@ -4387,8 +4387,8 @@ mod tests {
                 // NoError-with-records is not.
                 if let Ok(parsed) = Message::from_bytes(&bytes) {
                     assert!(
-                        !(parsed.metadata.response_code == ResponseCode::NoError
-                            && !parsed.answers.is_empty()),
+                        parsed.metadata.response_code != ResponseCode::NoError
+                            || parsed.answers.is_empty(),
                         "DoT pointer-loop query produced a served answer: {parsed:?}"
                     );
                 }
@@ -4476,8 +4476,8 @@ mod tests {
             Ok(Ok((n, _))) => {
                 if let Ok(msg) = Message::from_bytes(&buf[..n]) {
                     assert!(
-                        !(msg.metadata.response_code == ResponseCode::NoError
-                            && !msg.answers.is_empty()),
+                        msg.metadata.response_code != ResponseCode::NoError
+                            || msg.answers.is_empty(),
                         "malformed-OPT query produced a served answer"
                     );
                 }
