@@ -155,3 +155,69 @@ resolvers = ["https://dns.example/dns-query"]
     );
     assert_eq!(code, Some(0), "a valid config must exit 0");
 }
+
+#[test]
+fn bare_tld_static_record_fails_validation_with_nonzero_exit() {
+    // AQ-178 (r23 F4): the AQ-171 apex bound makes the daemon ABORT at
+    // `Authority::new` for a static record whose derived apex is a bare TLD
+    // (a 2-label name like `example.com` implies authority over `com.`),
+    // but `--validate-config` — the systemd ExecStartPre / install-script /
+    // CI gate — used to exit 0 for exactly that config, reintroducing the
+    // crash-loop the pre-start check exists to prevent, one layer up.
+    // Pins BOTH halves of the contract: nonzero exit AND the same refusal
+    // reason the daemon gives at startup ("bare TLD", authority lib.rs
+    // `static_zone_apex`).
+    let (all_logs, code) = validate_config_full(
+        r#"
+[authority]
+[[authority.static_records]]
+name = "example.com"
+type = "A"
+ttl = 300
+address = "192.0.2.1"
+"#,
+    );
+
+    assert_ne!(
+        code,
+        Some(0),
+        "a config the daemon aborts on at Authority::new must exit NONZERO via \
+         --validate-config; logs:\n{all_logs}"
+    );
+    assert!(
+        all_logs.contains("bare TLD"),
+        "rejection must carry the same bare-TLD refusal the daemon gives at \
+         startup. Output was:\n{all_logs}"
+    );
+}
+
+#[test]
+fn compliant_static_records_still_validate_with_zero_exit() {
+    // The over-refusal guard for the gate above: 3-label names are legal
+    // under any mesh_zone, and the AQ-171 carve-out (a 2-label name whose
+    // derived apex EQUALS the declared mesh_zone) must keep validating too.
+    // If the shared authority construction ever over-tightens, this pins it.
+    let (all_logs, code) = validate_config_full(
+        r#"
+[authority]
+mesh_zone = "mesh."
+[[authority.static_records]]
+name = "router.mesh"
+type = "A"
+ttl = 300
+address = "192.0.2.10"
+[[authority.static_records]]
+name = "host.zone.tld"
+type = "A"
+ttl = 300
+address = "192.0.2.11"
+"#,
+    );
+
+    assert_eq!(
+        code,
+        Some(0),
+        "legal static records (3-label + mesh_zone carve-out) must still exit 0; \
+         logs:\n{all_logs}"
+    );
+}

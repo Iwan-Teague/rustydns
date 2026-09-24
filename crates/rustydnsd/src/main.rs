@@ -169,9 +169,20 @@ async fn main() -> Result<()> {
     }
 
     // `--validate-config`: stop here. We've already parsed the file and
-    // run `validate_config` (inside `load_config`). Exit 0 to signal
-    // success to the install script or CI step that invoked us.
+    // run `validate_config` (inside `load_config`). Before signalling
+    // success we ALSO build the `Authority`, the same constructor the
+    // daemon passes through at startup below: `validate_config` lives in
+    // rustydns-core and cannot see the authority's record-level rules
+    // (rustydns-authority depends on core, not the reverse), so without
+    // this a config the daemon aborts on at `Authority::new` — e.g. the
+    // AQ-171 bare-TLD apex refusal — used to validate clean and
+    // crash-loop on the real start. Building it here keeps ONE source of
+    // truth (no duplicated rule); the mesh-bundle read inside the
+    // constructor is non-fatal there by design and stays non-fatal here.
+    // Exit 0 to signal success to the install script or CI step that
+    // invoked us.
     if args.validate_only {
+        Authority::new(config.authority.clone())?;
         info!("configuration validated — exiting (--validate-config)");
         return Ok(());
     }

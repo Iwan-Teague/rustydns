@@ -1905,16 +1905,38 @@ pub fn validate_config(cfg: &DnsConfig) -> Result<(), crate::RustyDnsError> {
                 .to_string(),
         ));
     }
-    let any_parseable = cfg
-        .server
-        .listen
-        .iter()
-        .any(|l| l.parse::<std::net::SocketAddr>().is_ok());
-    if !any_parseable {
-        return Err(crate::RustyDnsError::Config(format!(
-            "none of server.listen entries are parseable addresses: {:?}",
-            cfg.server.listen
-        )));
+    // EVERY plain-DNS listen entry must parse, not merely one of them: the
+    // daemon aborts on the FIRST unparseable entry at startup
+    // (parse_socket_addrs in rustydnsd/src/main.rs), so an any-entry check
+    // would validate clean a config that can never start — the
+    // validate-exits-0 / daemon-aborts pair this function exists to close
+    // (AQ-178, r23 F4 sweep; same class as the AQ-171 apex refusal).
+    for l in &cfg.server.listen {
+        if l.parse::<std::net::SocketAddr>().is_err() {
+            return Err(crate::RustyDnsError::Config(format!(
+                "server.listen entry `{l}` is not a valid socket address \
+                 (expected ip:port, e.g. \"127.0.0.1:53\")"
+            )));
+        }
+    }
+
+    // Same contract for the optional listeners: the overlap/bind-gate checks
+    // below skip an unparseable entry silently (`and_then(parse_addr)` /
+    // `if let Ok(..)`), but the daemon aborts on it at startup — so it is
+    // refused here, naming the field, before any check can look past it.
+    for (field, value) in [
+        ("server.dot_listen", cfg.server.dot_listen.as_deref()),
+        ("server.doq_listen", cfg.server.doq_listen.as_deref()),
+        ("server.doh_listen", cfg.server.doh_listen.as_deref()),
+        ("metrics.listen", Some(cfg.metrics.listen.as_str())),
+    ] {
+        if let Some(v) = value {
+            if v.parse::<std::net::SocketAddr>().is_err() {
+                return Err(crate::RustyDnsError::Config(format!(
+                    "{field} entry `{v}` is not a valid socket address"
+                )));
+            }
+        }
     }
 
     // mesh_zone must end with '.'
@@ -2879,7 +2901,51 @@ mod tests {
     fn unparseable_only_plain_listen_rejected() {
         let mut cfg = baseline();
         cfg.server.listen = vec!["not-an-addr".to_string()];
-        assert_config_err(validate_config(&cfg), "none of server.listen");
+        assert_config_err(validate_config(&cfg), "not a valid socket address");
+    }
+
+    #[test]
+    fn partially_unparseable_plain_listen_rejected() {
+        // AQ-178 (r23 F4 sweep): one bad entry among good ones used to PASS
+        // here — the old check only required ANY entry to parse — while the
+        // daemon aborts on the FIRST unparseable entry at startup
+        // (parse_socket_addrs, rustydnsd/src/main.rs). A config that can
+        // never start must not validate clean.
+        let mut cfg = baseline();
+        cfg.server.listen = vec!["127.0.0.1:53".to_string(), "not-an-addr".to_string()];
+        assert_config_err(validate_config(&cfg), "server.listen entry `not-an-addr`");
+    }
+
+    #[test]
+    fn unparseable_optional_listeners_rejected() {
+        // Same class: the overlap/bind-gate checks below silently SKIPPED an
+        // unparseable optional listener (and_then(parse_addr) / if-let-Ok),
+        // but the daemon aborts on it at startup. Each must be refused by
+        // name.
+        let mut cfg = baseline();
+        cfg.server.dot_listen = Some("not-an-addr".to_string());
+        assert_config_err(
+            validate_config(&cfg),
+            "server.dot_listen entry `not-an-addr`",
+        );
+
+        let mut cfg = baseline();
+        cfg.server.doq_listen = Some("not-an-addr".to_string());
+        assert_config_err(
+            validate_config(&cfg),
+            "server.doq_listen entry `not-an-addr`",
+        );
+
+        let mut cfg = baseline();
+        cfg.server.doh_listen = Some("not-an-addr".to_string());
+        assert_config_err(
+            validate_config(&cfg),
+            "server.doh_listen entry `not-an-addr`",
+        );
+
+        let mut cfg = baseline();
+        cfg.metrics.listen = "not-an-addr".to_string();
+        assert_config_err(validate_config(&cfg), "metrics.listen entry `not-an-addr`");
     }
 
     #[test]

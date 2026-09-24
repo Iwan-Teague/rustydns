@@ -494,7 +494,7 @@ async fn config_error_ux_names_the_offender_and_exits_nonzero() {
     let (code, out) = validate(bad_addr_body).await;
     assert_ne!(code, Some(0), "bad address must fail validation");
     assert!(
-        out.contains("server.listen entries are parseable"),
+        out.contains("server.listen entry `999.999.1.1:53`"),
         "error must name the server.listen key: {out}"
     );
     assert!(
@@ -693,7 +693,7 @@ async fn invalid_existing_config_error_names_file_and_hints() {
         "must carry the hint: {combined}"
     );
     assert!(
-        combined.contains("server.listen entries are parseable"),
+        combined.contains("server.listen entry `999.999.1.1:53`"),
         "inner cause must survive wrapping: {combined}"
     );
 }
