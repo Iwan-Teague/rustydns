@@ -2,6 +2,8 @@
 
 <https://polyformproject.org/licenses/noncommercial/1.0.0>
 
+Required Notice: Copyright © 2026 Iwan Teague (https://github.com/Iwan-Teague/rustydns)
+
 ## Acceptance
 
 In order to get any license under these terms, you must agree to them as both strict obligations and conditions to all your licenses.
